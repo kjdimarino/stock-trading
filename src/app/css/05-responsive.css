@@ -1,0 +1,81 @@
+/* =========================================================================
+   Responsive overrides.
+
+   These live in the last stylesheet on purpose: component files set
+   `display: flex` on the very panels the narrow layout needs to hide, and at
+   equal specificity the later rule wins. Keeping the breakpoints here means
+   they are never silently overridden by a component rule added later.
+   ========================================================================= */
+
+/*
+ * Declared here (and with !important) because .mobile-only is applied to a
+ * .seg, and .seg's own `display: inline-flex` is defined in a later component
+ * stylesheet — at equal specificity it would otherwise win.
+ */
+.mobile-only { display: none !important; }
+
+@media (max-width: 1280px) {
+  .terminal {
+    grid-template-columns: 56px var(--wl-w, 240px) minmax(360px, 1fr) 280px;
+  }
+}
+
+@media (max-width: 1100px) {
+  .terminal {
+    grid-template-columns: 56px minmax(280px, 1fr);
+    grid-template-rows: 48px 1fr 24px;
+    grid-template-areas:
+      "rail topbar"
+      "rail chart"
+      "status status";
+  }
+
+  /* One region at a time in the centre column. */
+  .terminal > .watchlist,
+  .terminal > .blotter,
+  .terminal > .orderpane { display: none; }
+
+  .terminal[data-mobile="watchlist"] {
+    grid-template-areas: "rail topbar" "rail watchlist" "status status";
+  }
+  .terminal[data-mobile="watchlist"] > .watchlist { display: flex; }
+  .terminal[data-mobile="watchlist"] > .chartpane { display: none; }
+
+  .terminal[data-mobile="order"] {
+    grid-template-areas: "rail topbar" "rail order" "status status";
+  }
+  .terminal[data-mobile="order"] > .orderpane { display: flex; }
+  .terminal[data-mobile="order"] > .chartpane { display: none; }
+
+  .terminal[data-mobile="blotter"] {
+    grid-template-areas: "rail topbar" "rail blotter" "status status";
+  }
+  .terminal[data-mobile="blotter"] > .blotter { display: flex; }
+  .terminal[data-mobile="blotter"] > .chartpane { display: none; }
+
+  /* The full-width panels span the single content column. */
+  .terminal[data-view="portfolio"],
+  .terminal[data-view="ai"],
+  .terminal[data-view="compare"] {
+    grid-template-areas: "rail topbar" "rail chart" "status status";
+  }
+
+  .mobile-only { display: inline-flex !important; }
+  .omni { width: 100%; min-width: 0; }
+  .symhead__stats { display: none; }
+  .topbar { gap: var(--sp-2); }
+}
+
+@media (max-width: 760px) {
+  .terminal { grid-template-columns: 48px minmax(0, 1fr); }
+  .rail { padding-top: var(--sp-1); }
+  .rail__btn { width: 36px; height: 36px; }
+  .symhead { height: auto; flex-wrap: wrap; gap: var(--sp-2); }
+  .symhead__last { font-size: var(--fs-2xl); }
+  .pfhero { padding: var(--sp-4); gap: var(--sp-4); }
+  .pfhero__value { font-size: var(--fs-3xl); }
+  .score { grid-template-columns: 1fr; text-align: center; gap: var(--sp-3); }
+  .score__side--ai { align-items: center; text-align: center; }
+  .score__vs { margin: 0 auto; }
+  .topbar__stat:first-of-type { display: none; }
+}

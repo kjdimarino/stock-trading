@@ -159,6 +159,8 @@
 
   function buildBlotter() {
     R.blotter.innerHTML = '';
+    R.blotterSig = null;
+    R.posRows = new Map();
     const head = el('div', { class: 'blotter__head' });
     R.blotterTabs = {};
     for (const [id, label] of BLOTTER_TABS) {
@@ -174,6 +176,18 @@
     renderBlotter();
   }
 
+  /**
+   * A signature of what the blotter is showing. The run loop calls this every
+   * second, and blowing away the table each time would reset scroll position,
+   * kill text selection and thrash the DOM — so the table is only rebuilt when
+   * its rows actually change, and otherwise just has its numbers updated.
+   */
+  function blotterSignature(pf, val) {
+    if (S.blotterTab === 'positions') return 'p:' + val.positions.map((p) => p.assetId + ':' + p.qty).join('|');
+    if (S.blotterTab === 'orders') return 'o:' + pf.orders.map((o) => o.id).join('|');
+    return 'h:' + pf.fills.length;
+  }
+
   function renderBlotter() {
     if (!R.blotterBody) return;
     const pf = A.pfUser();
@@ -185,10 +199,32 @@
       R.blotterTabs.history.count.textContent = String(pf.fills.length);
     }
 
+    const sig = blotterSignature(pf, val);
+    if (sig === R.blotterSig && R.blotterBody.firstChild) {
+      if (S.blotterTab === 'positions') updatePositionValues(val);
+      return;
+    }
+    R.blotterSig = sig;
+    R.posRows = new Map();
+
     R.blotterBody.innerHTML = '';
     if (S.blotterTab === 'positions') renderPositions(R.blotterBody, val);
     else if (S.blotterTab === 'orders') renderOpenOrders(R.blotterBody, pf);
     else renderHistory(R.blotterBody, pf);
+  }
+
+  /** Write live valuation numbers into the existing position rows. */
+  function updatePositionValues(val) {
+    if (!R.posRows) return;
+    for (const p of val.positions) {
+      const row = R.posRows.get(p.assetId);
+      if (!row || !row.value.isConnected) continue;
+      row.value.textContent = U.fmtUSD(p.value, { fixed2: true });
+      row.upl.textContent = U.fmtSigned(p.unrealized);
+      row.upl.className = 'num ' + U.dirClass(p.unrealized);
+      row.pct.textContent = U.fmtPct(p.unrealizedPct);
+      row.pct.className = 'num ' + U.dirClass(p.unrealized);
+    }
   }
 
   function table(headers) {
@@ -217,6 +253,7 @@
       const pctCell = el('span', { class: 'num ' + U.dirClass(p.unrealized) }, U.fmtPct(p.unrealizedPct));
       A.registerCell(p.assetId, { price: priceCell });
       UI.setPrice(priceCell, p.price);
+      if (R.posRows) R.posRows.set(p.assetId, { value: valueCell, upl: uplCell, pct: pctCell });
 
       const close = el('button', { class: 'btn btn--sm btn--danger', text: 'Close' });
       close.addEventListener('click', (ev) => { ev.stopPropagation(); closePosition(p); });
@@ -471,6 +508,22 @@
     } else {
       const pos = pf.positions[assetId];
       if (!pos) { R.amountInput.value = '0'; updateEstimate(); return; }
+
+      /*
+       * "Max" on a sell means close the position, so it is always sized by
+       * quantity. Going through dollars would floor to the cent and leave a
+       * dust quantity behind, and the position would never actually close.
+       */
+      if (fraction >= 1) {
+        if (S.order.sizeMode !== 'qty') {
+          S.order.sizeMode = 'qty';
+          buildOrderPane();
+        }
+        R.amountInput.value = String(U.roundQty(pos.qty, pos.kind));
+        updateEstimate();
+        return;
+      }
+
       const qty = U.roundQty(pos.qty * fraction, pos.kind);
       // Floor the dollar figure so converting it back can never exceed `qty`.
       R.amountInput.value = S.order.sizeMode === 'notional'

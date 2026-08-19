@@ -105,27 +105,3 @@
 }
 .panel__body { flex: 1; min-height: 0; }
 .panel__foot { flex: 0 0 auto; border-top: 1px solid var(--border-subtle); padding: var(--sp-2) var(--gutter); }
-
-/* ------------------------------- responsive ------------------------------ */
-@media (max-width: 1280px) {
-  .terminal { grid-template-columns: 56px var(--wl-w, 240px) minmax(360px, 1fr) 280px; }
-}
-@media (max-width: 1100px) {
-  .terminal {
-    grid-template-columns: 56px minmax(320px, 1fr);
-    grid-template-rows: 48px 1fr 24px;
-    grid-template-areas: "rail topbar" "rail chart" "status status";
-  }
-  .watchlist, .blotter, .orderpane { display: none; }
-  .terminal[data-mobile="watchlist"] { grid-template-areas: "rail topbar" "rail watchlist" "status status"; }
-  .terminal[data-mobile="watchlist"] .watchlist { display: flex; }
-  .terminal[data-mobile="watchlist"] .chartpane { display: none; }
-  .terminal[data-mobile="order"] { grid-template-areas: "rail topbar" "rail order" "status status"; }
-  .terminal[data-mobile="order"] .orderpane { display: flex; }
-  .terminal[data-mobile="order"] .chartpane { display: none; }
-  .terminal[data-mobile="blotter"] { grid-template-areas: "rail topbar" "rail blotter" "status status"; }
-  .terminal[data-mobile="blotter"] .blotter { display: flex; }
-  .terminal[data-mobile="blotter"] .chartpane { display: none; }
-  .mobile-only { display: flex !important; }
-}
-.mobile-only { display: none; }

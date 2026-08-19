@@ -372,6 +372,108 @@ try {
       (await page.evaluate(() => window.PT.app.S.focus)) !== 'BTC');
   }
 
+  /* ------------------------------------------------------------ stability */
+  section('Stability under a running feed');
+  // Hold a position so the blotter has rows to re-render every tick.
+  await page.evaluate(() => window.PT.app.setFocus('BTC'));
+  await page.waitForTimeout(1200);
+  await page.locator('.orderpane .seg__item', { hasText: 'Buy' }).click();
+  await page.locator('.orderpane .seg__item', { hasText: 'Market' }).click();
+  await page.locator('.orderpane .seg__item', { hasText: 'Dollars' }).click();
+  await page.locator('.orderpane input[type="number"]').last().fill('1000');
+  await page.waitForTimeout(300);
+  await page.locator('.orderpane .btn--lg').click();
+  await page.waitForTimeout(900);
+  await page.locator('.blotter .tab', { hasText: 'Positions' }).click();
+  await page.waitForTimeout(500);
+
+  const cellsBefore = await page.evaluate(() => {
+    let n = 0; window.PT.app.priceCells.forEach((v) => { n += v.length; });
+    return n;
+  });
+  const rowBefore = await page.evaluate(() => {
+    const tr = document.querySelector('.blotter tbody tr');
+    return tr ? tr.dataset.stamp || (tr.dataset.stamp = String(Math.random())) : null;
+  });
+
+  await page.waitForTimeout(9000);   // ~10 run-loop passes with ticks flowing
+
+  const cellsAfter = await page.evaluate(() => {
+    let n = 0; window.PT.app.priceCells.forEach((v) => { n += v.length; });
+    return n;
+  });
+  check('price-cell bindings stay bounded as views re-render',
+    cellsAfter <= cellsBefore + 6, `${cellsBefore} -> ${cellsAfter} bindings`);
+
+  const rowAfter = await page.evaluate(() => {
+    const tr = document.querySelector('.blotter tbody tr');
+    return tr ? tr.dataset.stamp : null;
+  });
+  check('the blotter updates in place instead of rebuilding every tick',
+    rowAfter !== null && rowAfter === rowBefore, `stamp ${rowBefore} -> ${rowAfter}`);
+
+  const pnlLive = await page.evaluate(() => {
+    const tds = [...document.querySelectorAll('.blotter tbody tr td')].map((td) => td.innerText);
+    return tds.join(' | ');
+  });
+  check('position row still shows live market value and P&L',
+    /\$/.test(pnlLive) && !/NaN|undefined/.test(pnlLive), pnlLive.slice(0, 80));
+
+  // Clean up so later sections start from a flat book.
+  await page.evaluate(() => {
+    const pf = window.PT.app.pfUser();
+    const id = Object.keys(pf.positions)[0];
+    if (id) {
+      window.PT.engine.submitOrder(pf, { assetId: id, side: 'sell', type: 'market', qty: pf.positions[id].qty },
+        window.PT.app.orderCtx(id));
+      window.PT.app.save();
+    }
+  });
+  await page.waitForTimeout(600);
+
+  /* ---------------------------------------------------------- responsive */
+  section('Responsive layout');
+  await page.setViewportSize({ width: 900, height: 800 });
+  await page.waitForTimeout(900);
+  const narrow = await page.evaluate(() => {
+    const t = document.querySelector('.terminal');
+    return {
+      overflowX: document.documentElement.scrollWidth > window.innerWidth + 1,
+      chartVisible: !!document.querySelector('.chartwrap'),
+      cols: getComputedStyle(t).gridTemplateColumns.split(' ').length,
+    };
+  });
+  check('no horizontal overflow at 900px', !narrow.overflowX);
+  check('the chart survives a narrow viewport', narrow.chartVisible);
+  check('the grid collapses to fewer columns', narrow.cols <= 2, `${narrow.cols} columns`);
+
+  // The side panels become switchable rather than simply vanishing.
+  check('a region switcher appears on narrow screens',
+    await page.locator('.mobile-only').first().isVisible());
+  await page.locator('.mobile-only .seg__item', { hasText: 'List' }).click();
+  await page.waitForTimeout(500);
+  check('the watchlist can be switched in on a narrow screen',
+    await page.locator('.watchlist').isVisible());
+  await page.locator('.mobile-only .seg__item', { hasText: 'Trade' }).click();
+  await page.waitForTimeout(500);
+  check('the order ticket can be switched in on a narrow screen',
+    await page.locator('.orderpane').isVisible());
+  await page.locator('.mobile-only .seg__item', { hasText: 'Chart' }).click();
+  await page.waitForTimeout(400);
+
+  await page.setViewportSize({ width: 430, height: 900 });
+  await page.waitForTimeout(900);
+  check('no horizontal overflow at phone width',
+    !(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1)),
+    await page.evaluate(() => `${document.documentElement.scrollWidth} > ${window.innerWidth}`));
+
+  await page.setViewportSize({ width: 1600, height: 950 });
+  await page.waitForTimeout(900);
+  const wide = await page.evaluate(() => getComputedStyle(document.querySelector('.terminal')).gridTemplateColumns.split(' ').length);
+  check('the full terminal layout returns on a wide viewport', wide === 4, `${wide} columns`);
+  check('the region switcher hides again on a wide viewport',
+    !(await page.locator('.mobile-only').first().isVisible()));
+
   /* --------------------------------------------------- movers + shortcuts */
   section('Top movers and shortcuts');
   await page.evaluate(() => window.PT.app.setView('trade'));

@@ -138,6 +138,23 @@
     R.feedBadge = el('span', { class: 'badge badge--closed' }, 'Connecting');
     bar.appendChild(R.feedBadge);
 
+    /*
+     * Below ~1100px only one centre region fits at a time, so the side panels
+     * become switchable rather than simply disappearing.
+     */
+    R.mobileSwitch = el('div', { class: 'seg mobile-only' });
+    for (const [mode, label] of [['chart', 'Chart'], ['watchlist', 'List'], ['order', 'Trade'], ['blotter', 'Book']]) {
+      const b = el('button', { class: 'seg__item' + (mode === 'chart' ? ' is-active' : ''), text: label });
+      b.addEventListener('click', () => {
+        if (mode === 'chart') delete R.terminal.dataset.mobile;
+        else R.terminal.dataset.mobile = mode;
+        for (const child of R.mobileSwitch.children) child.classList.toggle('is-active', child.textContent === label);
+        if (S.chart) S.chart.resize();
+      });
+      R.mobileSwitch.appendChild(b);
+    }
+    bar.appendChild(R.mobileSwitch);
+
     bar.appendChild(el('div', { class: 'topbar__spacer' }));
 
     R.topEquity = el('div', { class: 'v num' }, '—');
@@ -458,11 +475,24 @@
     priceCells.get(assetId).push(cells);
   }
 
-  /** Push a quote into every bound cell for that asset. */
+  /**
+   * Push a quote into every bound cell for that asset.
+   *
+   * Cells are registered by several views, and those views re-render
+   * independently, so bindings to detached nodes are dropped here. Without this
+   * the map grows without bound and every tick repaints nodes nobody can see.
+   */
   function paintQuote(assetId, q) {
     const bound = priceCells.get(assetId);
     if (!bound) return;
-    for (const c of bound) {
+
+    let live = 0;
+    for (let i = 0; i < bound.length; i++) {
+      const c = bound[i];
+      const anchor = c.price || c.chg;
+      if (!anchor || !anchor.isConnected) continue;
+      bound[live++] = c;
+
       if (c.price) UI.setPrice(c.price, q ? q.price : null, (v) => (v == null ? '—' : U.fmtUSD(v)));
       if (c.chg) {
         const pct = q ? q.changePct : null;
@@ -470,6 +500,8 @@
         c.chg.className = 'row__chg num ' + U.dirClass(pct);
       }
     }
+    bound.length = live;
+    if (!live) priceCells.delete(assetId);
   }
 
   PT.app = { S, R, mountShell: mount, setView, setFocus, addToWatchlist, removeFromWatchlist, renderWatchlist,
