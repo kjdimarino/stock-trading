@@ -159,6 +159,7 @@
       delayed: { cls: 'badge--delayed', text: 'Delayed' },
       cached: { cls: 'badge--delayed', text: 'Cached' },
       stale: { cls: 'badge--delayed', text: 'Stale' },
+      loading: { cls: 'badge--closed', text: 'Connecting' },
       none: { cls: 'badge--closed', text: 'No data' },
     };
     const m = map[grade] || map.none;

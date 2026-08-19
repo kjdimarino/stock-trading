@@ -17,18 +17,37 @@ const createLimiter = new Function(`${src.slice(start, end)}; return createLimit
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 describe('rate limiter under concurrency', () => {
-  it('spaces concurrent callers instead of releasing them in one burst', async () => {
+  it('allows exactly the burst capacity, then spaces the rest', async () => {
     const lim = createLimiter({ capacity: 5, refillMs: 60, maxWaitMs: 100000 });
     const t0 = Date.now();
     const times = [];
     await Promise.all(Array.from({ length: 20 }, () => lim.take().then(() => times.push(Date.now() - t0))));
     times.sort((a, b) => a - b);
 
-    // The first `capacity` may go immediately; the rest must be spaced out.
-    const burst = times.filter((t) => t < 25).length;
-    ok(burst <= 6, `${burst} requests released immediately (capacity 5)`);
-    const last = times[times.length - 1];
-    ok(last >= 14 * 60 * 0.8, `last release at ${last}ms — expected the queue to be spread out`);
+    const burst = times.filter((t) => t < 30).length;
+    // Too few means the limiter throttles work it should have let through;
+    // too many means it admits the burst it exists to prevent.
+    eq(burst, 5, `${burst} released immediately for a capacity of 5`);
+
+    const spaced = times.slice(5);
+    for (let i = 1; i < spaced.length; i++) {
+      const gap = spaced[i] - spaced[i - 1];
+      ok(gap >= 40 && gap <= 140, `gap ${gap}ms between queued releases (interval 60ms)`);
+    }
+  });
+
+  it('is deterministic no matter how callers interleave', async () => {
+    // Two waves launched a tick apart must still respect one shared budget.
+    const lim = createLimiter({ capacity: 2, refillMs: 80, maxWaitMs: 100000 });
+    const t0 = Date.now();
+    const times = [];
+    const wave = () => Array.from({ length: 4 }, () => lim.take().then(() => times.push(Date.now() - t0)));
+    const first = wave();
+    await new Promise((r) => setTimeout(r, 5));
+    await Promise.all([...first, ...wave()]);
+    times.sort((a, b) => a - b);
+    eq(times.filter((t) => t < 30).length, 2, 'only the burst allowance went immediately');
+    ok(times[times.length - 1] >= 5 * 80 * 0.8, `total spread ${times[times.length - 1]}ms`);
   });
 
   it('reports a burst budget that recovers over time', async () => {

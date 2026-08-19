@@ -32,8 +32,13 @@
     wsSubscribed: new Set(),
     lastStockPoll: 0,
     stockPollInFlight: false,
+    lastFocusPoll: 0,
+    focusPollInFlight: false,
     serverUp: true,
     counters: { ticks: 0, polls: 0, wsReconnects: 0 },
+    // Has a first fetch completed for each asset class? Before it has, "no
+    // data" is misleading — nothing has been asked for yet.
+    ready: { stock: false, crypto: false },
   };
 
   /* --------------------------------------------------------------- quotes */
@@ -55,8 +60,18 @@
   }
 
   /** Freshness grade for a quote, recomputed on read rather than stored. */
-  function grade(q) {
-    if (!q || !isFinite(q.price)) return 'none';
+  function grade(q, assetId) {
+    /*
+     * Distinguish "nothing has been fetched yet" from "we asked and got
+     * nothing". A quote record that exists but carries no usable price means
+     * the provider answered without one; no record at all, before the first
+     * cycle has completed, just means we have not asked yet.
+     */
+    if (!q) {
+      const kind = PT.assetKind(assetId);
+      return state.ready[kind === 'crypto' ? 'crypto' : 'stock'] ? 'none' : 'loading';
+    }
+    if (!isFinite(q.price)) return 'none';
     if (q.quality === 'delayed') return 'delayed';
     if (q.quality === 'cached') return 'cached';
     const kind = PT.assetKind(q.assetId);
@@ -136,6 +151,7 @@
     ws.onopen = () => {
       state.wsState = 'open';
       state.openedAt = Date.now();
+      state.ready.crypto = true;
       // Re-read the watched set: it may have changed during the handshake.
       const current = cryptoProducts();
       state.wsSubscribed = new Set(current);
@@ -229,6 +245,7 @@
     if (!ids.length) return;
     try {
       const j = await api(`/api/quotes?crypto=${encodeURIComponent(ids.join(','))}&ttl=4000`);
+      state.ready.crypto = true;
       for (const id in j.quotes) {
         const q = j.quotes[id];
         /*
@@ -268,6 +285,41 @@
     return 120000;
   }
 
+  /**
+   * Poll interval for the symbol the user is actually looking at.
+   *
+   * Yahoo tolerates roughly one request every 2.5s per host, so a dedicated
+   * lane for one symbol is affordable where polling the whole watchlist that
+   * fast is not — and it is the quote that matters while you are sizing a trade.
+   */
+  function focusInterval() {
+    const s = PT.calendar.stockStatus();
+    if (s.phase === 'open') return 4000;
+    if (s.phase === 'pre' || s.phase === 'after') return 20000;
+    return 120000;
+  }
+
+  /** Refresh just the focused equity, faster than the watchlist sweep. */
+  async function pollFocused() {
+    const id = state.focus;
+    if (!id || PT.isCrypto(id) || state.focusPollInFlight) return;
+    if (Date.now() - state.lastFocusPoll < focusInterval()) return;
+
+    state.focusPollInFlight = true;
+    state.lastFocusPoll = Date.now();
+    try {
+      const j = await api(`/api/quotes?stocks=${encodeURIComponent(id)}&ttl=2500`);
+      state.counters.polls++;
+      state.ready.stock = true;
+      for (const sym in j.quotes) applyQuote(sym, { ...j.quotes[sym], t: Date.now() });
+      state.serverUp = true;
+    } catch {
+      state.serverUp = false;
+    } finally {
+      state.focusPollInFlight = false;
+    }
+  }
+
   async function pollStocks(force) {
     const ids = [...state.watched].filter((id) => !PT.isCrypto(id));
     if (!ids.length || state.stockPollInFlight) return;
@@ -281,6 +333,7 @@
       const ttl = Math.max(4000, interval - 2000);
       const j = await api(`/api/quotes?stocks=${encodeURIComponent(ids.join(','))}&ttl=${ttl}`);
       state.counters.polls++;
+      state.ready.stock = true;
       for (const id in j.quotes) {
         // `t` is when we fetched; `quoteTime` is when the market printed it.
         // Keeping both lets grade() tell a fresh poll of a stale price apart
@@ -370,6 +423,7 @@
       wsProducts: state.wsSubscribed.size,
       serverUp: state.serverUp,
       counters: { ...state.counters },
+      ready: { ...state.ready },
       cryptoLive: state.wsState === 'open',
     };
   }
@@ -386,6 +440,7 @@
     pollStocks(true);
     timer = setInterval(() => {
       pollStocks(false);
+      pollFocused();
       // Repair any subscription drift (e.g. a change made mid-handshake).
       if (state.wsState === 'open') syncSubscriptions();
       // Top up over REST while the socket is down, or for coins it has not
@@ -428,13 +483,31 @@
     if (state.watched.delete(id) && state.started) syncSubscriptions();
   }
 
-  const setFocus = (id) => { state.focus = id; };
+  const setFocus = (id) => {
+    state.focus = id;
+    // Refresh the newly focused symbol immediately rather than waiting for the
+    // next sweep — this is the quote the user is about to trade against.
+    state.lastFocusPoll = 0;
+    if (state.started) pollFocused();
+  };
+
+  /** Resolves once the first quote cycle has completed (or after `timeout`). */
+  function whenReady(timeout = 20000) {
+    const started = Date.now();
+    return new Promise((resolve) => {
+      const check = () => {
+        if ((state.ready.stock && state.ready.crypto) || Date.now() - started > timeout) resolve();
+        else setTimeout(check, 300);
+      };
+      check();
+    });
+  }
   const price = (id) => (state.prices[id] ? state.prices[id].price : null);
   const quote = (id) => state.prices[id] || null;
 
   PT.feed = {
     start, stop, watch, unwatch, setFocus, candles, search,
-    applyTickToBars, applyQuote, grade, price, quote, parseCoinbaseTicker,
+    applyTickToBars, applyQuote, grade, price, quote, parseCoinbaseTicker, whenReady,
     get prices() { return state.prices; },
     get status() { return snapshotStatus(); },
     get watched() { return state.watched; },

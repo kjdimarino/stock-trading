@@ -30,12 +30,11 @@ To stop it, press `Ctrl+C`.
 
 ### Why there's a server at all
 
-The app is one file, but it is not a plain `.html` you can double-click. Yahoo
-Finance — the only free, key-less source of US equity data that actually works —
-sends no CORS headers, so a browser cannot call it directly. The Node process
-exists to proxy those requests, and while it's there it also caches them,
-coalesces duplicates and rate-limits them so a busy watchlist can't get your IP
-throttled.
+The app is one file, but it is not a plain `.html` you can double-click. The
+free, key-less sources of US equity data — Yahoo Finance and Nasdaq — send no
+CORS headers, so a browser cannot call them directly. The Node process exists to
+proxy those requests, and while it's there it also caches them, coalesces
+duplicates and rate-limits them so a busy watchlist can't get your IP throttled.
 
 Crypto needs none of that: the browser streams it straight from Coinbase's
 public WebSocket.
@@ -55,14 +54,17 @@ in your browser's `localStorage`.
 ### Trading
 - **Market and limit orders**, buy and sell, on stocks, ETFs and crypto.
 - **Fractional quantities** — size by dollars or by shares/coins. 8 decimals for crypto, 6 for equities.
-- Limit orders rest on a book and fill when the live price crosses them, with price improvement.
+- Limit orders rest on a book and fill when the live price crosses them, with
+  price improvement. Resting orders reserve their cash or shares, so you cannot
+  commit the same balance twice and have an order quietly vanish later.
 - A simulated spread (2bp equities, 5bp crypto) is applied to market fills so an
   instant round trip costs you something, the way a real one does. You can turn
   it off in Settings.
 - Positions show quantity, weighted-average cost, market value, and unrealized
   and realized P&L in both dollars and percent.
 - Day P&L, total return, win rate, profit factor and max drawdown.
-- Full timestamped trade history.
+- Full timestamped trade history, plus anything that reached its price but
+  could not fill, with the reason why.
 
 Short selling is deliberately not supported: simulating it honestly means
 simulating margin, borrow fees and forced buy-ins, and a paper account that got
@@ -83,6 +85,13 @@ Every quote is labelled with where it came from and how fresh it is —
 price is unavailable, the app says so rather than showing a plausible number.
 Market hours are enforced for equities (including real NYSE holiday rules and
 early closes) while crypto trades 24/7.
+
+**Update rate.** Crypto is a true stream — every trade print, several per
+second. Equities are polled, because Yahoo bans an IP for minutes after a burst
+(see the note at the bottom): the symbol you are looking at refreshes every 4
+seconds while the market is open, the rest of the watchlist every 12, and far
+more slowly once the market shuts, when nothing is moving anyway. The app never
+interpolates between real quotes — a price on screen is a price that traded.
 
 ### Charts
 Candlestick and line charts drawn on raw canvas — no charting library.
@@ -125,6 +134,8 @@ The **You vs AI** tab is a live scoreboard: overlaid equity curves, total
 return, realized and unrealized P&L, trade count, win rate and max drawdown.
 
 ![Scoreboard](test/screenshot-compare.png)
+
+![AI companion](test/screenshot-ai.png)
 
 ---
 
@@ -184,8 +195,9 @@ test/              unit, live-data and browser suites
 | `market-open` | The equity path with the session clock pinned open |
 
 ```bash
-npm test                      # everything
-PT_SKIP_BROWSER=1 npm test    # unit + live data only
+npm test                       # everything
+PT_SKIP_BROWSER=1 npm test     # unit + live data only
+PT_SHOTS=1 npm test            # also regenerate the screenshots in this README
 ```
 
 The browser suite drives the real UI: onboarding, live quotes, chart rendering

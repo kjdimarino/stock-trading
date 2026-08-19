@@ -96,7 +96,12 @@ describe('freshness grading', () => {
   it('a fresh live quote grades live', () => eq(F.grade(q()), 'live'));
   it('an explicitly delayed source stays delayed', () => eq(F.grade(q({ quality: 'delayed' })), 'delayed'));
   it('a cached snapshot stays cached', () => eq(F.grade(q({ quality: 'cached' })), 'cached'));
-  it('no price grades as none', () => eq(F.grade(q({ price: NaN })), 'none'));
+  it('a record without a usable price grades as none', () => eq(F.grade(q({ price: NaN })), 'none'));
+  it('a symbol never fetched grades as loading, not no-data', () => {
+    // Before the first cycle completes, "no data" would overstate what we know.
+    eq(F.grade(null, 'AAPL'), 'loading');
+    eq(F.grade(undefined, 'BTC'), 'loading');
+  });
 
   it('an old exchange stamp grades stale even when just polled', () => {
     // The failure this guards: polling a closed market every 12s keeps `t`

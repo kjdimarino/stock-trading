@@ -69,19 +69,30 @@ async function through(key, ttl, fetcher) {
  * matter how they interleave.
  */
 function createLimiter({ capacity, refillMs, maxWaitMs = 4000 }) {
-  let nextAt = 0;             // earliest instant the next request may go out
+  /*
+   * GCRA (generic cell rate algorithm): a leaky bucket with burst, expressed
+   * as a single "theoretical arrival time".
+   *
+   * A token-count-plus-sleep design is unsafe under concurrency — every caller
+   * runs its own `take()` body synchronously before any await resolves, so N
+   * callers observe the same count, sleep the same interval and fire together,
+   * admitting the exact burst the limiter exists to prevent. Here each caller
+   * claims its slot by advancing `tat` before awaiting anything, so ordering is
+   * deterministic no matter how they interleave.
+   */
+  const interval = refillMs;
+  const burst = Math.max(0, capacity - 1) * interval;   // tolerance
+  let tat = 0;                                          // next theoretical arrival
   let cooldownUntil = 0;
   let strikes = 0;
-
-  const availableAt = (now) => Math.max(now - capacity * refillMs, nextAt);
 
   return {
     get state() {
       const now = Date.now();
-      // Report the burst budget that is genuinely available right now.
-      const slack = Math.max(0, now - availableAt(now));
+      // How many requests could still go out immediately.
+      const spare = Math.max(0, burst - Math.max(0, tat - now));
       return {
-        tokens: Math.min(capacity, Math.floor(slack / refillMs)),
+        tokens: Math.min(capacity, Math.floor(spare / interval) + (tat <= now ? 1 : 0)),
         cooling: now < cooldownUntil,
         cooldownUntil,
         strikes,
@@ -96,22 +107,36 @@ function createLimiter({ capacity, refillMs, maxWaitMs = 4000 }) {
         e.cooling = true;
         throw e;
       }
-      const slot = Math.max(now, availableAt(now));
-      const wait = slot - now;
+      const start = Math.max(now, tat);
+      const wait = Math.max(0, start - burst - now);
       if (wait > maxWaitMs) {
         const e = new Error('rate limit budget exhausted');
         e.throttled = true;
         throw e;
       }
-      nextAt = slot + refillMs;   // claimed synchronously, before any await
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      tat = start + interval;   // claimed synchronously, before any await
+      if (wait > 0) {
+        await new Promise((r) => setTimeout(r, wait));
+        /*
+         * Re-check on the way out: if an earlier request in this burst was
+         * penalised while we queued, spending our slot would only extend the
+         * ban, and every queued caller would sit out its full wait before
+         * finding that out. Bail so the fallback provider is reached quickly.
+         */
+        const after = Date.now();
+        if (after < cooldownUntil) {
+          const e = new Error(`provider cooling down for ${Math.ceil((cooldownUntil - after) / 1000)}s`);
+          e.cooling = true;
+          throw e;
+        }
+      }
     },
 
     penalise() {
       strikes = Math.min(strikes + 1, 5);
       const backoff = Math.min(300000, 20000 * 2 ** (strikes - 1)); // 20s → 5min
       cooldownUntil = Date.now() + backoff;
-      nextAt = cooldownUntil;
+      tat = cooldownUntil;
       return backoff;
     },
     reward() { strikes = 0; },
@@ -122,7 +147,7 @@ const YAHOO_HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
 const yahooLimiters = Object.fromEntries(
   YAHOO_HOSTS.map((h) => [h, createLimiter({ capacity: 5, refillMs: 2500, maxWaitMs: 12000 })]),
 );
-const nasdaqLimiter = createLimiter({ capacity: 8, refillMs: 700, maxWaitMs: 15000 });
+const nasdaqLimiter = createLimiter({ capacity: 10, refillMs: 450, maxWaitMs: 20000 });
 const geckoLimiter = createLimiter({ capacity: 5, refillMs: 2500, maxWaitMs: 20000 });
 const coinbaseLimiter = createLimiter({ capacity: 10, refillMs: 120, maxWaitMs: 10000 });
 
@@ -204,6 +229,15 @@ function quoteFromYahooChart(json, symbol) {
   };
 }
 
+/**
+ * Nasdaq needs an `assetclass`, and guessing wrong costs a full round trip
+ * (~3s). Our own universe already knows, so order the attempts accordingly.
+ */
+function assetClassesFor(symbol) {
+  const known = BY_ID[symbol];
+  return known && known.kind === 'etf' ? ['etf', 'stocks'] : ['stocks', 'etf'];
+}
+
 /** Nasdaq's public quote endpoint — used when Yahoo is throttled. */
 async function nasdaqQuote(symbol) {
   const num = (s) => {
@@ -211,9 +245,9 @@ async function nasdaqQuote(symbol) {
     const v = parseFloat(String(s).replace(/[$,%+\s]/g, ''));
     return isFinite(v) ? v : null;
   };
-  for (const cls of ['stocks', 'etf']) {
+  for (const cls of assetClassesFor(symbol)) {
     try {
-      // A token per request: this loop can fire twice for an ETF.
+      // A token per request: this loop can fire twice if the first class misses.
       await nasdaqLimiter.take();
       const j = await getJSON(
         `https://api.nasdaq.com/api/quote/${encodeURIComponent(symbol)}/info?assetclass=${cls}`,
@@ -471,7 +505,7 @@ async function nasdaqIntradayCandles(symbol, tf) {
   if (!width) throw new Error(`nasdaq intraday does not cover ${tf}`);
 
   let json = null;
-  for (const cls of ['stocks', 'etf']) {
+  for (const cls of assetClassesFor(symbol)) {
     try {
       await nasdaqLimiter.take();
       const j = await getJSON(
@@ -509,7 +543,7 @@ async function nasdaqDailyCandles(symbol, days = 400) {
   const iso = (d) => d.toISOString().slice(0, 10);
 
   let rows = null;
-  for (const cls of ['stocks', 'etf']) {
+  for (const cls of assetClassesFor(symbol)) {
     try {
       await nasdaqLimiter.take();
       const j = await getJSON(

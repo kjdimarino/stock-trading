@@ -30,6 +30,13 @@ if (process.env.PT_SKIP_BROWSER !== '1' && fs.existsSync('node_modules/playwrigh
   // Equities are shut most of the time, so this suite pins the clock open and
   // exercises the stock path that would otherwise never be covered.
   run('test/market-open.test.mjs');
+
+  // Regenerate the documentation screenshots last, from a settled book, so the
+  // suite's reset flow cannot leave them showing an empty account.
+  if (process.env.PT_SHOTS === '1') {
+    console.log('\n\x1b[1m── screenshots ──\x1b[0m');
+    run('tools/screenshots.mjs');
+  }
   spawnSync('bash', ['tools/serve.sh', 'stop'], { stdio: 'inherit' });
 }
 

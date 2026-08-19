@@ -190,9 +190,10 @@
         signal: null, indicators: null, computed: true,
       };
     }
+    // Computed once and used as the headline only — repeating it as the first
+    // bullet made every briefing open by saying the same thing twice.
+    const headline = describeStance(assetId, sig, ind, quote);
     const body = [];
-
-    body.push(describeStance(assetId, sig, ind, quote));
 
     if (quote && isFinite(quote.changePct)) {
       const dir = quote.changePct >= 0 ? 'up' : 'down';
@@ -239,7 +240,7 @@
 
     return {
       assetId,
-      headline: describeStance(assetId, sig, ind, quote),
+      headline,
       body,
       signal: sig,
       indicators: ind,

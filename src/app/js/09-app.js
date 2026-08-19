@@ -434,21 +434,28 @@
     if (sparkDraining) return;
     sparkDraining = true;
     try {
-      // Let the first quotes and the focused chart settle before spending
-      // upstream budget on decoration.
-      await new Promise((r) => setTimeout(r, 1500));
+      /*
+       * Sparklines are decoration and must never delay the tape. Upstream
+       * budget is shared, so drawing twelve of them first would push the first
+       * real quote out by several seconds.
+       */
+      await PT.feed.whenReady();
+      await new Promise((r) => setTimeout(r, 800));
       while (sparkQueue.length) {
         const { assetId, svg } = sparkQueue.shift();
         if (!svg.isConnected) continue;
         try {
           const res = await PT.feed.candles(assetId, '1D');
+          // Shared with the symbol header, which uses the newest daily bar for
+          // range and volume when the quote provider omits them.
+          S.candleCache[assetId + ':1D'] = res.bars;
           const closes = res.bars.slice(-40).map((b) => b.c);
           sparkCache.set(assetId, closes);
           drawSparkline(svg, closes);
         } catch {
           // No history available for this symbol; the row simply has no spark.
         }
-        await new Promise((r) => setTimeout(r, 400));
+        await new Promise((r) => setTimeout(r, 600));
       }
     } finally {
       sparkDraining = false;

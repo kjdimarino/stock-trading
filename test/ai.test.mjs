@@ -89,6 +89,12 @@ describe('generated briefings cite real computed numbers', () => {
     ok(b.body.join(' ').toLowerCase().includes('waiting'), 'says it is waiting for data');
     eq(b.signal, null);
   });
+  it('does not repeat the headline as the first bullet', () => {
+    const b = C.briefAsset('BTC', series(UP), { price: 100, changePct: 2 }, '5m');
+    ok(!b.body.some((line) => line === b.headline), 'headline duplicated in the body');
+    ok(b.body.length >= 3, 'still has substance');
+  });
+
   it('never emits NaN or undefined in prose', () => {
     for (const f of [UP, DOWN, FLAT]) {
       const text = C.briefAsset('ETH', series(f), { price: 50, changePct: 1 }).body.join(' ');

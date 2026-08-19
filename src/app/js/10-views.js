@@ -725,16 +725,30 @@
     R.symChg.className = 'symhead__chg num ' + U.dirClass(q ? q.changePct : 0);
 
     R.symBadge.innerHTML = '';
-    R.symBadge.appendChild(UI.statusBadge(PT.feed.grade(q), q ? q.source : null));
+    R.symBadge.appendChild(UI.statusBadge(PT.feed.grade(q, S.focus), q ? q.source : null));
 
     R.symStats.innerHTML = '';
     const stat = (k, v) => R.symStats.appendChild(el('div', { class: 'symhead__stat' }, [
       el('div', { class: 'k', text: k }), el('div', { class: 'v', text: v }),
     ]));
     if (q) {
-      stat('24h high', q.dayHigh ? U.fmtUSD(q.dayHigh) : '—');
-      stat('24h low', q.dayLow ? U.fmtUSD(q.dayLow) : '—');
-      stat('Volume', q.volume ? U.fmtCompact(q.volume) : '—');
+      const isCrypto = PT.isCrypto(S.focus);
+      /*
+       * Nasdaq's quote carries no range or volume. Rather than show three
+       * dashes, derive them from the newest daily candle we already hold —
+       * real data from the same source, just a different endpoint.
+       */
+      const daily = S.candleCache[S.focus + ':1D'];
+      const bar = !isCrypto && daily && daily.length ? daily[daily.length - 1] : null;
+      const high = q.dayHigh != null ? q.dayHigh : (bar ? bar.h : null);
+      const low = q.dayLow != null ? q.dayLow : (bar ? bar.l : null);
+      const vol = q.volume != null ? q.volume : (bar ? bar.v : null);
+      // "24h" is a rolling window and only true for crypto; equities have a session.
+      const label = isCrypto ? '24h' : 'Day';
+
+      stat(`${label} high`, high ? U.fmtUSD(high) : '—');
+      stat(`${label} low`, low ? U.fmtUSD(low) : '—');
+      stat('Volume', vol ? U.fmtCompact(vol) : '—');
       const pos = A.pfUser().positions[S.focus];
       if (pos) stat('Your position', `${U.fmtQty(pos.qty)} @ ${U.fmtUSD(pos.avgCost)}`);
     }
