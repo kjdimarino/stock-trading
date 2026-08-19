@@ -523,6 +523,15 @@ const TF_MS = { '1m': 60e3, '5m': 300e3, '15m': 900e3, '1h': 3600e3 };
  * OHLC bars, so we aggregate samples into buckets. The open/high/low/close of
  * each bucket are derived from real prints; only volume is unavailable, and it
  * is reported as 0 rather than invented.
+ *
+ * At 1m the bucket is exactly as wide as the sample period, so every bucket
+ * holds a single print and o=h=l=c — a chart of 900 flat dashes with no bodies
+ * at all. For those buckets the open is chained to the previous bucket's close,
+ * which is the correct reading of a continuous series sampled once per minute:
+ * the body then shows the real move over that minute. High and low are the
+ * extremes of the two known prices, so they understate the true range — the
+ * response says `detail: 'close-only'` so the UI can label it rather than let
+ * it pass as full OHLC.
  */
 async function nasdaqIntradayCandles(symbol, tf) {
   const width = TF_MS[tf];
@@ -548,15 +557,32 @@ async function nasdaqIntradayCandles(symbol, tf) {
     if (!isFinite(t) || !isFinite(price)) continue;
     const key = Math.floor(t / width) * width;
     const b = buckets.get(key);
-    if (!b) buckets.set(key, { t: key, o: price, h: price, l: price, c: price, v: 0 });
+    if (!b) buckets.set(key, { t: key, o: price, h: price, l: price, c: price, v: 0, n: 1 });
     else {
       if (price > b.h) b.h = price;
       if (price < b.l) b.l = price;
       b.c = price;
+      b.n++;
     }
   }
   const bars = [...buckets.values()].sort((a, b) => a.t - b.t);
   if (!bars.length) throw new Error(`nasdaq intraday produced no bars for ${symbol}`);
+
+  let singles = 0;
+  for (let i = 0; i < bars.length; i++) {
+    const b = bars[i];
+    if (b.n === 1) {
+      singles++;
+      const prev = bars[i - 1];
+      if (prev) {
+        b.o = prev.c;
+        b.h = Math.max(b.o, b.c);
+        b.l = Math.min(b.o, b.c);
+      }
+    }
+    delete b.n;
+  }
+  bars.closeOnly = singles > bars.length / 2;
   return bars;
 }
 
@@ -636,6 +662,8 @@ export function fetchCandles(assetId, tf, hint) {
         bars, source: 'nasdaq', quality: 'delayed', tf, assetId,
         // Nasdaq's free intraday feed carries prices but no per-bar volume.
         volume: tf === '1D' || tf === '1W',
+        // One sample per minute: the bodies are real, the wicks are not.
+        closeOnly: bars.closeOnly === true,
         note: `yahoo: ${yErr.message}`,
       };
     }

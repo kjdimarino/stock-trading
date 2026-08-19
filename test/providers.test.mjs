@@ -102,6 +102,17 @@ describe('freshness labelling', () => {
     }
   });
 
+  it('1m equity candles are not a row of flat dashes', async () => {
+    const r = await P.fetchCandles('AAPL', '1m', { kind: 'stock' });
+    ok(r.bars.length > 20, `only ${r.bars.length} bars`);
+    const flat = r.bars.filter((b) => b.o === b.h && b.h === b.l && b.l === b.c).length;
+    ok(flat < r.bars.length * 0.5,
+      `${flat}/${r.bars.length} bars have no body — candles would be unreadable`);
+    for (const b of r.bars) {
+      ok(b.h >= Math.max(b.o, b.c) && b.l <= Math.min(b.o, b.c), `bar at ${b.t} has an inverted range`);
+    }
+  });
+
   it('health reports every provider budget', () => {
     const h = P.providerHealth();
     for (const k of ['nasdaq', 'coingecko', 'coinbase']) ok(h[k], `missing ${k}`);

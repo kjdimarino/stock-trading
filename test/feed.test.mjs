@@ -90,6 +90,67 @@ describe('folding ticks into candles', () => {
   });
 });
 
+describe('sub-minute candles built from the tick buffer', () => {
+  /* Push prints for a throwaway symbol so each case starts from a clean buffer. */
+  let n = 0;
+  const feed = (prints) => {
+    const id = `TICKTEST${n++}`;
+    for (const [t, p] of prints) F.applyQuote(id, { price: p, t });
+    return id;
+  };
+  const base = Math.floor(Date.now() / 1000) * 1000;
+
+  it('chains each bar open to the previous close so bodies are real', () => {
+    const id = feed([[base - 4000, 100], [base - 3000, 101], [base - 2000, 99]]);
+    const bars = F.candlesFromTicks(id, '1s');
+    const body = bars.find((b) => b.t === base - 3000);
+    eq(body.o, 100, 'opens where the previous second closed');
+    eq(body.c, 101);
+    ok(body.o !== body.c, 'a moving price must not produce a flat dash');
+  });
+
+  it('high and low bound the whole bar, open included', () => {
+    const id = feed([[base - 4000, 100], [base - 3000, 90]]);
+    const b = F.candlesFromTicks(id, '1s').find((x) => x.t === base - 3000);
+    eq(b.h, 100);
+    eq(b.l, 90);
+  });
+
+  it('carries quiet buckets forward flat instead of dropping them', () => {
+    const id = feed([[base - 10000, 50], [base - 4000, 51]]);
+    const bars = F.candlesFromTicks(id, '1s');
+    const ts = bars.map((b) => b.t);
+    for (let i = 1; i < ts.length; i++) eq(ts[i] - ts[i - 1], 1000, 'uniform one-second grid');
+    const quiet = bars.find((b) => b.t === base - 7000);
+    ok(quiet, 'a second with no prints still has a bar');
+    eq(quiet.o, 50); eq(quiet.c, 50); eq(quiet.h, 50); eq(quiet.l, 50);
+  });
+
+  it('runs the series up to the current bucket', () => {
+    const id = feed([[base - 5000, 20]]);
+    const bars = F.candlesFromTicks(id, '1s');
+    ok(bars.length >= 5, `expected the gap to now to be filled, got ${bars.length}`);
+    eq(bars[bars.length - 1].c, 20);
+  });
+
+  it('caps the window so a long-lived buffer cannot explode the bar count', () => {
+    const id = feed([[base - 3600e3, 10], [base - 1000, 11]]);
+    const bars = F.candlesFromTicks(id, '1s');
+    ok(bars.length <= 240, `expected a bounded window, got ${bars.length}`);
+    eq(bars[0].o, 10, 'the first visible bar still opens at a real price');
+  });
+
+  it('buckets at the requested width', () => {
+    const id = feed([[base - 20000, 7], [base - 1000, 8]]);
+    const bars = F.candlesFromTicks(id, '5s');
+    for (let i = 1; i < bars.length; i++) eq(bars[i].t - bars[i - 1].t, 5000);
+  });
+
+  it('returns nothing at all when no print has ever arrived', () => {
+    eq(F.candlesFromTicks('NEVER_SEEN', '1s').length, 0);
+  });
+});
+
 describe('freshness grading', () => {
   const q = (over) => Object.assign({ assetId: 'AAPL', price: 100, quality: 'live', t: Date.now() }, over);
 

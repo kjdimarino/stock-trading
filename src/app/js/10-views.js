@@ -121,6 +121,37 @@
     loadChart(true);
   }
 
+  /*
+   * Sub-minute candles are aggregated locally from the print stream, so the
+   * series starts empty and fills in as prints arrive. Say that plainly instead
+   * of leaving an empty chart with no explanation, and name the real source:
+   * crypto is a genuine trade feed, equities are a poll.
+   */
+  function tickSeriesState(assetId, tf, bars) {
+    const crypto = PT.isCrypto(assetId);
+    const label = crypto ? 'live trades' : 'polled quotes';
+    const n = bars ? bars.length : 0;
+    if (n >= 3) return { label, message: null };
+    if (!crypto && !PT.calendar.stockStatus().isOpen) {
+      return {
+        label,
+        message: `${tf} candles are built from live prints. The US market is closed, `
+          + 'so nothing new is coming in — try a crypto symbol, or 1m and above.',
+      };
+    }
+    return {
+      label,
+      message: `Building ${tf} candles from ${label}… ${n} bar${n === 1 ? '' : 's'} so far.`,
+    };
+  }
+
+  function showChartMsg(text) {
+    if (!R.chartMsg) return;
+    R.chartMsg.classList.remove('hidden');
+    R.chartMsg.innerHTML = '';
+    R.chartMsg.append(el('div', { class: 'spinner' }), text);
+  }
+
   async function loadChart(force) {
     const assetId = S.focus;
     const tf = S.tf;
@@ -137,8 +168,16 @@
       S.barsMeta = res;
       S.candleCache[assetId + ':' + tf] = res.bars;
       S.chart.setData(res.bars, tf);
-      R.chartMsg.classList.add('hidden');
-      R.chartSource.textContent = `${res.bars.length} bars · ${res.source}`;
+      if (PT.feed.SECOND_TFS.has(tf)) {
+        const st = tickSeriesState(assetId, tf, res.bars);
+        if (st.message) showChartMsg(st.message);
+        else R.chartMsg.classList.add('hidden');
+        R.chartSource.textContent = `${res.bars.length} bars · ${st.label}`;
+      } else {
+        R.chartMsg.classList.add('hidden');
+        R.chartSource.textContent = `${res.bars.length} bars · ${res.source}`
+          + (res.closeOnly ? ' · close-only, no intraday high/low' : '');
+      }
     } catch (e) {
       // Guard on the timeframe too: a slow failure for a timeframe the user has
       // already moved on from would otherwise blank a chart that loaded fine.
@@ -856,6 +895,6 @@
   PT.views = Object.assign(PT.views || {}, {
     buildChartPane, loadChart, buildBlotter, renderBlotter, buildOrderPane,
     updateEstimate, renderAll, renderTopbar, renderSymbolHeader, renderStatusbar,
-    table, TIMEFRAMES,
+    table, TIMEFRAMES, tickSeriesState, showChartMsg,
   });
 })(window.PT);

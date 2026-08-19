@@ -265,8 +265,12 @@
          */
         S.bars = PT.feed.candlesFromTicks(S.focus, S.tf);
         S.chart.setData(S.bars, S.tf);
-        if (S.bars.length > 1 && R.chartMsg) R.chartMsg.classList.add('hidden');
-        if (R.chartSource) R.chartSource.textContent = `${S.bars.length} bars · live ticks`;
+        const st = V.tickSeriesState(S.focus, S.tf, S.bars);
+        if (R.chartMsg) {
+          if (st.message) V.showChartMsg(st.message);
+          else R.chartMsg.classList.add('hidden');
+        }
+        if (R.chartSource) R.chartSource.textContent = `${S.bars.length} bars · ${st.label}`;
         return;
       }
 

@@ -82,23 +82,59 @@
     }
   }
 
-  /** Aggregate the tick buffer into OHLC candles of `width` ms. */
+  /*
+   * How many sub-minute bars to keep on screen. Enough to read a trend at 1s
+   * without the empty-bucket fill below turning into thousands of bars.
+   */
+  const TICK_BAR_WINDOW = 240;
+
+  /**
+   * Aggregate the tick buffer into OHLC candles of `width` ms.
+   *
+   * Two things matter here that a naive bucket-and-sum gets wrong:
+   *
+   *  - A bucket usually holds a single print at these widths, so opening the
+   *    bar at that print gives o=h=l=c and the chart is a row of flat dashes
+   *    with no bodies. The open is chained to the previous bar's close instead,
+   *    which is what the price actually did over that second.
+   *  - Buckets with no prints were skipped entirely, so the x-axis compressed
+   *    quiet stretches and a 1s chart of a slow mover looked like a handful of
+   *    bars scattered at random. Empty buckets are now carried forward flat at
+   *    the last close, which is the honest picture: the price did not move
+   *    because nothing traded.
+   */
   function candlesFromTicks(assetId, tf) {
     const width = TF_MS[tf];
     const buf = state.ticks[assetId];
-    if (!width || !buf || buf.length < 2) return [];
+    if (!width || !buf || !buf.length) return [];
+
+    const now = Date.now();
+    const lastBucket = Math.floor(now / width) * width;
+    const firstSeen = Math.floor(buf[0].t / width) * width;
+    const start = Math.max(firstSeen, lastBucket - (TICK_BAR_WINDOW - 1) * width);
+
     const bars = [];
-    let cur = null;
-    for (const { t, p } of buf) {
-      const bucket = Math.floor(t / width) * width;
-      if (!cur || cur.t !== bucket) {
-        cur = { t: bucket, o: p, h: p, l: p, c: p, v: 0 };
-        bars.push(cur);
-      } else {
-        cur.c = p;
-        if (p > cur.h) cur.h = p;
-        if (p < cur.l) cur.l = p;
+    let i = 0;
+    // Skip prints older than the visible window, but remember the last of them
+    // so the first bar opens at a real price rather than out of nowhere.
+    let carry = null;
+    while (i < buf.length && Math.floor(buf[i].t / width) * width < start) { carry = buf[i].p; i++; }
+
+    for (let bucket = start; bucket <= lastBucket; bucket += width) {
+      let h = -Infinity, l = Infinity, c = null;
+      while (i < buf.length && Math.floor(buf[i].t / width) * width === bucket) {
+        const p = buf[i].p;
+        if (p > h) h = p;
+        if (p < l) l = p;
+        c = p;
+        i++;
       }
+      if (c === null && carry === null) continue;      // nothing known yet
+      const open = carry === null ? c : carry;
+      const close = c === null ? open : c;
+      // -Infinity / Infinity from an empty bucket fall out of max/min on their own.
+      bars.push({ t: bucket, o: open, h: Math.max(open, close, h), l: Math.min(open, close, l), c: close, v: 0 });
+      carry = close;
     }
     return bars;
   }
@@ -437,7 +473,10 @@
       + (a.yh ? `&yh=${encodeURIComponent(a.yh)}` : '');
     const j = await api(`/api/candles?asset=${encodeURIComponent(assetId)}&tf=${encodeURIComponent(tf)}${hint}`);
     if (j.error) throw new Error(j.error);
-    const entry = { bars: j.bars, at: Date.now(), source: j.source, quality: j.quality, tf, assetId };
+    const entry = {
+      bars: j.bars, at: Date.now(), source: j.source, quality: j.quality, tf, assetId,
+      closeOnly: j.closeOnly === true,
+    };
     candleCache.set(key, entry);
     return entry;
   }
