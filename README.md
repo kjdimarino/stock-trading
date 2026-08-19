@@ -179,7 +179,7 @@ test/              unit, live-data and browser suites
 
 ### Tests
 
-343 assertions across 10 suites:
+346 assertions across 10 suites:
 
 | Suite | What it covers |
 |---|---|
