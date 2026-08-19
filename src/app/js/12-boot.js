@@ -40,17 +40,38 @@
           });
         }
       }
-      if (fills.length) A.save();
+      // An order that could not fill must say so; silently vanishing is worse.
+      for (const r of (fills.rejected || [])) {
+        if (id === 'user') {
+          UI.toast({
+            kind: 'error',
+            title: `Order could not fill: ${r.side} ${U.fmtQty(r.qty)} ${r.assetId}`,
+            message: r.rejectedReason,
+            timeout: 9000,
+          });
+        }
+      }
+      if (fills.length || (fills.rejected && fills.rejected.length)) A.save();
     }
 
-    /* Equity curve sampling for both books. */
+    /*
+     * Equity curve sampling for both books.
+     *
+     * Only sample a fully priced book. At startup the feed is empty, so
+     * `valuate` values positions at cost basis — sampling that would write a
+     * false trough into the persisted curve on every page load and invent a
+     * drawdown that never happened.
+     */
     if (now - lastEquitySample > 10000) {
-      lastEquitySample = now;
+      let sampled = false;
       for (const id of ['user', 'ai']) {
         const pf = S.st.portfolios[id];
-        E.sampleEquity(pf, E.valuate(pf, px).equity, now);
+        const v = E.valuate(pf, px);
+        if (v.staleCount > 0) continue;
+        E.sampleEquity(pf, v.equity, now);
+        sampled = true;
       }
-      A.save();
+      if (sampled) { lastEquitySample = now; A.save(); }
     }
 
     /* Chrome refresh, throttled — price cells update on their own via ticks. */
@@ -108,7 +129,7 @@
         try {
           const res = await PT.feed.candles(id, '15m');
           candles[id] = res.bars;
-          S.candleCache[id] = res.bars;
+          S.candleCache[id + ':15m'] = res.bars;
         } catch { /* skip anything we cannot price honestly */ }
       }
 

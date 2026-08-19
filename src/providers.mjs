@@ -56,17 +56,39 @@ async function through(key, ttl, fetcher) {
  * deliberately: a token bucket for steady state, plus escalating cooldown
  * whenever it answers 429.
  */
-function createLimiter({ capacity, refillMs }) {
-  let tokens = capacity;
-  let last = Date.now();
+/**
+ * Leaky bucket with burst, scheduled by *reservation*.
+ *
+ * A token-count-plus-sleep design is unsafe under concurrency: every caller
+ * runs its own `take()` body synchronously before any await resolves, so N
+ * callers all observe the same token count, all sleep the same interval and
+ * all fire together — the bucket admits the exact burst it exists to prevent.
+ *
+ * Here each caller claims the next free slot and advances `nextAt` before
+ * awaiting anything, so N concurrent callers are spaced `refillMs` apart no
+ * matter how they interleave.
+ */
+function createLimiter({ capacity, refillMs, maxWaitMs = 4000 }) {
+  let nextAt = 0;             // earliest instant the next request may go out
   let cooldownUntil = 0;
   let strikes = 0;
 
+  const availableAt = (now) => Math.max(now - capacity * refillMs, nextAt);
+
   return {
     get state() {
-      return { tokens: Math.floor(tokens), cooling: Date.now() < cooldownUntil, cooldownUntil, strikes };
+      const now = Date.now();
+      // Report the burst budget that is genuinely available right now.
+      const slack = Math.max(0, now - availableAt(now));
+      return {
+        tokens: Math.min(capacity, Math.floor(slack / refillMs)),
+        cooling: now < cooldownUntil,
+        cooldownUntil,
+        strikes,
+      };
     },
-    /** Wait for a token; throws if the provider is in cooldown. */
+
+    /** Reserve a slot. Throws if the provider is cooling or the queue is long. */
     async take() {
       const now = Date.now();
       if (now < cooldownUntil) {
@@ -74,44 +96,35 @@ function createLimiter({ capacity, refillMs }) {
         e.cooling = true;
         throw e;
       }
-      tokens = Math.min(capacity, tokens + (now - last) / refillMs);
-      last = now;
-      if (tokens < 1) {
-        const waitMs = Math.ceil((1 - tokens) * refillMs);
-        if (waitMs > 4000) {
-          const e = new Error('rate limit budget exhausted');
-          e.throttled = true;
-          throw e;
-        }
-        await new Promise((r) => setTimeout(r, waitMs));
-        tokens = 0;
-        last = Date.now();
-        return;
+      const slot = Math.max(now, availableAt(now));
+      const wait = slot - now;
+      if (wait > maxWaitMs) {
+        const e = new Error('rate limit budget exhausted');
+        e.throttled = true;
+        throw e;
       }
-      tokens -= 1;
+      nextAt = slot + refillMs;   // claimed synchronously, before any await
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
     },
+
     penalise() {
       strikes = Math.min(strikes + 1, 5);
       const backoff = Math.min(300000, 20000 * 2 ** (strikes - 1)); // 20s → 5min
       cooldownUntil = Date.now() + backoff;
-      tokens = 0;
+      nextAt = cooldownUntil;
       return backoff;
     },
     reward() { strikes = 0; },
   };
 }
 
-/*
- * query1 and query2 are rate limited independently — one can be in a penalty
- * box while the other answers 200 — so each gets its own budget and cooldown,
- * and we always spend from whichever host has the most headroom.
- */
 const YAHOO_HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
 const yahooLimiters = Object.fromEntries(
-  YAHOO_HOSTS.map((h) => [h, createLimiter({ capacity: 5, refillMs: 2500 })]),
+  YAHOO_HOSTS.map((h) => [h, createLimiter({ capacity: 5, refillMs: 2500, maxWaitMs: 12000 })]),
 );
-const nasdaqLimiter = createLimiter({ capacity: 8, refillMs: 700 });
-const geckoLimiter = createLimiter({ capacity: 5, refillMs: 2500 });
+const nasdaqLimiter = createLimiter({ capacity: 8, refillMs: 700, maxWaitMs: 15000 });
+const geckoLimiter = createLimiter({ capacity: 5, refillMs: 2500, maxWaitMs: 20000 });
+const coinbaseLimiter = createLimiter({ capacity: 10, refillMs: 120, maxWaitMs: 10000 });
 
 /** The host with the most tokens that is not cooling down, or null. */
 function pickYahooHost() {
@@ -162,6 +175,10 @@ function quoteFromYahooChart(json, symbol) {
     : isFinite(m.previousClose) ? m.previousClose : null;
   const change = prev != null ? price - prev : null;
 
+  const quoteTime = (m.regularMarketTime || 0) * 1000 || null;
+  const stampAgeMs = quoteTime ? Date.now() - quoteTime : null;
+  const fresh = m.marketState === 'REGULAR' && (stampAgeMs == null || stampAgeMs < 15 * 60000);
+
   return {
     symbol,
     price,
@@ -176,15 +193,19 @@ function quoteFromYahooChart(json, symbol) {
     currency: m.currency || 'USD',
     exchange: m.fullExchangeName || m.exchangeName || null,
     marketState: m.marketState || null,
-    quoteTime: (m.regularMarketTime || 0) * 1000 || null,
+    quoteTime,
     source: 'yahoo',
-    quality: 'live',
+    /*
+     * Real data, but the print may be old: outside regular hours this is the
+     * last close, not a live quote, and labelling it 'live' would put a pulsing
+     * green dot on a Friday price all weekend.
+     */
+    quality: fresh ? 'live' : 'delayed',
   };
 }
 
 /** Nasdaq's public quote endpoint — used when Yahoo is throttled. */
 async function nasdaqQuote(symbol) {
-  await nasdaqLimiter.take();
   const num = (s) => {
     if (s == null) return null;
     const v = parseFloat(String(s).replace(/[$,%+\s]/g, ''));
@@ -192,6 +213,8 @@ async function nasdaqQuote(symbol) {
   };
   for (const cls of ['stocks', 'etf']) {
     try {
+      // A token per request: this loop can fire twice for an ETF.
+      await nasdaqLimiter.take();
       const j = await getJSON(
         `https://api.nasdaq.com/api/quote/${encodeURIComponent(symbol)}/info?assetclass=${cls}`,
         { timeout: 8000 },
@@ -263,10 +286,10 @@ export function cryptoQuote(symbol, ttl = 4000) {
   return through(`c:${symbol}`, ttl, async () => {
     const meta = CB_BY_SYMBOL[symbol];
     if (!meta) throw new Error(`unknown crypto ${symbol}`);
-    const [ticker, stats] = await Promise.all([
-      getJSON(`https://api.exchange.coinbase.com/products/${meta.cb}/ticker`, { timeout: 8000 }),
-      getJSON(`https://api.exchange.coinbase.com/products/${meta.cb}/stats`, { timeout: 8000 }),
-    ]);
+    await coinbaseLimiter.take();
+    const ticker = await getJSON(`https://api.exchange.coinbase.com/products/${meta.cb}/ticker`, { timeout: 8000 });
+    await coinbaseLimiter.take();
+    const stats = await getJSON(`https://api.exchange.coinbase.com/products/${meta.cb}/stats`, { timeout: 8000 });
     const price = parseFloat(ticker.price);
     const open = parseFloat(stats.open);
     if (!isFinite(price)) throw new Error(`no price for ${symbol}`);
@@ -297,13 +320,16 @@ export function cryptoQuote(symbol, ttl = 4000) {
  * user follows two coins or forty.
  */
 function cryptoSnapshotAll(ttl = 5000) {
-  return through('cb:stats', ttl, async () => ({
-    stats: await getJSON('https://api.exchange.coinbase.com/products/stats', { timeout: 12000 }),
-    source: 'coinbase', quality: 'live',
-  }));
+  return through('cb:stats', ttl, async () => {
+    await coinbaseLimiter.take();
+    return {
+      stats: await getJSON('https://api.exchange.coinbase.com/products/stats', { timeout: 12000 }),
+      source: 'coinbase', quality: 'live',
+    };
+  });
 }
 
-function quoteFromCoinbaseStats(symbol, row) {
+function quoteFromCoinbaseStats(symbol, row, envelope) {
   const price = parseFloat(row.last);
   if (!isFinite(price)) return null;
   const open = parseFloat(row.open);
@@ -320,7 +346,14 @@ function quoteFromCoinbaseStats(symbol, row) {
     currency: 'USD',
     exchange: 'Coinbase',
     source: 'coinbase',
-    quality: 'live',
+    /*
+     * Inherit the snapshot's own freshness. When `through()` serves a stale
+     * snapshot because Coinbase is down, stamping these quotes 'live' would
+     * paint an hour-old price with a pulsing green Live dot.
+     */
+    quality: (envelope && envelope.quality) || 'live',
+    ageMs: envelope ? envelope.ageMs : 0,
+    staleError: envelope ? envelope.error : undefined,
   };
 }
 
@@ -332,7 +365,7 @@ export async function cryptoQuotes(symbols, ttl) {
     for (const s of symbols) {
       const meta = CB_BY_SYMBOL[s];
       const row = meta && snap.stats[meta.cb] && snap.stats[meta.cb].stats_24hour;
-      const q = row ? quoteFromCoinbaseStats(s, row) : null;
+      const q = row ? quoteFromCoinbaseStats(s, row, snap) : null;
       if (q) out[s] = q; else missing.push(s);
     }
     // Anything the bulk feed did not cover falls back to a per-product call.
@@ -434,13 +467,13 @@ const TF_MS = { '1m': 60e3, '5m': 300e3, '15m': 900e3, '1h': 3600e3 };
  * is reported as 0 rather than invented.
  */
 async function nasdaqIntradayCandles(symbol, tf) {
-  await nasdaqLimiter.take();
   const width = TF_MS[tf];
   if (!width) throw new Error(`nasdaq intraday does not cover ${tf}`);
 
   let json = null;
   for (const cls of ['stocks', 'etf']) {
     try {
+      await nasdaqLimiter.take();
       const j = await getJSON(
         `https://api.nasdaq.com/api/quote/${encodeURIComponent(symbol)}/chart?assetclass=${cls}`,
         { timeout: 12000 },
@@ -471,7 +504,6 @@ async function nasdaqIntradayCandles(symbol, tf) {
 
 /** Real daily OHLCV from Nasdaq's historical table. */
 async function nasdaqDailyCandles(symbol, days = 400) {
-  await nasdaqLimiter.take();
   const to = new Date();
   const from = new Date(to.getTime() - days * 86400e3);
   const iso = (d) => d.toISOString().slice(0, 10);
@@ -479,6 +511,7 @@ async function nasdaqDailyCandles(symbol, days = 400) {
   let rows = null;
   for (const cls of ['stocks', 'etf']) {
     try {
+      await nasdaqLimiter.take();
       const j = await getJSON(
         `https://api.nasdaq.com/api/quote/${encodeURIComponent(symbol)}/historical`
         + `?assetclass=${cls}&fromdate=${iso(from)}&todate=${iso(to)}&limit=${days}`,
@@ -519,6 +552,7 @@ export function fetchCandles(assetId, tf) {
     if (asset.kind === 'crypto') {
       try {
         const gran = CB_TF[tf];
+        await coinbaseLimiter.take();
         const j = await getJSON(
           `https://api.exchange.coinbase.com/products/${asset.cb}/candles?granularity=${gran}`,
           { timeout: 10000 },
@@ -605,6 +639,7 @@ export function providerHealth() {
     yahoo: Object.fromEntries(YAHOO_HOSTS.map((h) => [h.split('.')[0], yahooLimiters[h].state])),
     nasdaq: nasdaqLimiter.state,
     coingecko: geckoLimiter.state,
+    coinbase: coinbaseLimiter.state,
     cacheEntries: cache.size,
     inflight: inflight.size,
   };

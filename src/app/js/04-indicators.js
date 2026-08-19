@@ -173,7 +173,9 @@
     for (const b of slice) { if (b.h > hi) hi = b.h; if (b.l < lo) lo = b.l; }
     const last = slice[slice.length - 1].c;
     if (!(hi > lo)) return null;
-    return { high: hi, low: lo, position: (last - lo) / (hi - lo) };
+    // Report the window actually measured — the caller may have had fewer bars
+    // than the requested lookback, and the label must not overstate it.
+    return { high: hi, low: lo, position: (last - lo) / (hi - lo), lookback: slice.length };
   }
 
   /**
@@ -266,7 +268,7 @@
 
     // Position in the longer-term range.
     if (ind.range) add('range', 0.5, (ind.range.position - 0.5) * 1.6,
-      `${(ind.range.position * 100).toFixed(0)}% of the 52-period range`);
+      `${(ind.range.position * 100).toFixed(0)}% of the ${ind.range.lookback}-bar range`);
 
     if (!factors.length) return null;
 

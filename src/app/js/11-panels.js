@@ -18,6 +18,10 @@
   /* ============================= portfolio =============================== */
 
   function renderPortfolioView() {
+    // These views replace the chart pane's contents. Without an explicit
+    // teardown the canvases stay detached but alive, and every incoming tick
+    // keeps repainting them off-screen.
+    if (S.chart) { S.chart.destroy(); S.chart = null; S.bars = null; }
     const host = R.chartpane;
     const pf = A.pfUser();
     const val = E.valuate(pf, A.prices());
@@ -58,7 +62,10 @@
           el('span', { class: U.dirClass(val.totalReturn), text: `${U.fmtSigned(val.totalReturn)} (${U.fmtPct(val.totalReturnPct)})` }),
           el('span', { class: 'dimmer', text: 'all time' }),
           el('span', { class: 'dimmer', text: '·' }),
-          el('span', { class: U.dirClass(day.change), text: `${U.fmtSigned(day.change)} (${U.fmtPct(day.changePct)})` }),
+          el('span', {
+            class: day.pending ? 'dim' : U.dirClass(day.change),
+            text: day.pending ? '—' : `${U.fmtSigned(day.change)} (${U.fmtPct(day.changePct)})`,
+          }),
           el('span', { class: 'dimmer', text: 'today' }),
         ]),
       ]),
@@ -104,6 +111,10 @@
   /* ============================== scoreboard ============================= */
 
   function renderCompareView() {
+    // These views replace the chart pane's contents. Without an explicit
+    // teardown the canvases stay detached but alive, and every incoming tick
+    // keeps repainting them off-screen.
+    if (S.chart) { S.chart.destroy(); S.chart = null; S.bars = null; }
     const host = R.chartpane;
     const user = A.pfUser();
     const ai = A.pfAI();
@@ -248,6 +259,10 @@
   ];
 
   function renderAIView() {
+    // These views replace the chart pane's contents. Without an explicit
+    // teardown the canvases stay detached but alive, and every incoming tick
+    // keeps repainting them off-screen.
+    if (S.chart) { S.chart.destroy(); S.chart = null; S.bars = null; }
     const host = R.chartpane;
     host.innerHTML = '';
 
@@ -352,21 +367,23 @@
     // 3. A symbol mentioned by name.
     const symbol = findSymbol(question);
     if (symbol) {
-      const bars = await ensureBars(symbol);
-      const brief = C.briefAsset(symbol, bars, A.prices()[symbol]);
+      const tf = companionTf();
+      const bars = await ensureBars(symbol, tf);
+      const brief = C.briefAsset(symbol, bars, A.prices()[symbol], tf);
       const nodes = [el('p', {}, [el('strong', {}, brief.headline)]), bullets(brief.body)];
       if (brief.signal) nodes.push(signalReadout(brief.signal, brief.indicators));
       await withOptionalModel(nodes, question,
-        { symbol, indicators: compactIndicators(brief.indicators), signal: brief.signal },
-        brief.indicators ? `Computed from ${brief.indicators.bars} ${S.tf} candles` : 'Awaiting data');
+        { symbol, timeframe: tf, indicators: compactIndicators(brief.indicators), signal: brief.signal },
+        brief.indicators ? `Computed from ${brief.indicators.bars} ${tf} candles` : 'Awaiting data');
       return;
     }
 
     // 4. What is moving.
     if (/moving|movers|watchlist|trend|momentum|scan/.test(q)) {
       const entries = [];
+      const tf = companionTf();
       for (const id of S.st.watchlist.slice(0, 8)) {
-        entries.push({ assetId: id, bars: await ensureBars(id), quote: A.prices()[id] });
+        entries.push({ assetId: id, bars: await ensureBars(id, tf), quote: A.prices()[id] });
       }
       const scan = C.scanMovers(entries);
       if (!scan.length) {
@@ -469,14 +486,25 @@
     return null;
   }
 
-  async function ensureBars(assetId) {
-    if (S.candleCache[assetId] && S.candleCache[assetId].length) return S.candleCache[assetId];
+  /**
+   * Candles for the companion, at the timeframe it will report. The cache is
+   * keyed by timeframe so a 15m series cached by the AI cycle is never handed
+   * back and described as 5m data.
+   */
+  async function ensureBars(assetId, tf) {
+    const want = tf || companionTf();
+    const key = assetId + ':' + want;
+    const hit = S.candleCache[key];
+    if (hit && hit.length) return hit;
     try {
-      const res = await PT.feed.candles(assetId, S.tf === '1W' ? '1D' : S.tf);
-      S.candleCache[assetId] = res.bars;
+      const res = await PT.feed.candles(assetId, want);
+      S.candleCache[key] = res.bars;
       return res.bars;
     } catch { return []; }
   }
+
+  /** Weekly bars are too coarse for the indicator set; fall back to daily. */
+  const companionTf = () => (S.tf === '1W' ? '1D' : S.tf);
 
   /* =============================== settings ============================== */
 
@@ -547,6 +575,13 @@
       confirmLabel: 'Reset portfolio',
       danger: true,
       onConfirm: () => {
+        /*
+         * `location.reload()` is asynchronous, so a debounced save armed in the
+         * last 600ms would otherwise fire after the wipe and write the old book
+         * straight back — the reset would silently do nothing.
+         */
+        S.resetting = true;
+        A.save.cancel();
         E.clear();
         location.reload();
       },
@@ -587,17 +622,31 @@
       grid.appendChild(node);
     });
 
+    const MIN_CASH = 100;
+    const customError = el('div', { class: 'order__err hidden' });
+
     customInput.addEventListener('input', () => {
-      const v = Number(customInput.value);
-      if (v >= 100) { selected = v; paint(); }
+      const raw = customInput.value.trim();
+      const v = Number(raw);
+      customInput.classList.toggle('input--invalid', raw !== '' && !(v >= MIN_CASH));
+      if (raw === '' || v >= MIN_CASH) customError.classList.add('hidden');
+      if (v >= MIN_CASH) { selected = v; paint(); }
     });
 
     const start = el('button', { class: 'btn btn--primary btn--lg btn--block', text: 'Start trading' });
     start.addEventListener('click', () => {
-      const v = Number(customInput.value);
-      const cash = v >= 100 ? v : selected;
+      const raw = customInput.value.trim();
+      const v = Number(raw);
+      // Say so rather than quietly opening an account for a different amount.
+      if (raw !== '' && !(v >= MIN_CASH)) {
+        customError.textContent = `Minimum starting balance is $${MIN_CASH}. Clear the box to use a preset instead.`;
+        customError.classList.remove('hidden');
+        customInput.classList.add('input--invalid');
+        customInput.focus();
+        return;
+      }
       root.remove();
-      onDone(cash);
+      onDone(raw === '' ? selected : v);
     });
 
     card.append(
@@ -612,6 +661,7 @@
       el('div', { class: 'field' }, [
         el('div', { class: 'field__label' }, 'Or set your own'),
         customInput,
+        customError,
       ]),
       start,
       el('div', { class: 'onboard__foot' },

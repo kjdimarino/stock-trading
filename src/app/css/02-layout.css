@@ -15,6 +15,8 @@
     "status status  status  status";
 }
 .terminal > * { background: var(--surface-1); min-width: 0; min-height: 0; }
+/* Declared after the blanket rule above so it wins without !important. */
+.terminal > .statusbar { background: var(--surface-2); }
 
 .rail { grid-area: rail; }
 .topbar { grid-area: topbar; }
@@ -79,7 +81,7 @@
 /* -------------------------------- status bar ----------------------------- */
 .statusbar {
   display: flex; align-items: center; gap: var(--sp-3);
-  padding: 0 var(--sp-3); background: var(--surface-2) !important;
+  padding: 0 var(--sp-3);
   font-size: var(--fs-2xs); color: var(--text-tertiary);
 }
 .statusbar__spacer { flex: 1; }

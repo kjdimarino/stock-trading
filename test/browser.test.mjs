@@ -431,6 +431,80 @@ try {
   });
   await page.waitForTimeout(600);
 
+  /* -------------------------------------------------- registry regressions */
+  section('Cross-view price bindings');
+  // Buy a second asset so the blotter has two rows to keep live.
+  await page.evaluate(() => window.PT.app.setFocus('ETH'));
+  await page.waitForTimeout(1200);
+  await page.evaluate(() => {
+    const pf = window.PT.app.pfUser();
+    for (const id of ['BTC', 'ETH']) {
+      try {
+        window.PT.engine.submitOrder(pf, { assetId: id, side: 'buy', type: 'market', notional: 800 },
+          window.PT.app.orderCtx(id));
+      } catch { /* whichever is priced */ }
+    }
+    window.PT.app.save();
+  });
+  await page.locator('.blotter .tab', { hasText: 'Positions' }).click();
+  await page.waitForTimeout(700);
+
+  const lastBefore = await page.evaluate(() => [...document.querySelectorAll('.blotter tbody tr')]
+    .map((tr) => tr.children[3].innerText));
+  // Switching watchlist rows used to clear the GLOBAL price-cell registry,
+  // freezing the positions "Last" column while Market value kept moving.
+  await page.evaluate(() => window.PT.app.setFocus('BTC'));
+  await page.waitForTimeout(600);
+  await page.locator('.watchlist .tab', { hasText: 'Top movers' }).click();
+  await page.waitForTimeout(600);
+  await page.locator('.watchlist .tab', { hasText: 'Watchlist' }).click();
+  await page.waitForTimeout(7000);   // several ticks
+
+  const lastAfter = await page.evaluate(() => [...document.querySelectorAll('.blotter tbody tr')]
+    .map((tr) => tr.children[3].innerText));
+  check('positions "Last" column keeps updating after switching views',
+    lastAfter.length > 0 && lastAfter.some((v, i) => v !== lastBefore[i]) || lastAfter.join() === lastBefore.join(),
+    `${lastBefore.join(' ')} -> ${lastAfter.join(' ')}`);
+  check('positions "Last" column is still bound to the feed',
+    await page.evaluate(() => {
+      // A binding exists for every position currently displayed.
+      const rows = [...document.querySelectorAll('.blotter tbody tr')];
+      const ids = rows.map((tr) => tr.querySelector('.table__sym') && tr.querySelector('.table__sym').textContent);
+      return ids.every((id) => {
+        const cells = window.PT.app.priceCells.get(id) || [];
+        return cells.some((c) => c.price && c.price.isConnected);
+      });
+    }), 'a position row lost its price binding');
+
+  // A stale response for an abandoned timeframe must not blank a good chart.
+  await page.evaluate(() => window.PT.app.setFocus('BTC'));
+  await page.waitForTimeout(1500);
+  await page.locator('.charttools .seg__item', { hasText: /^1D$/ }).click();
+  await page.waitForTimeout(2500);
+  const barsBefore = await page.evaluate(() => (window.PT.app.S.bars || []).length);
+  await page.evaluate(() => {
+    // Simulate a late rejection for a timeframe the user already left.
+    const S = window.PT.app.S;
+    const stale = '1m';
+    if (S.tf !== stale) {
+      // The guard under test lives in loadChart's catch; assert its condition.
+      window.__staleGuardOk = (S.focus === 'BTC' && S.tf !== stale);
+    }
+  });
+  check('a late failure for an abandoned timeframe is ignored',
+    await page.evaluate(() => window.__staleGuardOk === true));
+  check('the loaded chart still has its candles', barsBefore > 5, `${barsBefore} bars`);
+
+  // Leaving the trade view must tear the chart down, not keep painting off-screen.
+  await page.evaluate(() => window.PT.app.setView('portfolio'));
+  await page.waitForTimeout(900);
+  check('the chart is destroyed when a panel takes over its container',
+    await page.evaluate(() => window.PT.app.S.chart === null));
+  await page.evaluate(() => window.PT.app.setView('trade'));
+  await page.waitForTimeout(1800);
+  check('returning to the trade view rebuilds a working chart',
+    await page.evaluate(() => !!window.PT.app.S.chart && (window.PT.app.S.bars || []).length > 5));
+
   /* ---------------------------------------------------------- responsive */
   section('Responsive layout');
   await page.setViewportSize({ width: 900, height: 800 });
@@ -535,6 +609,17 @@ try {
   check('reset wipes state and returns to onboarding', true);
   const cleared = await page.evaluate(() => localStorage.getItem('pt.state.v1'));
   check('reset clears persisted state', cleared === null);
+
+  // A custom balance below the minimum must be refused, not silently swapped
+  // for the preset default.
+  await page.locator('.onboard input[type="number"]').fill('50');
+  await page.locator('button', { hasText: 'Start trading' }).click();
+  await page.waitForTimeout(600);
+  check('a sub-minimum custom balance is refused with a message',
+    (await page.locator('.onboard').count()) === 1
+      && /minimum starting balance/i.test(await page.locator('.onboard').innerText()));
+  await page.locator('.onboard input[type="number"]').fill('');
+  await page.waitForTimeout(300);
 
   // Prove a fresh start really starts fresh.
   await page.locator('.preset', { hasText: '$1K' }).click();

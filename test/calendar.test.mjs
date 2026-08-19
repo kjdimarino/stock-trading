@@ -104,4 +104,4 @@ describe('next open', () => {
   });
 });
 
-report('calendar');
+await report('calendar');

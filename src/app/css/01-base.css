@@ -4,7 +4,18 @@
 
 html, body, #root { height: 100%; }
 
+/*
+ * The root font-size is left alone so `rem` keeps meaning what the user's
+ * browser setting says it means; the app's own 12px base lives on <body>.
+ * `optimizeLegibility` is deliberately absent — it is a known performance
+ * footgun and enables ligatures inside numerics.
+ */
 html {
+  color: var(--text-primary);
+  background: var(--bg-base);
+}
+
+body {
   font-family: var(--font-sans);
   font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
@@ -13,9 +24,9 @@ html {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   font-synthesis-weight: none;
+  overflow: hidden;
+  overscroll-behavior: none;
 }
-
-body { overflow: hidden; overscroll-behavior: none; }
 
 button, input, select, textarea { font: inherit; color: inherit; background: none; border: none; }
 button { cursor: pointer; }
@@ -32,10 +43,14 @@ svg { display: block; }
 }
 :focus:not(:focus-visible) { outline: none; }
 
-/* Every number in the app is tabular so columns never jitter as prices tick. */
+/*
+ * Every number is tabular so columns never jitter as prices tick.
+ * font-variant-numeric only — setting font-feature-settings as well would
+ * override it, and "cv01" is a font-specific set that means nothing on an
+ * arbitrary system font.
+ */
 .num, .mono, td.num, input[type="text"].num {
   font-variant-numeric: tabular-nums;
-  font-feature-settings: "tnum" 1, "cv01" 1;
   letter-spacing: var(--ls-tight);
   line-height: 1;
 }
@@ -87,8 +102,17 @@ svg { display: block; }
   100% { background-color: transparent; color: inherit; }
 }
 .tick { position: relative; border-radius: var(--r-xs); }
-.tick.is-up { animation: tick-up var(--d-flash) var(--ease-decay) 1; }
-.tick.is-down { animation: tick-down var(--d-flash) var(--ease-decay) 1; }
+/*
+ * Two equivalent class names per direction. Removing and re-adding the same
+ * class in one frame does not restart a CSS animation; the usual workaround is
+ * `void el.offsetWidth`, which forces a synchronous layout on every tick — a
+ * reflow storm across a streaming watchlist. Alternating between two identical
+ * rules restarts the animation with no layout at all.
+ */
+.tick.is-up-a { animation: tick-up var(--d-flash) var(--ease-decay) 1; }
+.tick.is-up-b { animation: tick-up var(--d-flash) var(--ease-decay) 1; }
+.tick.is-down-a { animation: tick-down var(--d-flash) var(--ease-decay) 1; }
+.tick.is-down-b { animation: tick-down var(--d-flash) var(--ease-decay) 1; }
 
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes rise-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }

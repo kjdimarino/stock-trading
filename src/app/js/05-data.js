@@ -28,6 +28,7 @@
     ws: null,
     wsState: 'idle',              // idle | connecting | open | closed | failed
     wsAttempts: 0,
+    openedAt: 0,
     wsSubscribed: new Set(),
     lastStockPoll: 0,
     stockPollInFlight: false,
@@ -57,10 +58,14 @@
   function grade(q) {
     if (!q || !isFinite(q.price)) return 'none';
     if (q.quality === 'delayed') return 'delayed';
+    if (q.quality === 'cached') return 'cached';
     const kind = PT.assetKind(q.assetId);
     const limit = kind === 'crypto' ? STALE_AFTER.crypto : STALE_AFTER.stock;
-    if (Date.now() - q.t > limit) return 'stale';
-    return q.quality === 'cached' ? 'cached' : 'live';
+    // Judge against the exchange's own stamp when we have it: polling a closed
+    // market every 12s keeps `t` fresh while the price itself is hours old.
+    const stamp = isFinite(q.quoteTime) && q.quoteTime > 0 ? q.quoteTime : q.t;
+    if (Date.now() - stamp > limit) return 'stale';
+    return 'live';
   }
 
   /* ----------------------------------------------------- coinbase socket */
@@ -130,9 +135,11 @@
 
     ws.onopen = () => {
       state.wsState = 'open';
-      state.wsAttempts = 0;
-      state.wsSubscribed = new Set(products);
-      ws.send(JSON.stringify({ type: 'subscribe', product_ids: products, channels: ['ticker'] }));
+      state.openedAt = Date.now();
+      // Re-read the watched set: it may have changed during the handshake.
+      const current = cryptoProducts();
+      state.wsSubscribed = new Set(current);
+      ws.send(JSON.stringify({ type: 'subscribe', product_ids: current, channels: ['ticker'] }));
       bus.emit('status', snapshotStatus());
     };
 
@@ -163,6 +170,13 @@
 
   function scheduleReconnect() {
     if (!state.started) return;
+    /*
+     * Reset the backoff only after a connection proved stable. Resetting on
+     * `open` defeats it entirely for a socket that connects and immediately
+     * drops: every cycle would restart at ~1s, hammering the endpoint.
+     */
+    if (state.openedAt && Date.now() - state.openedAt > 60000) state.wsAttempts = 0;
+    state.openedAt = 0;
     state.wsAttempts++;
     state.counters.wsReconnects++;
     // Exponential backoff with jitter, capped at 30s.
@@ -173,13 +187,27 @@
     pollCrypto();
   }
 
-  /** Re-subscribe when the watched set changes, without dropping the socket. */
+  /**
+   * Reconcile the socket's subscriptions against what is actually watched.
+   *
+   * Called both on watchlist changes and periodically, because a change that
+   * lands mid-handshake has nowhere to go: `connectWS` is a no-op while a
+   * socket is pending, and `onopen` sends the product list captured before the
+   * change. Reconciling against `cryptoProducts()` on every open — and again on
+   * a timer — means a dropped change repairs itself.
+   */
   function syncSubscriptions() {
     const want = new Set(cryptoProducts());
-    if (!state.ws || state.wsState !== 'open') { connectWS(); return; }
+    if (!state.ws || state.wsState !== 'open') {
+      // Not connected (or still handshaking): connectWS is idempotent, and
+      // onopen reads the live watched set rather than a stale capture.
+      connectWS();
+      return;
+    }
 
     const add = [...want].filter((p) => !state.wsSubscribed.has(p));
     const remove = [...state.wsSubscribed].filter((p) => !want.has(p));
+    if (!add.length && !remove.length) return;
     try {
       if (add.length) state.ws.send(JSON.stringify({ type: 'subscribe', product_ids: add, channels: ['ticker'] }));
       if (remove.length) state.ws.send(JSON.stringify({ type: 'unsubscribe', product_ids: remove, channels: ['ticker'] }));
@@ -253,7 +281,12 @@
       const ttl = Math.max(4000, interval - 2000);
       const j = await api(`/api/quotes?stocks=${encodeURIComponent(ids.join(','))}&ttl=${ttl}`);
       state.counters.polls++;
-      for (const id in j.quotes) applyQuote(id, { ...j.quotes[id], t: Date.now() });
+      for (const id in j.quotes) {
+        // `t` is when we fetched; `quoteTime` is when the market printed it.
+        // Keeping both lets grade() tell a fresh poll of a stale price apart
+        // from a genuinely live one.
+        applyQuote(id, { ...j.quotes[id], t: Date.now() });
+      }
       state.lastErrors = j.errors || {};
       state.serverUp = true;
     } catch (e) {
@@ -296,20 +329,28 @@
     const width = TF_MS[tf];
     if (!width) return false;
     const last = bars[bars.length - 1];
-    const bucket = Math.floor(ts / width) * width;
 
-    if (bucket <= last.t) {
+    /*
+     * Anchor the grid on the series itself, not on the epoch. Hourly equity
+     * bars start at the 09:30 ET open, so they sit at :30 past the hour and are
+     * never a multiple of 3600e3; an epoch-aligned bucket would drop half of
+     * each hour's ticks and then invent bars on the wrong grid. Weekly bars
+     * have the same problem (Monday-anchored vs the epoch's Thursday).
+     */
+    const elapsed = ts - last.t;
+    if (elapsed < 0) return false;              // a print older than the last bar
+    if (elapsed < width) {                      // still inside the current bar
       last.c = price;
       if (price > last.h) last.h = price;
       if (price < last.l) last.l = price;
       return true;
     }
-    if (bucket - last.t >= width) {
-      bars.push({ t: bucket, o: price, h: price, l: price, c: price, v: 0 });
-      if (bars.length > 1500) bars.shift();
-      return true;
-    }
-    return false;
+
+    const steps = Math.floor(elapsed / width);
+    const bucket = last.t + steps * width;
+    bars.push({ t: bucket, o: price, h: price, l: price, c: price, v: 0 });
+    if (bars.length > 1500) bars.shift();
+    return true;
   }
 
   /* ---------------------------------------------------------------- search */
@@ -345,6 +386,8 @@
     pollStocks(true);
     timer = setInterval(() => {
       pollStocks(false);
+      // Repair any subscription drift (e.g. a change made mid-handshake).
+      if (state.wsState === 'open') syncSubscriptions();
       // Top up over REST while the socket is down, or for coins it has not
       // priced yet because they simply have not traded.
       if (state.wsState !== 'open' || cryptoAwaitingPrice()) pollCrypto();

@@ -93,4 +93,4 @@ if (tickers.length) {
   console.log(`  recorded ${Math.min(6, tickers.length)} real frames to test/fixtures/coinbase-ticker.json`);
 }
 
-report('live-feed');
+await report('live-feed');

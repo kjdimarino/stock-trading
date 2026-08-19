@@ -26,7 +26,10 @@
   /* text — never pure white, which halates on OLED at this density */
   --text-primary: #e6eaf2;
   --text-secondary: #9ba6bc;
-  --text-tertiary: #79839a;
+  /* Raised from #79839a: that value measured 5.2:1 against --bg-base but only
+     4.19:1 on --surface-3 (dropdowns) and 3.68:1 on --surface-4 (tooltips),
+     where tertiary text is actually used. This clears 4.5:1 on every surface. */
+  --text-tertiary: #8a94ab;
   --text-quaternary: #5a6478;
   --text-disabled: #454e5e;
 
@@ -122,8 +125,18 @@
   --dir-up: var(--neg); --dir-up-wash: var(--neg-wash-lg);
   --dir-down: var(--pos); --dir-down-wash: var(--pos-wash-lg);
 }
-/* Deuteranopia-safe: blue up, amber down. */
+/*
+ * Deuteranopia-safe: blue up, amber down. The accent has to move too — leaving
+ * it blue would collide with "up" and break the rule that interaction colour
+ * never doubles as direction.
+ */
 [data-direction-scheme="cvd"] {
   --dir-up: #4da3ff; --dir-up-wash: rgba(77,163,255,.22);
   --dir-down: #ffa53d; --dir-down-wash: rgba(255,165,61,.22);
+  --accent: #b98cff;
+  --accent-hover: #cdaaff;
+  --accent-active: #a274f0;
+  --accent-wash: rgba(185, 140, 255, .12);
+  --accent-wash-lg: rgba(185, 140, 255, .22);
+  --accent-border: rgba(185, 140, 255, .38);
 }

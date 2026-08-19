@@ -135,12 +135,14 @@
       if (S.focus !== assetId || S.tf !== tf) return;
       S.bars = res.bars;
       S.barsMeta = res;
-      S.candleCache[assetId] = res.bars;
+      S.candleCache[assetId + ':' + tf] = res.bars;
       S.chart.setData(res.bars, tf);
       R.chartMsg.classList.add('hidden');
       R.chartSource.textContent = `${res.bars.length} bars · ${res.source}`;
     } catch (e) {
-      if (S.focus !== assetId) return;
+      // Guard on the timeframe too: a slow failure for a timeframe the user has
+      // already moved on from would otherwise blank a chart that loaded fine.
+      if (S.focus !== assetId || S.tf !== tf) return;
       S.bars = null;
       S.chart.setData([], tf);
       R.chartMsg.classList.remove('hidden');
@@ -184,7 +186,7 @@
    */
   function blotterSignature(pf, val) {
     if (S.blotterTab === 'positions') return 'p:' + val.positions.map((p) => p.assetId + ':' + p.qty).join('|');
-    if (S.blotterTab === 'orders') return 'o:' + pf.orders.map((o) => o.id).join('|');
+    if (S.blotterTab === 'orders') return 'o:' + pf.orders.map((o) => o.id).join('|') + '/r:' + (pf.rejected || []).length;
     return 'h:' + pf.fills.length;
   }
 
@@ -302,9 +304,14 @@
   }
 
   function renderOpenOrders(host, pf) {
+    const rejected = pf.rejected || [];
     if (!pf.orders.length) {
-      host.appendChild(UI.emptyState('orders', 'No open orders',
-        'Limit orders that have not filled yet will rest here until the market reaches your price.'));
+      if (!rejected.length) {
+        host.appendChild(UI.emptyState('orders', 'No open orders',
+          'Limit orders that have not filled yet will rest here until the market reaches your price.'));
+        return;
+      }
+      renderRejected(host, pf);
       return;
     }
     const { t, tbody } = table(['Placed', 'Symbol', 'Side', 'Type', 'Qty', 'Limit', 'Distance', '']);
@@ -328,6 +335,39 @@
         el('td', { class: 'num', text: U.fmtUSD(o.limitPrice) }),
         el('td', { class: 'num dim', text: dist == null ? '—' : U.fmtPct(dist) }),
         el('td', {}, cancel),
+      ]));
+    }
+    host.appendChild(t);
+    renderRejected(host, pf);
+  }
+
+  /**
+   * Orders that reached their price but could not be filled. They are shown
+   * rather than dropped so the reason is always visible somewhere.
+   */
+  function renderRejected(host, pf) {
+    const rejected = pf.rejected || [];
+    if (!rejected.length) return;
+
+    const head = el('div', { class: 'panel__head' }, [
+      el('div', { class: 'panel__title', text: 'Could not fill' }),
+      el('div', { style: 'flex:1' }),
+    ]);
+    const clear = el('button', { class: 'btn btn--ghost btn--sm', text: 'Dismiss' });
+    clear.addEventListener('click', () => { pf.rejected = []; A.save(); renderBlotter(); });
+    head.appendChild(clear);
+    host.appendChild(head);
+
+    const { t, tbody } = table(['Rejected', 'Symbol', 'Side', 'Qty', 'Limit', 'Reason', '']);
+    for (const o of rejected.slice().reverse()) {
+      tbody.appendChild(el('tr', {}, [
+        el('td', { class: 'table__sub', text: U.fmtDateTime(o.rejectedAt || o.createdAt) }),
+        el('td', {}, el('span', { class: 'table__sym', text: o.assetId })),
+        el('td', {}, el('span', { class: 'badge ' + (o.side === 'buy' ? 'badge--up' : 'badge--down'), text: o.side })),
+        el('td', { class: 'num', text: U.fmtQty(o.qty) }),
+        el('td', { class: 'num', text: o.limitPrice ? U.fmtUSD(o.limitPrice) : '—' }),
+        el('td', { class: 'table__sub', style: 'text-align:left;white-space:normal', text: o.rejectedReason || 'unknown' }),
+        el('td', {}, ''),
       ]));
     }
     host.appendChild(t);
@@ -649,8 +689,15 @@
     const val = E.valuate(A.pfUser(), A.prices());
     const day = E.dayPnl(A.pfUser(), val, PT.calendar.stockStatus().etDate);
     R.topEquity.textContent = U.fmtUSD(val.equity, { fixed2: true });
-    R.topDay.textContent = `${U.fmtSigned(day.change)} (${U.fmtPct(day.changePct)})`;
-    R.topDay.className = 'v num ' + U.dirClass(day.change);
+    if (day.pending) {
+      // The book is not fully priced yet; showing 0.00 would be a claim we
+      // cannot support, so say nothing until the quotes land.
+      R.topDay.textContent = '—';
+      R.topDay.className = 'v num dim';
+    } else {
+      R.topDay.textContent = `${U.fmtSigned(day.change)} (${U.fmtPct(day.changePct)})`;
+      R.topDay.className = 'v num ' + U.dirClass(day.change);
+    }
 
     const st = PT.calendar.stockStatus();
     R.session.className = `session session--${st.phase}`;

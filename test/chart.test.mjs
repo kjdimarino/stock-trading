@@ -70,4 +70,4 @@ describe('sparkline path', () => {
   });
 });
 
-report('chart');
+await report('chart');

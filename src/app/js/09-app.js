@@ -30,8 +30,12 @@
     barsMeta: null,
     lastCycle: 0,
     aiBusy: false,
+    resetting: false,
     cooldowns: Object.create(null),
-    candleCache: Object.create(null), // assetId -> bars, for AI evaluation
+    // `${assetId}:${tf}` -> bars. The key MUST include the timeframe: the AI
+    // cycle caches 15m bars while the chart may be on 5m, and serving one as
+    // the other silently changes every indicator the companion reports.
+    candleCache: Object.create(null),
     aiChat: [],
     llmReady: false,
     rotateIdx: 0,
@@ -56,7 +60,10 @@
     };
   }
 
-  const save = U.debounce(() => E.save(S.st), 600);
+  const persist = U.debounce(() => { if (!S.resetting) E.save(S.st); }, 600);
+  /** Debounced persistence. No-ops once a reset is under way. */
+  const save = (...a) => { if (!S.resetting) persist(...a); };
+  save.cancel = () => persist.cancel();
 
   /* --------------------------------------------------------------- shell */
 
@@ -335,7 +342,14 @@
   function renderWatchlist() {
     if (!R.wlBody) return;
     R.wlBody.innerHTML = '';
-    priceCells.clear();
+    /*
+     * Deliberately NOT clearing `priceCells` here. It is a global registry
+     * written by the watchlist, the symbol header, the blotter and the
+     * holdings table; clearing it from one view unregistered all the others,
+     * freezing the positions "Last" column. `paintQuote` already drops
+     * bindings whose nodes have left the document, so the rows this call
+     * replaces fall out on the next tick.
+     */
 
     if (S.wlTab === 'movers') return renderMovers();
 
@@ -420,6 +434,9 @@
     if (sparkDraining) return;
     sparkDraining = true;
     try {
+      // Let the first quotes and the focused chart settle before spending
+      // upstream budget on decoration.
+      await new Promise((r) => setTimeout(r, 1500));
       while (sparkQueue.length) {
         const { assetId, svg } = sparkQueue.shift();
         if (!svg.isConnected) continue;
@@ -431,7 +448,7 @@
         } catch {
           // No history available for this symbol; the row simply has no spark.
         }
-        await new Promise((r) => setTimeout(r, 220));
+        await new Promise((r) => setTimeout(r, 400));
       }
     } finally {
       sparkDraining = false;

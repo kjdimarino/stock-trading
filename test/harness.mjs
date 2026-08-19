@@ -53,18 +53,33 @@ export function loadPT(files, { now = null, localStorage = true } = {}) {
 
 let passed = 0, failed = 0;
 const failures = [];
+const pending = [];
 let suite = '';
 
 export const describe = (name, fn) => { suite = name; fn(); };
 
+/**
+ * Supports both sync and async test bodies. An async body that threw would
+ * otherwise become an unhandled rejection and be counted as a pass — the worst
+ * possible failure mode for a test harness.
+ */
 export function it(name, fn) {
-  try {
-    fn();
-    passed++;
-  } catch (e) {
+  const where = suite;
+  const fail = (e) => {
     failed++;
-    failures.push(`${suite} › ${name}\n    ${e.message}`);
+    failures.push(`${where} › ${name}\n    ${e && e.message ? e.message : e}`);
+  };
+  let result;
+  try {
+    result = fn();
+  } catch (e) {
+    return fail(e);
   }
+  if (result && typeof result.then === 'function') {
+    pending.push(result.then(() => { passed++; }, fail));
+    return;
+  }
+  passed++;
 }
 
 export function eq(actual, expected, msg) {
@@ -92,7 +107,8 @@ export function throws(fn, match, msg) {
   throw new Error(msg || 'expected a throw');
 }
 
-export function report(label) {
+export async function report(label) {
+  await Promise.all(pending);
   const total = passed + failed;
   if (failed) {
     console.log(`\n\x1b[31m✗ ${label}: ${passed}/${total} passed\x1b[0m`);

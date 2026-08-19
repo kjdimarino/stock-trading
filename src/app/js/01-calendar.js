@@ -231,8 +231,11 @@
     return `${s}s`;
   }
 
+  /** The Eastern-time calendar date of an instant, as 'YYYY-MM-DD'. */
+  const etDateOf = (ts) => dayKey(inET(ts));
+
   PT.calendar = {
-    inET, fromET, etOffset, holidays, earlyCloses, isTradingDay,
+    inET, fromET, etOffset, etDateOf, holidays, earlyCloses, isTradingDay,
     stockStatus, cryptoStatus, statusFor, nextOpenTs, untilText,
   };
 })(window.PT);

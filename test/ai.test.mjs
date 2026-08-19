@@ -286,6 +286,144 @@ describe('autonomous trader — exits', () => {
   });
 });
 
+describe('review regressions', () => {
+  const many = (n, base) => {
+    const c = {};
+    const ids = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'AVAX', 'LINK', 'DOT', 'LTC', 'BCH', 'ATOM', 'NEAR'];
+    for (let i = 0; i < n; i++) c[ids[i]] = series(base, 200, 20 + i * 3);
+    return c;
+  };
+
+  it('the daily trade cap is enforced within a single cycle', () => {
+    // A cycle that stops out every position at once used to blow straight
+    // through the cap because the budget was read once and never decremented.
+    const p = pf(200000);
+    const candles = many(10, UP);
+    const now = Date.UTC(2026, 7, 19, 14, 0);
+    // Open ten positions over successive cycles.
+    for (let i = 0; i < 30; i++) T.runTraderCycle(p, ctx({ candles, now: now + i * 3600e3 }));
+    const opened = Object.keys(p.positions).length;
+    ok(opened > 0, 'entered some positions');
+
+    // Backdate every fill into today, right up against the cap.
+    const today = Date.UTC(2026, 7, 20, 15, 0);
+    p.fills.forEach((f) => { f.t = today; });
+    while (p.fills.length < T.RULES.maxTradesPerDay - 1) {
+      p.fills.push({ id: 'pad' + p.fills.length, side: 'buy', assetId: 'BTC', qty: 0, price: 1, notional: 0, realized: 0, t: today });
+    }
+    const before = p.fills.length;
+
+    // Crash everything so every position trips its stop in one cycle.
+    const crashed = {}; const prices = {};
+    for (const id of Object.keys(candles)) {
+      crashed[id] = candles[id];
+      prices[id] = { price: p.positions[id] ? p.positions[id].avgCost * 0.5 : 1, changePct: -50 };
+    }
+    const r = T.runTraderCycle(p, ctx({ candles: crashed, prices, now: today }));
+    const executed = p.fills.length - before;
+    ok(executed <= 1, `${executed} trades executed with 1 left in the daily budget`);
+    ok(r.decisions.some((d) => /daily trade cap/i.test(d.why)), 'says why it stopped');
+  });
+
+  it('does not claim to be at the position limit right after going flat', () => {
+    const p = pf(200000);
+    const candles = many(9, UP);
+    const now = Date.UTC(2026, 7, 19, 14, 0);
+    for (let i = 0; i < 30; i++) T.runTraderCycle(p, ctx({ candles, now: now + i * 3600e3 }));
+    ok(Object.keys(p.positions).length >= 4, 'built a book first');
+
+    const prices = {};
+    for (const id of Object.keys(candles)) {
+      prices[id] = { price: p.positions[id] ? p.positions[id].avgCost * 0.5 : 1, changePct: -50 };
+    }
+    const r = T.runTraderCycle(p, ctx({ candles, prices, now: now + 40 * 3600e3 }));
+    const flat = Object.keys(p.positions).length === 0;
+    if (flat) {
+      ok(!r.decisions.some((d) => /position limit/i.test(d.why)),
+        `claimed the position limit while flat: ${r.decisions.map((d) => d.why).join(' | ').slice(0, 120)}`);
+    }
+  });
+
+  it('the buy rationale states the size actually traded', () => {
+    const p = pf(100000);
+    // Leave very little free cash so the target weight must be trimmed.
+    E.submitOrder(p, { assetId: 'ETH', side: 'buy', type: 'market', notional: 88000 },
+      ctx({ prices: { ETH: { price: 3000, changePct: 0 } } }));
+    const candles = { BTC: series(UP, 200, 60000) };
+    const r = T.runTraderCycle(p, ctx({
+      candles, prices: { BTC: { price: 60000 * Math.pow(1.006, 199), changePct: 5 }, ETH: { price: 3000, changePct: 0 } },
+    }));
+    const buy = r.decisions.find((d) => d.action === 'buy');
+    if (buy) {
+      const claimed = Number((buy.why.match(/Sizing ([\d.]+)% of equity/) || [])[1]);
+      const val = E.valuate(p, { BTC: { price: 60000 * Math.pow(1.006, 199), changePct: 0 }, ETH: { price: 3000, changePct: 0 } });
+      const actual = (buy.notional / val.equity) * 100;
+      ok(Math.abs(claimed - actual) < 0.6, `log says ${claimed}% but traded ${actual.toFixed(2)}%`);
+    }
+  });
+
+  it('the daily counter buckets on Eastern dates, not UTC', () => {
+    const p = pf(100000);
+    // 23:00 ET on Aug 19 is 03:00 UTC on Aug 20 — the same ET trading day.
+    const late = Date.UTC(2026, 7, 20, 3, 0);
+    const earlier = Date.UTC(2026, 7, 19, 23, 0);
+    eq(PT.calendar.etDateOf(late), PT.calendar.etDateOf(earlier),
+      'both instants are the same Eastern date');
+    for (let i = 0; i < T.RULES.maxTradesPerDay; i++) {
+      p.fills.push({ id: 'f' + i, side: 'buy', assetId: 'BTC', qty: 0, price: 1, notional: 0, realized: 0, t: earlier });
+    }
+    const r = T.runTraderCycle(p, ctx({ candles: { BTC: series(UP) }, now: late }));
+    ok(r.decisions.some((d) => /daily trade cap/i.test(d.why)),
+      'the cap still applies across the UTC midnight boundary');
+  });
+
+  it('diversification is not inflated by idle cash', () => {
+    const p = pf(100000);
+    E.submitOrder(p, { assetId: 'AAPL', side: 'buy', type: 'market', notional: 2000 },
+      ctx({ prices: { AAPL: { price: 100, changePct: 0 } } }));
+    const val = E.valuate(p, { AAPL: { price: 100, changePct: 0 } });
+    const pa = C.analyzePortfolio(val, null, E.stats(p, val));
+    near(pa.concentration.hhi, 1, 1e-6, 'a single holding is maximally concentrated');
+    ok(pa.diversification <= 15, `one position scored ${pa.diversification}/100 for diversification`);
+  });
+
+  it('never pairs a direction word with a signed percentage', () => {
+    const p = pf(10000);
+    E.submitOrder(p, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 }, ctx({ prices: { AAPL: { price: 100 } } }));
+    const val = E.valuate(p, { AAPL: { price: 150, changePct: 3 } });
+    const texts = [
+      C.briefPortfolio(C.analyzePortfolio(val, { change: 120, changePct: 1.2 }, E.stats(p, val)), val).body.join(' '),
+      C.briefAsset('BTC', series(UP), { price: 100, changePct: 1.2 }, '5m').body.join(' '),
+      C.briefAsset('BTC', series(DOWN), { price: 100, changePct: -1.2 }, '5m').body.join(' '),
+    ];
+    for (const t of texts) {
+      ok(!/\b(up|down)\s+[+-]/.test(t), `contradictory sign: ${(t.match(/\b(up|down)\s+[+-][^ ]*/) || [])[0]}`);
+    }
+  });
+
+  it('describes the change window correctly per asset class', () => {
+    const crypto = C.briefAsset('BTC', series(UP), { price: 100, changePct: 2 }, '5m').body.join(' ');
+    const stock = C.briefAsset('AAPL', series(UP), { price: 100, changePct: 2 }, '5m').body.join(' ');
+    ok(/last 24h/.test(crypto), 'crypto really is a rolling 24h change');
+    ok(/previous close/.test(stock) && !/last 24h/.test(stock),
+      'equities are measured from the previous close, which may be days back');
+  });
+
+  it('annualises volatility using the timeframe it was given', () => {
+    const bars = series((i, b) => b * (1 + Math.sin(i / 3) * 0.01), 300);
+    const daily = C.briefAsset('AAPL', bars, null, '1D').indicators.realizedVol;
+    const fiveMin = C.briefAsset('AAPL', bars, null, '5m').indicators.realizedVol;
+    ok(fiveMin > daily * 5, `5m vol ${fiveMin.toFixed(1)}% should far exceed daily ${daily.toFixed(1)}%`);
+  });
+
+  it('names the range window it actually measured', () => {
+    const sig = PT.ta.score(PT.ta.analyze(series(UP, 120)));
+    const range = sig.factors.find((f) => f.key === 'range');
+    ok(range, 'range factor present');
+    ok(/120-bar range/.test(range.detail), `label was "${range.detail}" for a 120-bar series`);
+  });
+});
+
 describe('autonomous trader — long simulation invariants', () => {
   it('survives 400 cycles of a noisy market with the books intact', () => {
     const p = pf(100000);
@@ -321,4 +459,4 @@ describe('autonomous trader — long simulation invariants', () => {
   });
 });
 
-report('ai');
+await report('ai');

@@ -76,21 +76,29 @@
    * Concentration via the Herfindahl-Hirschman Index over position weights.
    * 1.0 means everything sits in a single position.
    */
-  function concentration(positions, equity) {
-    if (!positions.length || equity <= 0) return { hhi: 0, top: null, topWeight: 0 };
+  function concentration(positions, equity, invested) {
+    if (!positions.length || equity <= 0) return { hhi: 0, top: null, topWeight: 0, effectiveN: 0 };
+    /*
+     * HHI is measured against invested capital: including cash makes a
+     * one-stock book look perfectly diversified simply because it is mostly
+     * uninvested. `topWeight` stays equity-relative, because there cash
+     * genuinely does dilute single-name risk.
+     */
+    const base = invested > 0 ? invested : equity;
     let hhi = 0, topWeight = 0, top = null;
     for (const p of positions) {
-      const w = p.value / equity;
+      const w = p.value / base;
       hhi += w * w;
-      if (w > topWeight) { topWeight = w; top = p.assetId; }
+      const eqWeight = p.value / equity;
+      if (eqWeight > topWeight) { topWeight = eqWeight; top = p.assetId; }
     }
-    return { hhi, top, topWeight };
+    return { hhi, top, topWeight, effectiveN: hhi > 0 ? 1 / hhi : 0 };
   }
 
   function analyzePortfolio(val, dayPnl, stats) {
     const positions = val.positions;
     const equity = val.equity;
-    const conc = concentration(positions, equity);
+    const conc = concentration(positions, equity, val.invested);
     const cashWeight = equity > 0 ? val.cash / equity : 1;
 
     const bySector = {};
@@ -107,9 +115,11 @@
     const loser = sorted[sorted.length - 1] && sorted[sorted.length - 1].unrealized < 0
       ? sorted[sorted.length - 1] : null;
 
-    // Diversification: more positions and lower concentration score better.
-    const effectiveN = conc.hhi > 0 ? 1 / conc.hhi : 0;
-    const diversification = U.clamp(Math.round((effectiveN / 8) * 100), 0, 100);
+    // Diversification: more independent positions scores better, capped at the
+    // 8-position target. Never above the number of positions actually held.
+    const effectiveN = Math.min(conc.effectiveN, positions.length);
+    const diversification = positions.length
+      ? U.clamp(Math.round((effectiveN / 8) * 100), 0, 100) : 0;
 
     let risk = 'balanced';
     if (!positions.length) risk = 'uninvested';
@@ -152,11 +162,22 @@
    */
   const MIN_BRIEF_BARS = 30;
 
+  /**
+   * Bars per year for each timeframe, so annualised volatility means something.
+   * US equities trade ~252 days a year, 6.5h a day.
+   */
+  const BARS_PER_YEAR = {
+    '1m': 252 * 390, '5m': 252 * 78, '15m': 252 * 26,
+    '1h': 252 * 7, '1D': 252, '1W': 52,
+  };
+
   /** Build a companion briefing for one asset entirely from computed values. */
-  function briefAsset(assetId, bars, quote) {
+  function briefAsset(assetId, bars, quote, tf) {
     const asset = PT.byId[assetId];
     if (!asset) return null;
-    const perYear = 252;
+    // Crypto never closes, so its bars-per-year is the full calendar.
+    const cryptoFactor = asset.kind === 'crypto' ? (365 * 24) / (252 * 6.5) : 1;
+    const perYear = Math.round((BARS_PER_YEAR[tf] || 252) * cryptoFactor);
     const ind = bars && bars.length >= MIN_BRIEF_BARS ? TA.analyze(bars, perYear) : null;
     const sig = ind ? TA.score(ind) : null;
     if (!ind || !sig) {
@@ -175,7 +196,10 @@
 
     if (quote && isFinite(quote.changePct)) {
       const dir = quote.changePct >= 0 ? 'up' : 'down';
-      body.push(`It is ${dir} ${U.fmtPct(Math.abs(quote.changePct))} over the last 24h, last trading at ${U.fmtUSD(quote.price)}.`);
+      // Crypto change is a true rolling 24h; equities are measured from the
+      // previous close, which over a weekend is a great deal more than 24h.
+      const window = asset.kind === 'crypto' ? 'over the last 24h' : 'since the previous close';
+      body.push(`It is ${dir} ${U.fmtPctAbs(quote.changePct)} ${window}, last trading at ${U.fmtUSD(quote.price)}.`);
     }
 
     if (ind.rsi14 != null) {
@@ -219,6 +243,7 @@
       body,
       signal: sig,
       indicators: ind,
+      tf: tf || null,
       computed: true,
     };
   }
@@ -235,11 +260,11 @@
     }
 
     const rp = val.totalReturnPct;
-    body.push(`Your book is worth ${U.fmtUSD(eq)} across ${pa.positionCount} position${pa.positionCount === 1 ? '' : 's'}, ${rp >= 0 ? 'up' : 'down'} ${U.fmtPct(Math.abs(rp))} since you started.`);
+    body.push(`Your book is worth ${U.fmtUSD(eq)} across ${pa.positionCount} position${pa.positionCount === 1 ? '' : 's'}, ${rp >= 0 ? 'up' : 'down'} ${U.fmtPctAbs(rp)} since you started.`);
     body.push(`Unrealized P&L is ${U.fmtSigned(val.unrealized)} (${U.fmtPct(val.unrealizedPct)}) and you have booked ${U.fmtSigned(val.realized)} in realized gains.`);
 
     if (pa.dayPnl) {
-      body.push(`Today you are ${pa.dayPnl.change >= 0 ? 'up' : 'down'} ${U.fmtUSD(Math.abs(pa.dayPnl.change))} (${U.fmtPct(pa.dayPnl.changePct)}).`);
+      body.push(`Today you are ${pa.dayPnl.change >= 0 ? 'up' : 'down'} ${U.fmtUSD(Math.abs(pa.dayPnl.change))} (${U.fmtPctAbs(pa.dayPnl.changePct)}).`);
     }
 
     const c = pa.concentration;
@@ -367,9 +392,13 @@
     const val = PT.engine.valuate(pf, ctx.prices);
     const equity = val.equity;
 
-    const todayKey = new Date(now).toISOString().slice(0, 10);
-    const tradesToday = pf.fills.filter((f) => new Date(f.t).toISOString().slice(0, 10) === todayKey).length;
-    const budgetLeft = RULES.maxTradesPerDay - tradesToday;
+    // Bucket by the Eastern trading date, the same clock day P&L uses. A UTC
+    // bucket would roll over at 19:00 ET and let crypto trade the cap twice.
+    const todayKey = PT.calendar.etDateOf(now);
+    const tradesToday = pf.fills.filter((f) => PT.calendar.etDateOf(f.t) === todayKey).length;
+    // Mutable: it must fall as this cycle spends it, or a single cycle can
+    // blow straight through the daily cap.
+    let budgetLeft = RULES.maxTradesPerDay - tradesToday;
 
     const log = (action, assetId, why, factors, extra) => {
       const entry = {
@@ -429,6 +458,7 @@
           const r = PT.engine.submitOrder(pf, {
             assetId, side: 'sell', type: 'market', qty: pos.qty, reason,
           }, ctx);
+          budgetLeft -= 1;
           log('sell', assetId, reason, factors, {
             qty: r.fill.qty, price: r.fill.price, realized: r.fill.realized,
             pnlPct, signal: sig ? sig.score : null, stance: sig ? sig.stance : null,
@@ -441,8 +471,10 @@
     }
 
     /* -------------------------------------------------------- entries */
-    const held = new Set(val.positions.map((p) => p.assetId));
+    // Re-value after the exit loop: positions closed above are gone, and using
+    // the pre-exit set would report being at the position limit while flat.
     const freshVal = PT.engine.valuate(pf, ctx.prices);
+    const held = new Set(freshVal.positions.map((p) => p.assetId));
     const investable = freshVal.equity * (1 - RULES.minCashReserve);
     const deployed = freshVal.invested;
 
@@ -514,8 +546,14 @@
     const factors = best.sig.factors.slice(0, 4).map((f) => ({
       k: f.key, v: f.detail, dir: f.value > 0 ? 1 : f.value < 0 ? -1 : 0,
     }));
+    // Report the size actually traded, not the target: available cash and the
+    // reserve floor routinely clamp it, and the log must match the order.
+    const actualWeight = freshVal.equity > 0 ? (notional / freshVal.equity) * 100 : 0;
+    const clamped = actualWeight < targetWeight * 100 - 0.05;
     const why = `${best.assetId} scored ${best.sig.score.toFixed(2)} (${best.sig.stance}, ${best.sig.confidence}% confidence). `
-      + `Sizing ${(targetWeight * 100).toFixed(1)}% of equity after a volatility adjustment for ${best.ind.atrPct != null ? best.ind.atrPct.toFixed(2) + '% ATR' : 'unknown volatility'}.`;
+      + `Sizing ${actualWeight.toFixed(1)}% of equity`
+      + (clamped ? ` (trimmed from a ${(targetWeight * 100).toFixed(1)}% target by available cash)` : '')
+      + ` after a volatility adjustment for ${best.ind.atrPct != null ? best.ind.atrPct.toFixed(2) + '% ATR' : 'unknown volatility'}.`;
 
     try {
       const r = PT.engine.submitOrder(pf, {

@@ -168,17 +168,20 @@ test/              unit, live-data and browser suites
 
 ### Tests
 
-249 assertions across 7 suites:
+343 assertions across 10 suites:
 
 | Suite | What it covers |
 |---|---|
 | `calendar` | NYSE holiday rules, early closes, session phases, DST boundaries |
-| `engine` | Order validation, cost basis, P&L, limit fills, persistence, a 500-trade float-safety run |
+| `engine` | Order validation, cost basis, P&L, limit fills, reserved balances, persistence, a 500-trade float-safety run |
 | `indicators` | RSI/MACD/Bollinger/ATR against an independent reference implementation |
 | `chart` | Axis tick generation, decimal precision, sparkline geometry |
+| `feed` | Folding live ticks into session-anchored candles, freshness grading |
 | `ai` | Companion output, trader entries/exits/risk limits, a 400-cycle simulation |
 | `live-feed` | Connects to the **real** Coinbase socket and parses genuine live frames |
-| `browser` | Full end-to-end in Chromium against live data — 79 checks |
+| `providers` | Rate-limiter behaviour under concurrency, freshness labelling |
+| `browser` | Full end-to-end in Chromium against live data — 98 checks |
+| `market-open` | The equity path with the session clock pinned open |
 
 ```bash
 npm test                      # everything
@@ -187,7 +190,9 @@ PT_SKIP_BROWSER=1 npm test    # unit + live data only
 
 The browser suite drives the real UI: onboarding, live quotes, chart rendering
 on canvas, order placement and rejection, limit resting and cancelling,
-persistence across reload, the companion, the AI trader, and reset.
+persistence across reload, the companion, the AI trader, responsive layout and
+reset. `market-open` exists because the suite usually runs outside trading
+hours, which would otherwise leave the entire stock path untested.
 
 ---
 

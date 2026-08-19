@@ -213,12 +213,37 @@ describe('limit orders', () => {
     eq(E.processOpenOrders(pf, ctx(px({ BTC: 49000 }), { marketOpen: false })).length, 1);
   });
 
-  it('a resting order rejects rather than overdrawing cash', () => {
+  it('resting buy limits reserve their cash so it cannot be spent twice', () => {
     const pf = fresh(1000);
     E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'limit', qty: 10, limitPrice: 90 }, ctx(px({ AAPL: 100 })));
-    E.submitOrder(pf, { assetId: 'TSLA', side: 'buy', type: 'market', notional: 990 }, ctx(px({ TSLA: 200 })));
+    near(E.availableCash(pf), 100, 1e-9, 'only the unreserved balance is spendable');
+    // The resting order has claimed $900, so a $990 market buy must be refused
+    // up front rather than silently killing the resting order later.
+    throws(() => E.submitOrder(pf, { assetId: 'TSLA', side: 'buy', type: 'market', notional: 990 }, ctx(px({ TSLA: 200 }))),
+      'committed to open limit orders');
+    ok(pf.orders.length === 1, 'the resting order survives');
+  });
+
+  it('resting sell limits reserve their shares', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 }, ctx(px({ AAPL: 100 })));
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'limit', qty: 10, limitPrice: 130 }, ctx(px({ AAPL: 100 })));
+    near(E.availableQty(pf, 'AAPL'), 0, 1e-9);
+    throws(() => E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 5 }, ctx(px({ AAPL: 100 }))),
+      'committed to open sell orders');
+  });
+
+  it('an order that still cannot fill is kept and explained, not silently dropped', () => {
+    const pf = fresh(1000);
+    const r = E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'limit', qty: 10, limitPrice: 90 }, ctx(px({ AAPL: 100 })));
+    // Force the failure the reservation normally prevents.
+    pf.cash = 10;
     const fills = E.processOpenOrders(pf, ctx(px({ AAPL: 89 })));
     eq(fills.length, 0);
+    eq(pf.orders.length, 0);
+    eq(pf.rejected.length, 1, 'the order is retained for the user to see');
+    eq(pf.rejected[0].id, r.order.id);
+    ok(pf.rejected[0].rejectedReason.length > 0, 'it carries a reason');
     ok(pf.cash >= 0, 'cash stayed non-negative');
   });
 
@@ -352,6 +377,70 @@ describe('persistence', () => {
   });
 });
 
+describe('review regressions', () => {
+  it('a dollar order for the entire balance is accepted', () => {
+    // Rounding qty up made estCost exceed the notional and tripped the cash
+    // check on roughly half of all "Max" buys.
+    let rejected = 0, tried = 0;
+    for (let cents = 5000; cents <= 60000; cents += 137) {
+      const price = cents / 100;
+      const pf = fresh(10000);
+      tried++;
+      try {
+        E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', notional: 10000 },
+          ctx(px({ AAPL: price }), { slippage: true }));
+      } catch { rejected++; }
+    }
+    eq(rejected, 0, `${rejected} of ${tried} full-balance buys were rejected`);
+  });
+
+  it('sizing by dollars never spends more than the dollars requested', () => {
+    for (const price of [187.4321, 0.069989, 64321.55, 3.33333]) {
+      const pf = fresh(10000);
+      E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', notional: 500 },
+        ctx(px({ AAPL: price })));
+      ok(10000 - pf.cash <= 500 + 0.005, `spent ${(10000 - pf.cash).toFixed(6)} for a $500 order at ${price}`);
+    }
+  });
+
+  it('realized P&L survives the fill log being trimmed', () => {
+    const pf = fresh(100000);
+    for (let i = 0; i < 3; i++) {
+      E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 }, ctx(px({ AAPL: 100 })));
+      E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 10 }, ctx(px({ AAPL: 110 })));
+    }
+    near(E.valuate(pf, px({})).realized, 300, 1e-6);
+    pf.fills = pf.fills.slice(-2);            // what the quota fallback does
+    near(E.valuate(pf, px({})).realized, 300, 1e-6, 'still 300 after truncation');
+  });
+
+  it('day P&L does not anchor to an unpriced book', () => {
+    const pf = fresh(5000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 50 }, ctx(px({ AAPL: 100 })));
+    // Startup: quotes have not arrived, so valuate falls back to cost basis.
+    const cold = E.dayPnl(pf, E.valuate(pf, px({})), '2026-08-19');
+    eq(cold.pending, true, 'reports pending rather than anchoring');
+    eq(pf.dayBaseline, null, 'no baseline is written from an unpriced book');
+    // Quotes arrive with the position up 50% on the month but flat today.
+    const warm = E.dayPnl(pf, E.valuate(pf, px({ AAPL: 150 })), '2026-08-19');
+    near(warm.change, 0, 1e-6, 'today is flat, not +2500');
+    near(pf.dayBaseline.equity, 7500, 1e-6);
+  });
+
+  it('save only sheds history on a genuine quota error', () => {
+    const st = E.newState(10000);
+    for (let i = 0; i < 40; i++) {
+      E.submitOrder(st.portfolios.user, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 1 }, ctx(px({ AAPL: 10 })));
+    }
+    const before = st.portfolios.user.fills.length;
+    const real = localStorage.setItem;
+    localStorage.setItem = () => { const e = new Error('storage disabled'); e.name = 'SecurityError'; throw e; };
+    eq(E.save(st), false);
+    localStorage.setItem = real;
+    eq(st.portfolios.user.fills.length, before, 'history is untouched by a non-quota failure');
+  });
+});
+
 describe('float safety', () => {
   it('survives 500 randomised trades without cash drift or negative balances', () => {
     const pf = fresh(100000);
@@ -379,4 +468,4 @@ describe('float safety', () => {
   });
 });
 
-report('engine');
+await report('engine');

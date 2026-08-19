@@ -5,8 +5,8 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 
-const UNIT = ['calendar', 'engine', 'indicators', 'chart', 'ai'];
-const LIVE = ['live-feed'];
+const UNIT = ['calendar', 'engine', 'indicators', 'chart', 'feed', 'ai'];
+const LIVE = ['live-feed', 'providers'];
 
 let failed = 0;
 const run = (file, env = {}) => {

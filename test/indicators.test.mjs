@@ -193,4 +193,4 @@ describe('signal scoring', () => {
   });
 });
 
-report('indicators');
+await report('indicators');

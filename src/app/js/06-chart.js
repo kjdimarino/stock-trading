@@ -145,6 +145,14 @@
       this.bars = Array.isArray(bars) ? bars : [];
       if (tf) this.tf = tf;
       this.draw();
+      /*
+       * The newest bar mutates in place as ticks arrive, and the crosshair
+       * pill re-reads it on every repaint. Re-emit the hovered bar so the
+       * legend cannot drift from the pill and show two closes for one candle.
+       */
+      if (this.hover != null && this.onHover) {
+        this.onHover(this.bars[this.hover] || null, this.hover);
+      }
     }
 
     setMode(mode) { this.mode = mode; this.draw(); }

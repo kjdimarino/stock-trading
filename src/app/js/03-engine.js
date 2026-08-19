@@ -12,7 +12,7 @@
   'use strict';
 
   const U = PT.util;
-  const { round, money, roundQty } = U;
+  const { round, money, roundQty, floorQty } = U;
 
   const SCHEMA_VERSION = 1;
   const STORAGE_KEY = 'pt.state.v1';
@@ -22,6 +22,15 @@
 
   /** Smallest order we accept, in dollars — stops dust orders. */
   const MIN_NOTIONAL = 1;
+
+  /**
+   * Slack when comparing an order's cost against cash. Cash is tracked to the
+   * cent, so anything below half a cent is representation noise rather than a
+   * real shortfall. A tolerance tighter than the quantity rounding step would
+   * reject "spend my whole balance" orders.
+   */
+  const CASH_EPS = 0.005;
+  const QTY_EPS = 1e-9;
 
   /* ----------------------------------------------------------- portfolios */
 
@@ -34,7 +43,11 @@
       positions: {},   // assetId -> { qty, avgCost, realized, kind, openedAt }
       orders: [],      // open (resting) limit orders
       fills: [],       // executed trades, newest last
+      rejected: [],    // orders that could not fill, kept so they are explainable
       equity: [],      // [{ t, e }] sampled equity curve
+      // Accumulated at fill time. The fill log gets trimmed, so realized P&L
+      // must never be re-derived from it or booked profit would shrink.
+      realizedTotal: 0,
       dayBaseline: null, // { etDate, equity } — anchor for day P&L
       counters: { orders: 0 },
     };
@@ -79,6 +92,41 @@
   class OrderError extends Error {}
 
   /**
+   * Cash already promised to resting buy limits. Without this a user can place
+   * several limit buys that each pass on their own but cannot all be honoured,
+   * and the losers would silently disappear when they later fail to fill.
+   */
+  function committedCash(pf, exceptId) {
+    let total = 0;
+    for (const o of pf.orders) {
+      if (o.status !== 'open' || o.side !== 'buy' || o.id === exceptId) continue;
+      total += o.qty * o.limitPrice;
+    }
+    return total;
+  }
+
+  /** Shares already promised to resting sell limits for one asset. */
+  function committedQty(pf, assetId, exceptId) {
+    let total = 0;
+    for (const o of pf.orders) {
+      if (o.status !== 'open' || o.side !== 'sell') continue;
+      if (o.assetId !== assetId || o.id === exceptId) continue;
+      total += o.qty;
+    }
+    return total;
+  }
+
+  /** Cash that is actually spendable right now. */
+  const availableCash = (pf) => Math.max(0, pf.cash - committedCash(pf));
+
+  /** Units of an asset that are actually sellable right now. */
+  function availableQty(pf, assetId) {
+    const pos = pf.positions[assetId];
+    if (!pos) return 0;
+    return Math.max(0, pos.qty - committedQty(pf, assetId));
+  }
+
+  /**
    * Normalise and validate an order request.
    * Accepts either `qty` (shares/coins) or `notional` (dollars).
    * Returns a fully-specified order object; throws OrderError on rejection.
@@ -118,7 +166,8 @@
     if (req.notional != null && req.notional !== '') {
       const notional = Number(req.notional);
       if (!isFinite(notional) || notional <= 0) throw new OrderError('Enter a valid dollar amount.');
-      qty = roundQty(notional / refPrice, kind);
+      // Floor, never round: sizing by dollars must not spend more than asked.
+      qty = floorQty(notional / refPrice, kind);
     } else {
       qty = roundQty(Number(req.qty), kind);
     }
@@ -130,17 +179,21 @@
     }
 
     if (side === 'buy') {
-      if (estCost > pf.cash + 1e-6) {
-        throw new OrderError(
-          `Not enough cash. Need ${U.fmtUSD(estCost)}, available ${U.fmtUSD(pf.cash)}.`,
-        );
+      const free = availableCash(pf);
+      if (estCost > free + CASH_EPS) {
+        const reserved = pf.cash - free;
+        throw new OrderError(reserved > CASH_EPS
+          ? `Not enough free cash. Need ${U.fmtUSD(estCost)}, but ${U.fmtUSD(reserved)} is committed to open limit orders.`
+          : `Not enough cash. Need ${U.fmtUSD(estCost)}, available ${U.fmtUSD(free)}.`);
       }
     } else {
-      const held = pf.positions[assetId] ? pf.positions[assetId].qty : 0;
-      if (qty > held + 1e-9) {
-        throw new OrderError(
-          `You only hold ${U.fmtQty(held)} ${assetId}. Short selling is not supported.`,
-        );
+      const pos = pf.positions[assetId];
+      const held = pos ? pos.qty : 0;
+      const free = availableQty(pf, assetId);
+      if (qty > free + QTY_EPS) {
+        throw new OrderError(free < held
+          ? `Only ${U.fmtQty(free)} ${assetId} is free — the rest is committed to open sell orders.`
+          : `You only hold ${U.fmtQty(held)} ${assetId}. Short selling is not supported.`);
       }
     }
 
@@ -194,6 +247,7 @@
       if (!pos || pos.qty + 1e-9 < qty) throw new OrderError('Insufficient shares at fill time.');
       realizedDelta = (price - pos.avgCost) * qty;
       pos.realized = round(pos.realized + realizedDelta, 6);
+      pf.realizedTotal = round((pf.realizedTotal || 0) + realizedDelta, 6);
       pos.qty = roundQty(pos.qty - qty, kind);
       pf.cash = money(pf.cash + money(gross));
       if (pos.qty <= 1e-9) {
@@ -273,6 +327,7 @@
   function processOpenOrders(pf, ctx) {
     const ts = ctx.now ?? Date.now();
     const fills = [];
+    const rejected = [];
     const still = [];
 
     for (const order of pf.orders) {
@@ -288,13 +343,19 @@
       try {
         fills.push(applyFill(pf, order, marketableLimitPrice(order, q.price), ts, 'Limit order filled'));
       } catch (e) {
-        // Conditions changed since the order rested (cash spent elsewhere).
+        // Conditions changed since the order rested. Keep it — an order that
+        // silently disappears is worse than one that explains itself.
         order.status = 'rejected';
         order.rejectedReason = e.message;
         order.rejectedAt = ts;
+        rejected.push(order);
       }
     }
     pf.orders = still;
+    if (rejected.length) {
+      pf.rejected = (pf.rejected || []).concat(rejected).slice(-50);
+    }
+    fills.rejected = rejected;
     return fills;
   }
 
@@ -350,7 +411,7 @@
 
     rows.sort((a, b) => b.value - a.value);
 
-    const realizedTotal = pf.fills.reduce((s, f) => s + (f.realized || 0), 0);
+    const realizedTotal = pf.realizedTotal || 0;
     const equity = pf.cash + invested;
 
     return {
@@ -375,7 +436,16 @@
    * mixed stock+crypto book.
    */
   function dayPnl(pf, val, etDate) {
+    /*
+     * Only anchor against a fully priced book. At startup the feed is empty and
+     * `valuate` falls back to cost basis, so anchoring there would bake the
+     * entire lifetime gain into "today" — and then persist that wrong baseline.
+     */
+    const trustworthy = val.staleCount === 0;
     if (!pf.dayBaseline || pf.dayBaseline.etDate !== etDate) {
+      if (!trustworthy) {
+        return { change: 0, changePct: 0, baseline: val.equity, since: Date.now(), pending: true };
+      }
       pf.dayBaseline = { etDate, equity: val.equity, t: Date.now() };
     }
     const base = pf.dayBaseline.equity;
@@ -385,6 +455,7 @@
       changePct: base > 0 ? (change / base) * 100 : 0,
       baseline: base,
       since: pf.dayBaseline.t,
+      pending: false,
     };
   }
 
@@ -509,8 +580,13 @@
         pf.positions = pf.positions || {};
         pf.orders = pf.orders || [];
         pf.fills = pf.fills || [];
+        pf.rejected = pf.rejected || [];
         pf.equity = pf.equity || [];
         pf.counters = pf.counters || { orders: pf.orders.length };
+        // Books written before the running total existed: seed it from history.
+        if (typeof pf.realizedTotal !== 'number') {
+          pf.realizedTotal = pf.fills.reduce((s, f) => s + (f.realized || 0), 0);
+        }
       }
       parsed.watchlist = parsed.watchlist || PT.defaultWatchlist.slice();
       parsed.aiLog = parsed.aiLog || [];
@@ -534,6 +610,18 @@
     try {
       return attempt(state);
     } catch (e) {
+      /*
+       * Only a quota failure justifies destroying history. Storage can throw
+       * for other reasons (private browsing disables it entirely), and shedding
+       * trade history on every save in that case would be far worse than the
+       * write simply not happening.
+       */
+      const isQuota = e && (e.name === 'QuotaExceededError'
+        || e.name === 'NS_ERROR_DOM_QUOTA_REACHED' || e.code === 22 || e.code === 1014);
+      if (!isQuota) {
+        console.warn('[PT] could not persist state', e && e.message);
+        return false;
+      }
       const now = Date.now();
       for (const id of ['user', 'ai']) {
         const pf = state.portfolios[id];
@@ -558,6 +646,7 @@
     SCHEMA_VERSION, STORAGE_KEY, SLIPPAGE_BPS, MIN_NOTIONAL, OrderError,
     newState, newPortfolio, submitOrder, buildOrder, applyFill, processOpenOrders,
     cancelOrder, crosses, effectivePrice, valuate, dayPnl, stats,
+    availableCash, availableQty, committedCash, committedQty, CASH_EPS,
     sampleEquity, pruneEquity, load, save, clear,
   };
 })(window.PT);

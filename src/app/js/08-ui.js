@@ -118,10 +118,13 @@
    */
   const FLASH_MIN_GAP = 120;
 
+  const FLASH_CLASSES = ['is-up-a', 'is-up-b', 'is-down-a', 'is-down-b'];
+
   function makePriceCell(className) {
     const node = el('span', { class: (className || '') + ' tick num' });
     node._lastRendered = null;
     node._lastFlash = 0;
+    node._flashPhase = 0;
     return node;
   }
 
@@ -139,12 +142,14 @@
     if (now - node._lastFlash < FLASH_MIN_GAP) return;
     node._lastFlash = now;
 
-    const cls = value > prev ? 'is-up' : 'is-down';
-    node.classList.remove('is-up', 'is-down');
-    // Force a reflow so the animation restarts even on a rapid re-trigger.
-    void node.offsetWidth;
+    // Alternate between two identical rules so a rapid re-tick restarts the
+    // animation without forcing a synchronous layout.
+    node._flashPhase = node._flashPhase ? 0 : 1;
+    const cls = (value > prev ? 'is-up-' : 'is-down-') + (node._flashPhase ? 'a' : 'b');
+    node.classList.remove(...FLASH_CLASSES);
     node.classList.add(cls);
-    setTimeout(() => node.classList.remove(cls), 460);
+    clearTimeout(node._flashTimer);
+    node._flashTimer = setTimeout(() => node.classList.remove(cls), 470);
   }
 
   /** Freshness badge derived from a quote's own grade. */

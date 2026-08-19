@@ -23,6 +23,19 @@ window.PT = window.PT || {};
     return round(qty, kind === 'crypto' ? 8 : 6);
   }
 
+  /**
+   * Round a quantity DOWN to its precision. Sizing by dollars must never round
+   * up: `notional / price` rounded up costs marginally more than the dollars
+   * the user asked to spend, which is exactly enough to fail an
+   * "invest my whole balance" order.
+   */
+  function floorQty(qty, kind) {
+    if (!isFinite(qty) || qty <= 0) return 0;
+    const f = Math.pow(10, kind === 'crypto' ? 8 : 6);
+    // Nudge first so 0.29999999999 (a representation artefact) floors to 0.3.
+    return Math.floor(qty * f + 1e-6) / f;
+  }
+
   /* ------------------------------------------------------------ formatting */
 
   const nf = (min, max) => new Intl.NumberFormat('en-US', {
@@ -58,6 +71,12 @@ window.PT = window.PT || {};
   function fmtPct(v, dp = 2) {
     if (v == null || !isFinite(v)) return '—';
     return (v > 0 ? '+' : '') + fmtNum(v, dp, dp) + '%';
+  }
+
+  /** Magnitude only — for prose that supplies its own direction word. */
+  function fmtPctAbs(v, dp = 2) {
+    if (v == null || !isFinite(v)) return '—';
+    return fmtNum(Math.abs(v), dp, dp) + '%';
   }
 
   /** Compact quantity: hide trailing zeros but keep small coin amounts readable. */
@@ -113,13 +132,15 @@ window.PT = window.PT || {};
       Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   }
 
-  /** Trailing-edge debounce. */
+  /** Trailing-edge debounce, with a cancel so a pending call can be abandoned. */
   function debounce(fn, wait) {
     let t;
-    return function (...args) {
+    const wrapped = function (...args) {
       clearTimeout(t);
       t = setTimeout(() => fn.apply(this, args), wait);
     };
+    wrapped.cancel = () => clearTimeout(t);
+    return wrapped;
   }
 
   /** Escape untrusted strings before they touch innerHTML. */
@@ -183,7 +204,7 @@ window.PT = window.PT || {};
   }
 
   PT.util = {
-    round, money, roundQty, fmtUSD, fmtSigned, fmtPct, fmtQty, fmtCompact,
+    round, money, roundQty, floorQty, fmtUSD, fmtSigned, fmtPct, fmtPctAbs, fmtQty, fmtCompact,
     fmtNum, fmtTime, fmtDateTime, fmtAge, clamp, uid, debounce, esc, el, $, $$,
     dirClass, emitter,
   };
