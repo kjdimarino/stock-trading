@@ -312,14 +312,38 @@ export async function stockQuotes(symbols, ttl) {
 const CB_BY_SYMBOL = Object.fromEntries(CRYPTO.map((c) => [c.symbol, c]));
 
 /**
+ * Work out how to price a symbol that may not be in the curated list.
+ *
+ * The curated universe is a starting point, not a whitelist: any listed US
+ * equity or ETF and any Coinbase-listed coin should be tradable. `hint.kind`
+ * comes from the client, which learned it from a search result.
+ */
+function resolveAsset(assetId, hint = {}) {
+  const id = String(assetId || '').toUpperCase();
+  const known = BY_ID[id];
+  if (known) return known;
+  const kind = hint.kind === 'crypto' ? 'crypto' : (hint.kind === 'etf' ? 'etf' : 'stock');
+  return {
+    id,
+    symbol: id,
+    name: hint.name || id,
+    kind,
+    // Yahoo quotes crypto as "SOL-USD"; equities use the bare ticker.
+    yh: hint.yh || (kind === 'crypto' ? `${id}-USD` : id),
+    cb: hint.cb || (kind === 'crypto' ? `${id}-USD` : null),
+    discovered: true,
+  };
+}
+
+/**
  * Crypto quote via Coinbase Exchange (24h stats + ticker). The browser normally
  * streams this over WebSocket; this REST path exists for the initial snapshot
  * and for browsers where the socket cannot connect.
  */
 export function cryptoQuote(symbol, ttl = 4000) {
   return through(`c:${symbol}`, ttl, async () => {
-    const meta = CB_BY_SYMBOL[symbol];
-    if (!meta) throw new Error(`unknown crypto ${symbol}`);
+    // Any Coinbase USD product, not just the curated ones.
+    const meta = CB_BY_SYMBOL[symbol] || { cb: `${String(symbol).toUpperCase()}-USD` };
     await coinbaseLimiter.take();
     const ticker = await getJSON(`https://api.exchange.coinbase.com/products/${meta.cb}/ticker`, { timeout: 8000 });
     await coinbaseLimiter.take();
@@ -397,8 +421,8 @@ export async function cryptoQuotes(symbols, ttl) {
     const snap = await cryptoSnapshotAll(ttl);
     const missing = [];
     for (const s of symbols) {
-      const meta = CB_BY_SYMBOL[s];
-      const row = meta && snap.stats[meta.cb] && snap.stats[meta.cb].stats_24hour;
+      const product = (CB_BY_SYMBOL[s] || {}).cb || `${String(s).toUpperCase()}-USD`;
+      const row = snap.stats[product] && snap.stats[product].stats_24hour;
       const q = row ? quoteFromCoinbaseStats(s, row, snap) : null;
       if (q) out[s] = q; else missing.push(s);
     }
@@ -576,13 +600,12 @@ async function nasdaqCandles(symbol, tf) {
 
 const CANDLE_TTL = { '1m': 20000, '5m': 60000, '15m': 120000, '1h': 300000, '1D': 900000, '1W': 1800000 };
 
-export function fetchCandles(assetId, tf) {
-  const asset = BY_ID[assetId];
-  if (!asset) return Promise.reject(new Error(`unknown asset ${assetId}`));
+export function fetchCandles(assetId, tf, hint) {
+  const asset = resolveAsset(assetId, hint);
   const spec = YH_TF[tf];
   if (!spec) return Promise.reject(new Error(`unsupported timeframe ${tf}`));
 
-  return through(`k:${assetId}:${tf}`, CANDLE_TTL[tf] ?? 60000, async () => {
+  return through(`k:${asset.id}:${tf}`, CANDLE_TTL[tf] ?? 60000, async () => {
     if (asset.kind === 'crypto') {
       try {
         const gran = CB_TF[tf];
@@ -619,50 +642,272 @@ export function fetchCandles(assetId, tf) {
   });
 }
 
+/** Every Coinbase USD product we could stream, for search and discovery. */
+export function cryptoProducts() {
+  return through('cb:products', 3600000, async () => {
+    await coinbaseLimiter.take();
+    const rows = await getJSON('https://api.exchange.coinbase.com/products', { timeout: 15000 });
+    const products = rows
+      .filter((r) => r.quote_currency === 'USD' && r.status === 'online' && !r.trading_disabled)
+      .map((r) => ({ symbol: r.base_currency, name: r.base_name || r.base_currency, cb: r.id, kind: 'crypto' }))
+      .sort((a, b) => a.symbol.localeCompare(b.symbol));
+    return { products, source: 'coinbase', quality: 'live' };
+  });
+}
+
+/* ------------------------------------------------------ stock directory */
+
+const parseMoney = (v) => {
+  if (v == null) return null;
+  const n = parseFloat(String(v).replace(/[$,%\s]/g, ''));
+  return isFinite(n) ? n : null;
+};
+
+/**
+ * Every US-listed stock, with live price, day change, volume, market cap and
+ * sector — around 7,000 names in a single request.
+ *
+ * This is what makes the universe the whole market rather than a curated list.
+ * It backs symbol search (so lookups keep working when Yahoo is rate limited)
+ * and every idea list.
+ */
+export function stockDirectory() {
+  return through('nq:directory', 300000, async () => {
+    await nasdaqLimiter.take();
+    const j = await getJSON(
+      'https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=0&download=true',
+      { timeout: 45000 },
+    );
+    const raw = (j && j.data && j.data.rows) || [];
+    const rows = [];
+    for (const r of raw) {
+      const symbol = String(r.symbol || '').trim().toUpperCase();
+      const price = parseMoney(r.lastsale);
+      if (!symbol || price == null || price <= 0) continue;
+      rows.push({
+        symbol,
+        name: String(r.name || symbol).replace(/\s+Common Stock.*$/i, '').replace(/\s+$/, ''),
+        price,
+        changePct: parseMoney(r.pctchange),
+        change: parseMoney(r.netchange),
+        volume: parseMoney(r.volume) || 0,
+        marketCap: parseMoney(r.marketCap) || 0,
+        sector: r.sector || null,
+        industry: r.industry || null,
+        country: r.country || null,
+      });
+    }
+    if (!rows.length) throw new Error('empty stock directory');
+    return { rows, source: 'nasdaq', quality: 'live' };
+  });
+}
+
 /* --------------------------------------------------------------- search */
 
-/** Ticker lookup: Yahoo's search, falling back to our local universe. */
+/**
+ * Symbol lookup across the whole tradable universe.
+ *
+ * Order matters: curated names first (richest metadata), then every listed US
+ * stock from the directory, then every Coinbase coin, and finally Yahoo as a
+ * bonus. Yahoo is no longer required — it rate limits aggressively, and search
+ * that stops working is worse than search with one fewer source.
+ */
 export function searchSymbols(query) {
   const q = String(query || '').trim();
   if (!q) return Promise.resolve({ results: [], source: 'local' });
 
-  const local = () => {
+  return through(`s:${q.toLowerCase()}`, 120000, async () => {
     const needle = q.toLowerCase();
-    const results = Object.values(BY_ID)
-      .filter((a) => a.id.toLowerCase().includes(needle) || a.name.toLowerCase().includes(needle))
-      .slice(0, 20)
-      .map((a) => ({ symbol: a.id, name: a.name, kind: a.kind, exchange: a.kind === 'crypto' ? 'Coinbase' : 'US', tradable: true }));
-    return { results, source: 'local' };
-  };
+    const upper = q.toUpperCase();
+    const out = [];
+    const seen = new Set();
+    const push = (r) => {
+      if (!r.symbol || seen.has(r.symbol)) return false;
+      seen.add(r.symbol);
+      out.push(r);
+      return true;
+    };
 
-  return through(`s:${q.toLowerCase()}`, 300000, async () => {
+    for (const a of Object.values(BY_ID)) {
+      if (a.id.toLowerCase().includes(needle) || a.name.toLowerCase().includes(needle)) {
+        push({
+          symbol: a.id, name: a.name, kind: a.kind,
+          exchange: a.kind === 'crypto' ? 'Coinbase' : 'US', tradable: true,
+        });
+      }
+    }
+
     try {
-      const j = await yahooGet(`/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=12&newsCount=0`);
-      const seen = new Set();
-      const results = (j.quotes || [])
-        .filter((r) => r.symbol && ['EQUITY', 'ETF', 'CRYPTOCURRENCY', 'INDEX', 'MUTUALFUND'].includes(r.quoteType))
-        .filter((r) => (seen.has(r.symbol) ? false : (seen.add(r.symbol), true)))
-        .map((r) => {
+      const dir = await stockDirectory();
+      const exact = [], prefix = [], byName = [];
+      for (const r of dir.rows) {
+        if (r.symbol === upper) exact.push(r);
+        else if (r.symbol.startsWith(upper)) prefix.push(r);
+        else if (r.name.toLowerCase().includes(needle)) byName.push(r);
+      }
+      const busiest = (a, b) => (b.volume || 0) - (a.volume || 0);
+      prefix.sort(busiest);
+      byName.sort(busiest);
+      for (const r of [...exact, ...prefix, ...byName]) {
+        push({
+          symbol: r.symbol,
+          name: r.name,
+          kind: 'stock',
+          exchange: r.country && r.country !== 'United States' ? r.country : 'US',
+          price: r.price,
+          changePct: r.changePct,
+          tradable: true,
+        });
+        if (out.length >= 24) break;
+      }
+    } catch { /* directory unavailable; the other sources still apply */ }
+
+    if (out.length < 24) {
+      try {
+        const cp = await cryptoProducts();
+        for (const c of cp.products) {
+          if (c.symbol.toLowerCase().includes(needle) || c.name.toLowerCase().includes(needle)) {
+            push({ symbol: c.symbol, name: c.name, kind: 'crypto', exchange: 'Coinbase', tradable: true });
+          }
+          if (out.length >= 24) break;
+        }
+      } catch { /* ignore */ }
+    }
+
+    if (out.length < 6) {
+      try {
+        const j = await yahooGet(`/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=12&newsCount=0`);
+        for (const r of (j.quotes || [])) {
+          if (!r.symbol || !['EQUITY', 'ETF', 'CRYPTOCURRENCY'].includes(r.quoteType)) continue;
           const isCrypto = r.quoteType === 'CRYPTOCURRENCY';
-          // A Yahoo crypto symbol like "BTC-USD" maps onto our tradable universe.
           const base = isCrypto ? String(r.symbol).replace(/-USD$/, '') : r.symbol;
-          const known = BY_ID[base];
-          return {
-            symbol: known ? known.id : r.symbol,
+          push({
+            symbol: BY_ID[base] ? base : r.symbol,
             name: r.longname || r.shortname || r.symbol,
             kind: isCrypto ? 'crypto' : (r.quoteType === 'ETF' ? 'etf' : 'stock'),
             exchange: r.exchDisp || r.exchange || '',
-            // Only assets we can actually price and trade are marked tradable.
-            tradable: !!known || (!isCrypto && ['EQUITY', 'ETF'].includes(r.quoteType)),
-          };
-        });
-      // Merge in local matches so our own universe always surfaces first.
-      const localRes = local().results;
-      const merged = [...localRes, ...results.filter((r) => !localRes.some((l) => l.symbol === r.symbol))];
-      return { results: merged.slice(0, 20), source: 'yahoo' };
-    } catch {
-      return local();
+            tradable: true,
+            yh: r.symbol,
+          });
+        }
+      } catch { /* Yahoo is a bonus here, not a dependency */ }
     }
+
+    return { results: out.slice(0, 24), source: 'directory' };
+  });
+}
+
+/* ---------------------------------------------------------------- ideas */
+
+/**
+ * Ready-made lists of things to look at, computed from live market data.
+ *
+ * Each list states the filter it applied, because "top gainer" means nothing
+ * without knowing whether penny-stock noise was screened out.
+ */
+export function tradeIdeas() {
+  return through('ideas', 120000, async () => {
+    const lists = [];
+
+    try {
+      const dir = await stockDirectory();
+      const rows = dir.rows;
+      const liquid = rows.filter((r) => r.volume >= 200000 && r.price >= 1 && r.changePct != null);
+      const take = (arr, n = 12) => arr.slice(0, n).map((r) => ({
+        symbol: r.symbol, name: r.name, kind: 'stock', price: r.price,
+        changePct: r.changePct, volume: r.volume, marketCap: r.marketCap, sector: r.sector,
+      }));
+
+      lists.push({
+        id: 'gainers',
+        title: 'Top gainers today',
+        note: 'Biggest percentage risers, limited to names trading over $1 with real volume.',
+        items: take([...liquid].sort((a, b) => b.changePct - a.changePct)),
+      });
+      lists.push({
+        id: 'losers',
+        title: 'Biggest fallers today',
+        note: 'The other side of the same screen — sharp falls on liquid names.',
+        items: take([...liquid].sort((a, b) => a.changePct - b.changePct)),
+      });
+      lists.push({
+        id: 'active',
+        title: 'Most actively traded',
+        note: 'Highest share volume today. Heavy volume means tighter spreads and easier fills.',
+        items: take([...rows].sort((a, b) => b.volume - a.volume)),
+      });
+      lists.push({
+        id: 'penny',
+        title: 'Penny stocks on the move',
+        note: 'Under $5 with at least 500k shares traded. These swing hard and can gap — size small.',
+        items: take([...rows]
+          .filter((r) => r.price < 5 && r.volume >= 500000 && r.changePct != null)
+          .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))),
+      });
+      lists.push({
+        id: 'steady',
+        title: 'Large and steady',
+        note: 'The biggest companies listed, moving less than 2% today. The calm end of the market.',
+        items: take([...rows]
+          .filter((r) => r.marketCap > 5e10 && r.changePct != null && Math.abs(r.changePct) < 2)
+          .sort((a, b) => b.marketCap - a.marketCap)),
+      });
+      lists.push({
+        id: 'megacap',
+        title: 'Biggest companies',
+        note: 'Ranked purely by market capitalisation.',
+        items: take([...rows].sort((a, b) => b.marketCap - a.marketCap)),
+      });
+      lists.push({
+        id: 'smallcap',
+        title: 'Small caps making moves',
+        note: 'Market cap between $300M and $2B with a move of 5% or more.',
+        items: take([...liquid]
+          .filter((r) => r.marketCap >= 3e8 && r.marketCap <= 2e9 && Math.abs(r.changePct) >= 5)
+          .sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct))),
+      });
+    } catch (e) {
+      lists.push({ id: 'stocks-error', title: 'Stock ideas unavailable', note: e.message, items: [] });
+    }
+
+    try {
+      const snap = await cryptoSnapshotAll(60000);
+      const coins = [];
+      for (const product in snap.stats) {
+        if (!product.endsWith('-USD')) continue;
+        const st = snap.stats[product].stats_24hour;
+        if (!st) continue;
+        const price = parseFloat(st.last), open = parseFloat(st.open);
+        const volume = parseFloat(st.volume);
+        if (!isFinite(price) || !isFinite(open) || open <= 0) continue;
+        const symbol = product.replace(/-USD$/, '');
+        coins.push({
+          symbol,
+          name: (BY_ID[symbol] || {}).name || symbol,
+          kind: 'crypto',
+          price,
+          changePct: ((price - open) / open) * 100,
+          volume: isFinite(volume) ? volume * price : 0,
+        });
+      }
+      const active = coins.filter((c) => c.volume > 250000);
+      lists.push({
+        id: 'crypto-gainers',
+        title: 'Crypto gainers (24h)',
+        note: 'Coinbase-listed coins with at least $250k of 24h turnover.',
+        items: [...active].sort((a, b) => b.changePct - a.changePct).slice(0, 12),
+      });
+      lists.push({
+        id: 'crypto-losers',
+        title: 'Crypto fallers (24h)',
+        note: 'Same screen, the other direction.',
+        items: [...active].sort((a, b) => a.changePct - b.changePct).slice(0, 12),
+      });
+    } catch (e) {
+      lists.push({ id: 'crypto-error', title: 'Crypto ideas unavailable', note: e.message, items: [] });
+    }
+
+    return { lists, source: 'nasdaq + coinbase', quality: 'live', at: Date.now() };
   });
 }
 

@@ -8,9 +8,50 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const out = `/* AUTO-GENERATED from src/universe.mjs by tools/gen-universe.mjs — do not edit. */
 (function (PT) {
   'use strict';
-  PT.assets = ${JSON.stringify(ASSETS)};
+
+  /*
+   * The curated list is a STARTING POINT, not a whitelist. It seeds the default
+   * watchlist, the movers board and the AI trader's candidate pool. Anything the
+   * data providers can price — any listed US equity or ETF, including penny
+   * stocks, and any Coinbase-listed coin — becomes tradable the moment it is
+   * discovered through search, via registerAsset() below.
+   */
+  PT.seedAssets = ${JSON.stringify(ASSETS)};
+  PT.assets = PT.seedAssets.slice();
   PT.byId = Object.fromEntries(PT.assets.map(function (a) { return [a.id, a]; }));
   PT.defaultWatchlist = ${JSON.stringify(DEFAULT_WATCHLIST)};
+
+  /** Was this symbol in the curated seed list (vs discovered at runtime)? */
+  PT.isSeed = function (id) { var a = PT.byId[id]; return !!(a && !a.discovered); };
+
+  /**
+   * Add (or update) an asset so the rest of the app can price, chart and trade
+   * it. Safe to call repeatedly; later calls fill in missing fields.
+   */
+  PT.registerAsset = function (a) {
+    if (!a || !a.id) return null;
+    var id = String(a.id).toUpperCase();
+    var existing = PT.byId[id];
+    if (existing) {
+      for (var k in a) if (a[k] != null && existing[k] == null) existing[k] = a[k];
+      return existing;
+    }
+    var entry = {
+      id: id,
+      symbol: id,
+      name: a.name || id,
+      kind: a.kind || 'stock',
+      sector: a.sector || (a.kind === 'crypto' ? 'Crypto' : 'Equity'),
+      exchange: a.exchange || null,
+      yh: a.yh || (a.kind === 'crypto' ? id + '-USD' : id),
+      cb: a.cb || (a.kind === 'crypto' ? id + '-USD' : null),
+      discovered: true,
+    };
+    PT.byId[id] = entry;
+    PT.assets.push(entry);
+    return entry;
+  };
+
   PT.assetKind = function (id) { var a = PT.byId[id]; return a ? a.kind : 'stock'; };
   PT.isCrypto = function (id) { return PT.assetKind(id) === 'crypto'; };
 })(window.PT);

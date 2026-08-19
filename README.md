@@ -121,11 +121,15 @@ number. The key stays on your machine; the browser never sees it. Answers that
 came from the model are labelled as such.
 
 ### Autonomous AI trader
-A second portfolio, same starting cash, traded automatically once a minute by a
-deterministic multi-factor strategy while you trade yours.
+A second portfolio, same starting cash, traded automatically every five seconds
+by a deterministic multi-factor strategy while you trade yours. It stays
+long-only regardless of your own shorting setting — its rules were designed and
+tested without shorts.
 
 It logs **every** decision — including the decision to do nothing — with the
-factors behind it, so you can see exactly why it acted. It runs with real
+factors behind it, so you can see exactly why it acted. Repeated identical holds
+collapse into one entry with a count, so the log moves quickly without burying
+the actual trades. It runs with real
 guardrails: long only, max 8 positions, max 15% of equity per position, a 10%
 cash floor, ATR-based stops and targets, a 10-minute per-symbol cooldown and a
 25-trade daily cap.
@@ -179,12 +183,12 @@ test/              unit, live-data and browser suites
 
 ### Tests
 
-346 assertions across 10 suites:
+365 assertions across 10 suites:
 
 | Suite | What it covers |
 |---|---|
 | `calendar` | NYSE holiday rules, early closes, session phases, DST boundaries |
-| `engine` | Order validation, cost basis, P&L, limit fills, reserved balances, persistence, a 500-trade float-safety run |
+| `engine` | Order validation, cost basis, long and short P&L, margin and forced buy-in, limit fills, reserved balances, account repair, persistence, randomised float-safety runs |
 | `indicators` | RSI/MACD/Bollinger/ATR against an independent reference implementation |
 | `chart` | Axis tick generation, decimal precision, sparkline geometry |
 | `feed` | Folding live ticks into session-anchored candles, freshness grading |

@@ -36,6 +36,8 @@
     focusPollInFlight: false,
     serverUp: true,
     counters: { ticks: 0, polls: 0, wsReconnects: 0 },
+    // Rolling per-asset tick history, the source for sub-minute candles.
+    ticks: Object.create(null),
     // Has a first fetch completed for each asset class? Before it has, "no
     // data" is misleading — nothing has been asked for yet.
     ready: { stock: false, crypto: false },
@@ -55,8 +57,50 @@
       next.tickDir = 0;
     }
     state.prices[assetId] = next;
+    recordTick(assetId, next.price, next.t);
     bus.emit('tick', next);
     return next;
+  }
+
+  /** Keep roughly the last hour of prints, capped so memory stays bounded. */
+  const TICK_HISTORY_MS = 3600e3;
+  const TICK_HISTORY_MAX = 20000;
+
+  function recordTick(assetId, price, t) {
+    if (!isFinite(price)) return;
+    const buf = state.ticks[assetId] || (state.ticks[assetId] = []);
+    const last = buf[buf.length - 1];
+    // Collapse repeat prints at the same instant.
+    if (last && last.t === t && last.p === price) return;
+    buf.push({ t, p: price });
+    if (buf.length > TICK_HISTORY_MAX) buf.splice(0, buf.length - TICK_HISTORY_MAX);
+    if (buf.length > 64 && t - buf[0].t > TICK_HISTORY_MS) {
+      const cutoff = t - TICK_HISTORY_MS;
+      let i = 0;
+      while (i < buf.length && buf[i].t < cutoff) i++;
+      if (i > 0) buf.splice(0, i);
+    }
+  }
+
+  /** Aggregate the tick buffer into OHLC candles of `width` ms. */
+  function candlesFromTicks(assetId, tf) {
+    const width = TF_MS[tf];
+    const buf = state.ticks[assetId];
+    if (!width || !buf || buf.length < 2) return [];
+    const bars = [];
+    let cur = null;
+    for (const { t, p } of buf) {
+      const bucket = Math.floor(t / width) * width;
+      if (!cur || cur.t !== bucket) {
+        cur = { t: bucket, o: p, h: p, l: p, c: p, v: 0 };
+        bars.push(cur);
+      } else {
+        cur.c = p;
+        if (p > cur.h) cur.h = p;
+        if (p < cur.l) cur.l = p;
+      }
+    }
+    return bars;
   }
 
   /** Freshness grade for a quote, recomputed on read rather than stored. */
@@ -280,9 +324,9 @@
 
   function stockInterval() {
     const s = PT.calendar.stockStatus();
-    if (s.phase === 'open') return 12000;
-    if (s.phase === 'pre' || s.phase === 'after') return 30000;
-    return 120000;
+    if (s.phase === 'open') return 6000;
+    if (s.phase === 'pre' || s.phase === 'after') return 25000;
+    return 90000;
   }
 
   /**
@@ -294,9 +338,9 @@
    */
   function focusInterval() {
     const s = PT.calendar.stockStatus();
-    if (s.phase === 'open') return 4000;
-    if (s.phase === 'pre' || s.phase === 'after') return 20000;
-    return 120000;
+    if (s.phase === 'open') return 1500;
+    if (s.phase === 'pre' || s.phase === 'after') return 15000;
+    return 60000;
   }
 
   /** Refresh just the focused equity, faster than the watchlist sweep. */
@@ -308,7 +352,7 @@
     state.focusPollInFlight = true;
     state.lastFocusPoll = Date.now();
     try {
-      const j = await api(`/api/quotes?stocks=${encodeURIComponent(id)}&ttl=2500`);
+      const j = await api(`/api/quotes?stocks=${encodeURIComponent(id)}&ttl=1000`);
       state.counters.polls++;
       state.ready.stock = true;
       for (const sym in j.quotes) applyQuote(sym, { ...j.quotes[sym], t: Date.now() });
@@ -330,7 +374,7 @@
     state.lastStockPoll = Date.now();
     try {
       // Server-side TTL matches our cadence so repeat callers share one upstream hit.
-      const ttl = Math.max(4000, interval - 2000);
+      const ttl = Math.max(1200, interval - 1500);
       const j = await api(`/api/quotes?stocks=${encodeURIComponent(ids.join(','))}&ttl=${ttl}`);
       state.counters.polls++;
       state.ready.stock = true;
@@ -357,16 +401,41 @@
 
   /** Bar width in ms for each timeframe, used to roll live ticks into candles. */
   const TF_MS = {
+    '1s': 1e3, '5s': 5e3, '15s': 15e3,
     '1m': 60e3, '5m': 300e3, '15m': 900e3, '1h': 3600e3, '1D': 86400e3, '1W': 604800e3,
   };
 
+  /*
+   * No public feed serves sub-minute candles — Coinbase's smallest granularity
+   * is 60s. These are built here from the tick stream instead: real trade
+   * prints for crypto, and the polled quotes for equities. That is genuine
+   * data, just aggregated locally, so the chart labels its source honestly.
+   */
+  const SECOND_TFS = new Set(['1s', '5s', '15s']);
+
   async function candles(assetId, tf, { force = false } = {}) {
+    if (SECOND_TFS.has(tf)) {
+      const bars = candlesFromTicks(assetId, tf);
+      return {
+        bars,
+        at: Date.now(),
+        source: 'live ticks',
+        quality: bars.length ? 'live' : 'none',
+        tf,
+        assetId,
+        // The chart says so out loud: this is built here, not fetched.
+        derived: true,
+      };
+    }
     const key = `${assetId}:${tf}`;
     const hit = candleCache.get(key);
     const maxAge = Math.min(300000, (TF_MS[tf] || 60e3) / 2);
     if (!force && hit && Date.now() - hit.at < maxAge) return hit;
 
-    const j = await api(`/api/candles?asset=${encodeURIComponent(assetId)}&tf=${encodeURIComponent(tf)}`);
+    const a = PT.byId[assetId] || {};
+    const hint = `&kind=${encodeURIComponent(a.kind || 'stock')}`
+      + (a.yh ? `&yh=${encodeURIComponent(a.yh)}` : '');
+    const j = await api(`/api/candles?asset=${encodeURIComponent(assetId)}&tf=${encodeURIComponent(tf)}${hint}`);
     if (j.error) throw new Error(j.error);
     const entry = { bars: j.bars, at: Date.now(), source: j.source, quality: j.quality, tf, assetId };
     candleCache.set(key, entry);
@@ -447,7 +516,7 @@
       // priced yet because they simply have not traded.
       if (state.wsState !== 'open' || cryptoAwaitingPrice()) pollCrypto();
       bus.emit('status', snapshotStatus());
-    }, 5000);
+    }, 1000);
 
     // Reconnect promptly when the tab comes back or the network returns.
     document.addEventListener('visibilitychange', () => {
@@ -508,6 +577,7 @@
   PT.feed = {
     start, stop, watch, unwatch, setFocus, candles, search,
     applyTickToBars, applyQuote, grade, price, quote, parseCoinbaseTicker, whenReady,
+    candlesFromTicks, tickCount: (id) => (state.ticks[id] || []).length, SECOND_TFS,
     get prices() { return state.prices; },
     get status() { return snapshotStatus(); },
     get watched() { return state.watched; },

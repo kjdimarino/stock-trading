@@ -56,7 +56,8 @@
   /* The full-width panels span the single content column. */
   .terminal[data-view="portfolio"],
   .terminal[data-view="ai"],
-  .terminal[data-view="compare"] {
+  .terminal[data-view="compare"],
+  .terminal[data-view="ideas"] {
     grid-template-areas: "rail topbar" "rail chart" "status status";
   }
 

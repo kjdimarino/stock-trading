@@ -27,7 +27,8 @@
 .statusbar { grid-area: status; }
 
 /* Panels that swap into the centre column (Portfolio, AI, etc.) span both rows. */
-.terminal[data-view="portfolio"], .terminal[data-view="ai"], .terminal[data-view="compare"] {
+.terminal[data-view="portfolio"], .terminal[data-view="ai"],
+.terminal[data-view="compare"], .terminal[data-view="ideas"] {
   grid-template-areas:
     "rail topbar    topbar  topbar"
     "rail watchlist chart   order"
@@ -36,7 +37,8 @@
 }
 .terminal[data-view="portfolio"] .blotter,
 .terminal[data-view="ai"] .blotter,
-.terminal[data-view="compare"] .blotter { display: none; }
+.terminal[data-view="compare"] .blotter,
+.terminal[data-view="ideas"] .blotter { display: none; }
 
 /* ---------------------------------- rail --------------------------------- */
 .rail {

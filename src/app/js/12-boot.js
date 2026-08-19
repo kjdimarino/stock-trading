@@ -9,7 +9,7 @@
   const E = PT.engine;
   const A = PT.app;
   const V = PT.views;
-  const { S } = A;
+  const { S, R } = A;
 
   /* ------------------------------------------------------------ run loop */
 
@@ -29,6 +29,7 @@
         // Each order's own asset class decides whether it may fill.
         marketOpen: PT.calendar.stockStatus().isOpen,
         slippageEnabled: S.st.settings.slippageEnabled,
+        shortingEnabled: S.st.settings.shortingEnabled !== false,
         now,
       });
       for (const f of fills) {
@@ -75,7 +76,7 @@
     }
 
     /* Chrome refresh, throttled — price cells update on their own via ticks. */
-    if (now - lastRender > 900) {
+    if (now - lastRender > 250) {
       lastRender = now;
       V.renderTopbar();
       V.renderStatusbar();
@@ -85,7 +86,53 @@
       }
     }
 
-    requestAnimationFrame(() => setTimeout(tickLoop, 250));
+    requestAnimationFrame(() => setTimeout(tickLoop, 100));
+  }
+
+  /**
+   * A short can lose more than it cost to open, so the account is checked every
+   * pass. Below the maintenance level the user is warned; below the hard floor
+   * the engine buys the shorts back, exactly as a broker would, and says so.
+   */
+  let lastMarginLevel = 'ok';
+  function checkMargin(now, px) {
+    const pf = A.pfUser();
+    const m = E.marginStatus(pf, px);
+    if (m.level === 'none') { lastMarginLevel = 'ok'; return; }
+
+    if (m.level === 'liquidate') {
+      const shorts = E.valuate(pf, px).positions.filter((p) => p.isShort);
+      for (const pos of shorts) {
+        try {
+          const r = E.submitOrder(pf, {
+            assetId: pos.assetId, side: 'buy', type: 'market', qty: Math.abs(pos.qty),
+            reason: 'Forced buy-in: margin fell below the maintenance floor',
+          }, { ...A.orderCtx(pos.assetId), marketOpen: true });
+          UI.toast({
+            kind: 'error',
+            title: `Forced buy-in: ${pos.assetId}`,
+            message: `Your short lost more than the account could cover, so it was bought back at `
+              + `${U.fmtUSD(r.fill.price)} (${U.fmtSigned(r.fill.realized)}). This is what a broker would do.`,
+            timeout: 15000,
+          });
+        } catch (e) { console.warn('[margin] could not buy in', pos.assetId, e.message); }
+      }
+      A.save();
+      lastMarginLevel = 'liquidate';
+      return;
+    }
+
+    if (m.level === 'call' && lastMarginLevel !== 'call') {
+      UI.toast({
+        kind: 'warn',
+        title: 'Margin call on your short positions',
+        message: `Equity is ${U.fmtUSD(m.equity)} against ${U.fmtUSD(m.exposure)} of shorts. `
+          + `Equity must stay above ${U.fmtUSD(m.maintenance)} (30% of the short). `
+          + `Below ${U.fmtUSD(m.forceLevel)} the positions are bought back automatically.`,
+        timeout: 15000,
+      });
+    }
+    lastMarginLevel = m.level;
   }
 
   /* ------------------------------------------------------- AI trader loop */
@@ -141,9 +188,24 @@
         cooldowns: S.cooldowns,
         marketOpen: PT.calendar.stockStatus().isOpen,
         slippageEnabled: S.st.settings.slippageEnabled,
+        // The autonomous strategy stays long-only regardless of the user's
+        // own setting: its rules were designed and tested without shorts.
+        shortingEnabled: false,
       });
 
       for (const d of result.decisions) {
+        /*
+         * At a five-second cadence the strategy holds far more often than it
+         * trades. Collapsing a repeated identical hold into one entry with a
+         * count keeps the log fast-moving without burying the actual trades.
+         */
+        const last = S.st.aiLog[S.st.aiLog.length - 1];
+        if (d.action === 'hold' && last && last.action === 'hold'
+            && last.assetId === d.assetId && last.why === d.why) {
+          last.t = d.t;
+          last.repeats = (last.repeats || 1) + 1;
+          continue;
+        }
         S.st.aiLog.push(d);
         if (d.action === 'buy' || d.action === 'sell') {
           UI.toast({
@@ -173,7 +235,7 @@
       if (e.key === '/' && !typing) { e.preventDefault(); A.R.omniInput.focus(); return; }
       if (typing) return;
 
-      const idx = ['1', '2', '3', '4', '5', '6'].indexOf(e.key);
+      const idx = ['1', '2', '3', '4', '5', '6', '7', '8', '9'].indexOf(e.key);
       if (idx >= 0 && S.view === 'trade') {
         S.tf = V.TIMEFRAMES[idx];
         V.buildChartPane();
@@ -193,12 +255,24 @@
   function wireFeed() {
     PT.feed.on('tick', (q) => {
       A.paintQuote(q.assetId, q);
+      if (q.assetId !== S.focus || !S.chart) return;
+
+      if (PT.feed.SECOND_TFS.has(S.tf)) {
+        /*
+         * Sub-minute candles are aggregated from the tick buffer, so rebuild
+         * rather than fold: the buffer is small and this keeps the series exact
+         * as prints arrive out of order or arrive faster than one per bucket.
+         */
+        S.bars = PT.feed.candlesFromTicks(S.focus, S.tf);
+        S.chart.setData(S.bars, S.tf);
+        if (S.bars.length > 1 && R.chartMsg) R.chartMsg.classList.add('hidden');
+        if (R.chartSource) R.chartSource.textContent = `${S.bars.length} bars · live ticks`;
+        return;
+      }
 
       // Fold the live price into the focused chart's newest candle.
-      if (q.assetId === S.focus && S.bars && S.chart) {
-        if (PT.feed.applyTickToBars(S.bars, S.tf, q.price, q.t)) {
-          S.chart.setData(S.bars, S.tf);
-        }
+      if (S.bars && PT.feed.applyTickToBars(S.bars, S.tf, q.price, q.t)) {
+        S.chart.setData(S.bars, S.tf);
       }
     });
   }
@@ -207,6 +281,18 @@
 
   function startApp(state) {
     S.st = state;
+
+    /*
+     * Re-register symbols the user discovered through search. This has to run
+     * before anything reads the registry, or a held penny stock would come back
+     * as an unknown symbol with no name and no price source.
+     */
+    for (const id in (S.st.discovered || {})) PT.registerAsset(S.st.discovered[id]);
+
+    // Older saves defaulted the AI to a one-minute clock.
+    if (!S.st.settings.aiIntervalMs || S.st.settings.aiIntervalMs > 30000) {
+      S.st.settings.aiIntervalMs = 5000;
+    }
 
     // Focus something the user is actually watching.
     S.focus = S.st.watchlist[0] || 'AAPL';
@@ -228,13 +314,31 @@
     tickLoop();
 
     // The AI takes its first decision shortly after launch, then on its schedule.
-    setTimeout(aiCycle, 8000);
-    setInterval(aiCycle, S.st.settings.aiIntervalMs || 60000);
+    setTimeout(aiCycle, 4000);
+    setInterval(aiCycle, S.st.settings.aiIntervalMs || 5000);
 
     PT.companion.llmAvailable().then((ok) => {
       S.llmReady = ok;
       if (S.view === 'ai') V.renderAIView();
     });
+
+    // If the stored book was corrupt, say so plainly rather than silently
+    // presenting different numbers than the user left behind.
+    if (S.st.repairs && S.st.repairs.length) {
+      for (const r of S.st.repairs) {
+        UI.toast({
+          kind: 'warn',
+          title: `Repaired your ${r.portfolio === 'ai' ? 'AI' : ''} account`.replace('  ', ' '),
+          message: `${r.problems.join('; ')}. `
+            + (r.exact
+              ? `Rebuilt from your trade history — balance is now ${U.fmtUSD(r.after.cash)}.`
+              : `History was incomplete, so values were clamped to a valid state.`),
+          timeout: 15000,
+        });
+      }
+      delete S.st.repairs;
+      A.save();
+    }
 
     // A one-time, unmissable statement of what this is.
     if (!S.st.settings.disclaimerSeen) {

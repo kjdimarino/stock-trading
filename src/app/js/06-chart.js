@@ -63,6 +63,9 @@
   const fmtAxis = (v, dp) => v.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
 
   const TIME_FMT = {
+    '1s': { minute: '2-digit', second: '2-digit' },
+    '5s': { minute: '2-digit', second: '2-digit' },
+    '15s': { hour: 'numeric', minute: '2-digit', second: '2-digit' },
     '1m': { hour: 'numeric', minute: '2-digit' },
     '5m': { hour: 'numeric', minute: '2-digit' },
     '15m': { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' },

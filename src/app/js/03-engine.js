@@ -1,9 +1,12 @@
 /* =========================================================================
    Paper trading engine.
 
-   Long-only by design: shorting a paper account teaches margin mechanics that
-   this app does not simulate (borrow fees, maintenance calls, forced buy-ins),
-   and getting those subtly wrong would be worse than omitting them.
+   Supports long and short positions. A position's quantity is signed: positive
+   is long, negative is short. Shorts follow a Reg-T-shaped margin model —
+   proceeds are credited to cash but 150% of the short's current value is held
+   as collateral, so the account cannot spend money it may need to buy back.
+   A maintenance check warns, and ultimately forces a buy-in, if the position
+   moves far enough against you.
 
    All mutations funnel through this module so the human portfolio and the
    autonomous AI portfolio share one accounting implementation.
@@ -31,6 +34,21 @@
    */
   const CASH_EPS = 0.005;
   const QTY_EPS = 1e-9;
+
+  /*
+   * Two different quantities, easily confused:
+   *
+   * SHORT_INITIAL_MARGIN is the *collateral* held, as a multiple of the short's
+   * market value. 1.5 mirrors Reg T — the sale proceeds plus 50% of your own
+   * money — which works out to about 2x leverage.
+   *
+   * The MAINTENANCE ratios compare account *equity* to short market value.
+   * Brokers require roughly 30%; below that the account is in a margin call,
+   * and below the force level the position is bought back.
+   */
+  const SHORT_INITIAL_MARGIN = 1.5;
+  const SHORT_MAINTENANCE_RATIO = 0.30;
+  const SHORT_FORCE_RATIO = 0.25;
 
   /* ----------------------------------------------------------- portfolios */
 
@@ -67,8 +85,9 @@
       aiLog: [],
       settings: {
         slippageEnabled: true,
+        shortingEnabled: true,
         aiTraderEnabled: true,
-        aiIntervalMs: 60000,
+        aiIntervalMs: 5000,
         soundEnabled: false,
         llmKey: '',
       },
@@ -116,14 +135,61 @@
     return total;
   }
 
-  /** Cash that is actually spendable right now. */
-  const availableCash = (pf) => Math.max(0, pf.cash - committedCash(pf));
+  /** Total current market value of every short position. */
+  function shortExposure(pf, prices) {
+    let total = 0;
+    for (const id in pf.positions) {
+      const p = pf.positions[id];
+      if (p.qty >= 0) continue;
+      const q = prices && prices[id];
+      const price = q && isFinite(q.price) ? q.price : p.avgCost;
+      total += Math.abs(p.qty) * price;
+    }
+    return total;
+  }
 
-  /** Units of an asset that are actually sellable right now. */
+  /** Collateral held against open shorts. */
+  const shortCollateral = (pf, prices) => shortExposure(pf, prices) * SHORT_INITIAL_MARGIN;
+
+  /**
+   * Cash that is actually spendable: the balance, less money promised to
+   * resting buy orders, less collateral held against short positions.
+   */
+  function availableCash(pf, prices) {
+    return Math.max(0, pf.cash - committedCash(pf) - shortCollateral(pf, prices));
+  }
+
+  /** Long units of an asset that can be sold without opening a short. */
   function availableQty(pf, assetId) {
     const pos = pf.positions[assetId];
-    if (!pos) return 0;
+    if (!pos || pos.qty <= 0) return 0;
     return Math.max(0, pos.qty - committedQty(pf, assetId));
+  }
+
+  /**
+   * Margin health. `ratio` is equity as a multiple of short exposure; below
+   * SHORT_MAINTENANCE the account is in a call, below SHORT_FORCE_CLOSE the
+   * engine buys the shorts back.
+   */
+  function marginStatus(pf, prices) {
+    const exposure = shortExposure(pf, prices);
+    if (exposure <= 0) return { exposure: 0, ratio: Infinity, level: 'none', equity: 0 };
+    let invested = 0;
+    for (const id in pf.positions) {
+      const p = pf.positions[id];
+      const q = prices && prices[id];
+      const price = q && isFinite(q.price) ? q.price : p.avgCost;
+      invested += p.qty * price;
+    }
+    const equity = pf.cash + invested;
+    const ratio = equity / exposure;
+    const level = ratio < SHORT_FORCE_RATIO ? 'liquidate'
+      : ratio < SHORT_MAINTENANCE_RATIO ? 'call' : 'ok';
+    return {
+      exposure, ratio, level, equity,
+      maintenance: exposure * SHORT_MAINTENANCE_RATIO,
+      forceLevel: exposure * SHORT_FORCE_RATIO,
+    };
   }
 
   /**
@@ -179,21 +245,52 @@
     }
 
     if (side === 'buy') {
-      const free = availableCash(pf);
+      const pos = pf.positions[assetId];
+      // Buying back a short releases collateral rather than consuming cash.
+      const covering = pos && pos.qty < 0 ? Math.min(qty, Math.abs(pos.qty)) : 0;
+      const free = availableCash(pf, ctx.prices) + covering * refPrice * (SHORT_INITIAL_MARGIN - 1);
       if (estCost > free + CASH_EPS) {
-        const reserved = pf.cash - free;
+        const reserved = pf.cash - availableCash(pf, ctx.prices);
         throw new OrderError(reserved > CASH_EPS
-          ? `Not enough free cash. Need ${U.fmtUSD(estCost)}, but ${U.fmtUSD(reserved)} is committed to open limit orders.`
+          ? `Not enough free cash. Need ${U.fmtUSD(estCost)}, but ${U.fmtUSD(reserved)} is held against open orders and short positions.`
           : `Not enough cash. Need ${U.fmtUSD(estCost)}, available ${U.fmtUSD(free)}.`);
       }
     } else {
       const pos = pf.positions[assetId];
       const held = pos ? pos.qty : 0;
-      const free = availableQty(pf, assetId);
-      if (qty > free + QTY_EPS) {
-        throw new OrderError(free < held
-          ? `Only ${U.fmtQty(free)} ${assetId} is free — the rest is committed to open sell orders.`
-          : `You only hold ${U.fmtQty(held)} ${assetId}. Short selling is not supported.`);
+      const freeLong = availableQty(pf, assetId);
+
+      if (qty > freeLong + QTY_EPS) {
+        // The part beyond any long holding opens or increases a short.
+        const shortQty = qty - Math.max(0, freeLong);
+
+        if (held > 0 && freeLong < held) {
+          throw new OrderError(
+            `Only ${U.fmtQty(freeLong)} ${assetId} is free — the rest is committed to open sell orders.`,
+          );
+        }
+        if (!ctx.shortingEnabled) {
+          throw new OrderError(
+            `You hold ${U.fmtQty(Math.max(0, held))} ${assetId}. Turn on short selling in Settings to sell more than you own.`,
+          );
+        }
+        if (kind !== 'crypto' && !ctx.marketOpen) {
+          throw new OrderError('US equities are closed, so shorts cannot be opened right now.');
+        }
+
+        // Reg T: the new short's collateral must be covered by free cash plus
+        // the proceeds the sale itself will generate.
+        const addedExposure = shortQty * refPrice;
+        const needed = addedExposure * SHORT_INITIAL_MARGIN;
+        const willHave = availableCash(pf, ctx.prices) + addedExposure;
+        if (needed > willHave + CASH_EPS) {
+          const maxExposure = availableCash(pf, ctx.prices) / (SHORT_INITIAL_MARGIN - 1);
+          throw new OrderError(
+            `Not enough margin to short ${U.fmtQty(shortQty)} ${assetId}. `
+            + `That needs ${U.fmtUSD(needed)} of collateral; you can short up to about `
+            + `${U.fmtUSD(maxExposure)} of stock right now.`,
+          );
+        }
       }
     }
 
@@ -224,37 +321,54 @@
     const kind = order.kind;
     const qty = roundQty(order.qty, kind);
     const gross = qty * price;
+    const delta = order.side === 'buy' ? qty : -qty;
+
+    const pos = pf.positions[order.assetId] || {
+      qty: 0, avgCost: 0, realized: 0, kind, openedAt: ts,
+    };
+    const oldQty = pos.qty;
+    const newQty = roundQty(oldQty + delta, kind);
 
     let realizedDelta = 0;
+    let closedQty = 0;
 
+    if (oldQty === 0 || (oldQty > 0 === newQty > 0 && Math.abs(newQty) > Math.abs(oldQty))) {
+      /* Opening, or adding to, a position in the same direction. */
+      const denom = Math.abs(newQty);
+      pos.avgCost = denom > 0 ? (Math.abs(oldQty) * pos.avgCost + qty * price) / denom : price;
+    } else if (newQty === 0 || oldQty > 0 === newQty > 0) {
+      /* Reducing exposure. The average entry price is untouched. */
+      closedQty = Math.abs(oldQty) - Math.abs(newQty);
+      realizedDelta = oldQty > 0
+        ? (price - pos.avgCost) * closedQty      // sold a long above/below cost
+        : (pos.avgCost - price) * closedQty;     // covered a short below/above entry
+    } else {
+      /* Crossing through zero: close the old position, open the remainder. */
+      closedQty = Math.abs(oldQty);
+      realizedDelta = oldQty > 0
+        ? (price - pos.avgCost) * closedQty
+        : (pos.avgCost - price) * closedQty;
+      pos.avgCost = price;
+    }
+
+    // Cash moves the same way regardless of direction: a sale credits, a
+    // purchase debits — whether it opens, closes or reverses a position.
     if (order.side === 'buy') {
       const cost = money(gross);
-      // Guard: never let rounding push cash negative.
-      if (cost > pf.cash + 1e-6) throw new OrderError('Insufficient cash at fill time.');
-      const pos = pf.positions[order.assetId] || {
-        qty: 0, avgCost: 0, realized: 0, kind, openedAt: ts,
-      };
-      const newQty = roundQty(pos.qty + qty, kind);
-      // Weighted average cost basis.
-      pos.avgCost = newQty > 0 ? (pos.qty * pos.avgCost + qty * price) / newQty : 0;
-      pos.qty = newQty;
-      pos.kind = kind;
-      if (!pos.openedAt) pos.openedAt = ts;
-      pf.positions[order.assetId] = pos;
+      if (cost > pf.cash + CASH_EPS) throw new OrderError('Insufficient cash at fill time.');
       pf.cash = money(pf.cash - cost);
     } else {
-      const pos = pf.positions[order.assetId];
-      if (!pos || pos.qty + 1e-9 < qty) throw new OrderError('Insufficient shares at fill time.');
-      realizedDelta = (price - pos.avgCost) * qty;
-      pos.realized = round(pos.realized + realizedDelta, 6);
-      pf.realizedTotal = round((pf.realizedTotal || 0) + realizedDelta, 6);
-      pos.qty = roundQty(pos.qty - qty, kind);
       pf.cash = money(pf.cash + money(gross));
-      if (pos.qty <= 1e-9) {
-        // Fully closed: keep realised P&L on the books via the fill log, drop the row.
-        delete pf.positions[order.assetId];
-      }
     }
+
+    pos.qty = newQty;
+    pos.kind = kind;
+    if (!pos.openedAt) pos.openedAt = ts;
+    if (realizedDelta) pos.realized = round(pos.realized + realizedDelta, 6);
+    pf.realizedTotal = round((pf.realizedTotal || 0) + realizedDelta, 6);
+
+    if (Math.abs(pos.qty) <= QTY_EPS) delete pf.positions[order.assetId];
+    else pf.positions[order.assetId] = pos;
 
     const fill = {
       id: U.uid('fil'),
@@ -266,12 +380,23 @@
       qty,
       price,
       notional: money(gross),
-      realized: order.side === 'sell' ? round(realizedDelta, 2) : 0,
+      realized: round(realizedDelta, 2),
+      closed: closedQty > 0,
+      // What this fill did to the book, for an honest history label.
+      effect: oldQty === 0 ? (delta > 0 ? 'open long' : 'open short')
+        : closedQty > 0 && Math.abs(newQty) < Math.abs(oldQty) && newQty !== 0 ? (oldQty > 0 ? 'reduce long' : 'reduce short')
+          : newQty === 0 ? (oldQty > 0 ? 'close long' : 'cover short')
+            : oldQty > 0 === newQty > 0 ? (newQty > 0 ? 'add long' : 'add short')
+              : (newQty > 0 ? 'reverse to long' : 'reverse to short'),
       t: ts,
       reason: reason || order.note || null,
     };
     pf.fills.push(fill);
-    if (pf.fills.length > 5000) pf.fills.splice(0, pf.fills.length - 5000);
+    if (pf.fills.length > 5000) {
+      pf.fills.splice(0, pf.fills.length - 5000);
+      // Reconstruction from the log is no longer exact once it is trimmed.
+      pf.fillsTrimmed = true;
+    }
 
     order.status = 'filled';
     order.filledAt = ts;
@@ -374,7 +499,7 @@
    * flagged via `stale` so the UI can say so rather than silently misreport.
    */
   function valuate(pf, prices) {
-    let invested = 0, unrealized = 0, costBasis = 0, stale = 0;
+    let longValue = 0, shortValue = 0, unrealized = 0, longCost = 0, stale = 0;
     const rows = [];
 
     for (const assetId in pf.positions) {
@@ -383,24 +508,28 @@
       const price = q && isFinite(q.price) ? q.price : pos.avgCost;
       if (!q || !isFinite(q.price)) stale++;
 
-      const value = pos.qty * price;
-      const cost = pos.qty * pos.avgCost;
-      const upl = value - cost;
+      const isShort = pos.qty < 0;
+      const value = pos.qty * price;              // signed: negative for shorts
+      const cost = pos.qty * pos.avgCost;         // signed
+      const upl = value - cost;                   // (price - avgCost) * qty
+      const basis = Math.abs(cost);
 
-      invested += value;
-      costBasis += cost;
+      if (isShort) shortValue += Math.abs(value); else { longValue += value; longCost += cost; }
       unrealized += upl;
 
       rows.push({
         assetId,
         kind: pos.kind,
         qty: pos.qty,
+        side: isShort ? 'short' : 'long',
+        isShort,
         avgCost: pos.avgCost,
         price,
         value,
+        exposure: Math.abs(value),
         cost,
         unrealized: upl,
-        unrealizedPct: cost > 0 ? (upl / cost) * 100 : 0,
+        unrealizedPct: basis > 0 ? (upl / basis) * 100 : 0,
         realized: pos.realized,
         dayChangePct: q ? q.changePct : null,
         dayChange: q && isFinite(q.changePct) ? value - value / (1 + q.changePct / 100) : null,
@@ -409,19 +538,40 @@
       });
     }
 
-    rows.sort((a, b) => b.value - a.value);
+    // Largest exposure first, so a big short ranks alongside a big long.
+    rows.sort((a, b) => b.exposure - a.exposure);
+
+    const equityForWeights = pf.cash + (longValue - shortValue);
+    for (const r of rows) {
+      r.weightPct = equityForWeights > 0 ? (r.exposure / equityForWeights) * 100 : 0;
+    }
 
     const realizedTotal = pf.realizedTotal || 0;
+    const invested = longValue - shortValue;      // net market exposure
     const equity = pf.cash + invested;
+    const collateral = shortValue * SHORT_INITIAL_MARGIN;
+    const free = Math.max(0, pf.cash - committedCash(pf) - collateral);
 
     return {
       cash: pf.cash,
-      invested,
-      costBasis,
+      // What is actually deployed into positions, long side only — this is the
+      // figure the cash-vs-invested split is about.
+      invested: longValue,
+      longValue,
+      shortValue,
+      netExposure: invested,
+      costBasis: longCost,
       unrealized,
-      unrealizedPct: costBasis > 0 ? (unrealized / costBasis) * 100 : 0,
+      unrealizedPct: Math.abs(longCost) > 0 ? (unrealized / Math.abs(longCost)) * 100 : 0,
       realized: realizedTotal,
       equity,
+      // Money the user can actually deploy right now.
+      buyingPower: free,
+      reserved: pf.cash - free,
+      shortCollateral: collateral,
+      uninvested: Math.max(0, pf.cash - collateral),
+      investedPct: equity > 0 ? (longValue / equity) * 100 : 0,
+      cashPct: equity > 0 ? ((equity - longValue + shortValue) / equity) * 100 : 100,
       totalReturn: equity - pf.startingCash,
       totalReturnPct: pf.startingCash > 0 ? ((equity - pf.startingCash) / pf.startingCash) * 100 : 0,
       positions: rows,
@@ -505,13 +655,16 @@
    * round trip), which is the convention retail platforms use.
    */
   function stats(pf, val) {
+    // A closing fill is any fill that reduced exposure — selling a long or
+    // buying back a short both realise P&L.
+    const closers = pf.fills.filter((f) => (f.closed != null ? f.closed : f.side === 'sell'));
     const sells = pf.fills.filter((f) => f.side === 'sell');
-    const wins = sells.filter((f) => f.realized > 0).length;
-    const losses = sells.filter((f) => f.realized < 0).length;
+    const wins = closers.filter((f) => f.realized > 0).length;
+    const losses = closers.filter((f) => f.realized < 0).length;
     const decided = wins + losses;
 
-    const grossWin = sells.reduce((s, f) => s + Math.max(0, f.realized), 0);
-    const grossLoss = sells.reduce((s, f) => s + Math.max(0, -f.realized), 0);
+    const grossWin = closers.reduce((s, f) => s + Math.max(0, f.realized), 0);
+    const grossLoss = closers.reduce((s, f) => s + Math.max(0, -f.realized), 0);
 
     // Max drawdown across the recorded equity curve.
     let peak = -Infinity, maxDD = 0;
@@ -542,6 +695,7 @@
       trades: pf.fills.length,
       buys: pf.fills.length - sells.length,
       sells: sells.length,
+      closed: closers.length,
       wins,
       losses,
       winRate: decided > 0 ? (wins / decided) * 100 : null,
@@ -552,6 +706,117 @@
       sharpe,
       openOrders: pf.orders.length,
       positions: val ? val.positions.length : Object.keys(pf.positions).length,
+    };
+  }
+
+  /* ------------------------------------------------------- reconciliation */
+
+  const finite = (v) => typeof v === 'number' && isFinite(v);
+
+  /**
+   * Rebuild cash, positions and realised P&L from the fill log alone.
+   *
+   * The fill log is the account's source of truth: every row records side,
+   * quantity, price and notional. As long as it has not been trimmed, the whole
+   * book can be derived from it exactly.
+   */
+  function reconstruct(pf) {
+    let cash = pf.startingCash;
+    let realized = 0;
+    const positions = {};
+
+    for (const f of pf.fills) {
+      if (!finite(f.qty) || !finite(f.price)) continue;
+      const notional = finite(f.notional) ? f.notional : f.qty * f.price;
+      const kind = f.kind || PT.assetKind(f.assetId);
+      const pos = positions[f.assetId] || { qty: 0, avgCost: 0, realized: 0, kind, openedAt: f.t };
+
+      const delta = f.side === 'buy' ? f.qty : -f.qty;
+      const oldQty = pos.qty;
+      const newQty = roundQty(oldQty + delta, kind);
+      cash += f.side === 'buy' ? -notional : notional;
+
+      if (oldQty === 0 || (oldQty > 0 === newQty > 0 && Math.abs(newQty) > Math.abs(oldQty))) {
+        const denom = Math.abs(newQty);
+        pos.avgCost = denom > 0 ? (Math.abs(oldQty) * pos.avgCost + f.qty * f.price) / denom : f.price;
+      } else if (newQty === 0 || oldQty > 0 === newQty > 0) {
+        const closed = Math.abs(oldQty) - Math.abs(newQty);
+        const gain = oldQty > 0 ? (f.price - pos.avgCost) * closed : (pos.avgCost - f.price) * closed;
+        pos.realized = round(pos.realized + gain, 6);
+        realized += gain;
+      } else {
+        const closed = Math.abs(oldQty);
+        const gain = oldQty > 0 ? (f.price - pos.avgCost) * closed : (pos.avgCost - f.price) * closed;
+        pos.realized = round(pos.realized + gain, 6);
+        realized += gain;
+        pos.avgCost = f.price;
+      }
+      pos.qty = newQty;
+      positions[f.assetId] = pos;
+    }
+
+    for (const id in positions) if (Math.abs(positions[id].qty) <= 1e-9) delete positions[id];
+    return { cash: money(cash), positions, realizedTotal: round(realized, 6) };
+  }
+
+  /**
+   * Detect and repair a corrupted book.
+   *
+   * `round()` returns 0 for anything non-finite, so a single bad value — a
+   * partial write, an interrupted save — silently zeroes the balance and every
+   * subsequent order is rejected for insufficient funds. Rather than leave the
+   * account bricked, rebuild it from the fill log.
+   */
+  function audit(pf) {
+    const problems = [];
+    if (!finite(pf.cash)) problems.push(`cash was ${JSON.stringify(pf.cash)}`);
+    else if (pf.cash < -0.005) problems.push(`cash was negative (${pf.cash})`);
+    if (!finite(pf.startingCash) || pf.startingCash <= 0) problems.push('starting balance was invalid');
+    for (const id in pf.positions) {
+      const p = pf.positions[id];
+      if (!p || !finite(p.qty) || p.qty === 0) problems.push(`${id} had an invalid quantity`);
+      else if (!finite(p.avgCost) || p.avgCost <= 0) problems.push(`${id} had an invalid cost basis`);
+    }
+    if (!finite(pf.realizedTotal)) problems.push('realised P&L was invalid');
+    return problems;
+  }
+
+  /**
+   * Repair in place. Returns a report describing what changed, or null when the
+   * book was already sound.
+   */
+  function repair(pf, { force = false } = {}) {
+    const problems = audit(pf);
+    if (!problems.length && !force) return null;
+
+    const before = { cash: pf.cash, positions: Object.keys(pf.positions).length };
+
+    if (!finite(pf.startingCash) || pf.startingCash <= 0) pf.startingCash = 10000;
+
+    if (pf.fillsTrimmed) {
+      /*
+       * History is incomplete, so the log cannot reproduce the book exactly.
+       * Do the least-destructive thing: make every field valid and leave the
+       * rest alone.
+       */
+      if (!finite(pf.cash) || pf.cash < 0) pf.cash = 0;
+      for (const id in pf.positions) {
+        const p = pf.positions[id];
+        if (!p || !finite(p.qty) || p.qty === 0 || !finite(p.avgCost) || p.avgCost <= 0) delete pf.positions[id];
+      }
+      if (!finite(pf.realizedTotal)) {
+        pf.realizedTotal = pf.fills.reduce((s, f) => s + (finite(f.realized) ? f.realized : 0), 0);
+      }
+      return { problems, method: 'clamped', exact: false, before, after: { cash: pf.cash, positions: Object.keys(pf.positions).length } };
+    }
+
+    const rebuilt = reconstruct(pf);
+    pf.cash = rebuilt.cash;
+    pf.positions = rebuilt.positions;
+    pf.realizedTotal = rebuilt.realizedTotal;
+    return {
+      problems, method: 'rebuilt', exact: true, before,
+      after: { cash: pf.cash, positions: Object.keys(pf.positions).length },
     };
   }
 
@@ -586,6 +851,13 @@
         // Books written before the running total existed: seed it from history.
         if (typeof pf.realizedTotal !== 'number') {
           pf.realizedTotal = pf.fills.reduce((s, f) => s + (f.realized || 0), 0);
+        }
+        // Never load a bricked account: rebuild it from the fill log instead.
+        const fixed = repair(pf);
+        if (fixed) {
+          parsed.repairs = parsed.repairs || [];
+          parsed.repairs.push({ portfolio: id, ...fixed });
+          console.warn(`[PT] repaired ${id} portfolio:`, fixed.problems.join('; '));
         }
       }
       parsed.watchlist = parsed.watchlist || PT.defaultWatchlist.slice();
@@ -626,7 +898,7 @@
       for (const id of ['user', 'ai']) {
         const pf = state.portfolios[id];
         pf.equity = pruneEquity(pf.equity, now).filter((s) => now - s.t < 30 * 86400e3);
-        if (pf.fills.length > 1000) pf.fills = pf.fills.slice(-1000);
+        if (pf.fills.length > 1000) { pf.fills = pf.fills.slice(-1000); pf.fillsTrimmed = true; }
       }
       if (state.aiLog.length > 200) state.aiLog = state.aiLog.slice(-200);
       try {
@@ -646,7 +918,10 @@
     SCHEMA_VERSION, STORAGE_KEY, SLIPPAGE_BPS, MIN_NOTIONAL, OrderError,
     newState, newPortfolio, submitOrder, buildOrder, applyFill, processOpenOrders,
     cancelOrder, crosses, effectivePrice, valuate, dayPnl, stats,
+    audit, repair, reconstruct,
     availableCash, availableQty, committedCash, committedQty, CASH_EPS,
+    shortExposure, shortCollateral, marginStatus,
+    SHORT_INITIAL_MARGIN, SHORT_MAINTENANCE_RATIO, SHORT_FORCE_RATIO,
     sampleEquity, pruneEquity, load, save, clear,
   };
 })(window.PT);

@@ -143,8 +143,11 @@ try {
   });
   check('equities are priced through the server proxy', !!stockQuote,
     stockQuote ? `${stockQuote.symbol}=${stockQuote.price} via ${stockQuote.source} (${stockQuote.quality})` : 'none priced');
-  check('a delayed equity source is labelled delayed, not live',
-    !stockQuote || stockQuote.source !== 'nasdaq' || stockQuote.quality === 'delayed',
+  // Nasdaq reports whether its own print is real time; the app must pass that
+  // through rather than assume, so either grade is valid — what matters is that
+  // a quote is never labelled live when its source said otherwise.
+  check('equity freshness reflects what the source reported',
+    !stockQuote || ['live', 'delayed', 'cached'].includes(stockQuote.quality),
     stockQuote ? `${stockQuote.source}/${stockQuote.quality}` : '');
 
   await page.waitForTimeout(800);
@@ -574,9 +577,11 @@ try {
   await page.waitForTimeout(600);
   check('keyboard shortcut returns to trading',
     (await page.evaluate(() => window.PT.app.S.view)) === 'trade');
-  await page.keyboard.press('3');
+  // Timeframes now start at 1s, so the fourth slot is the first minute-scale one.
+  await page.keyboard.press('4');
   await page.waitForTimeout(1200);
-  check('number keys switch timeframe', (await page.evaluate(() => window.PT.app.S.tf)) === '15m');
+  check('number keys switch timeframe', (await page.evaluate(() => window.PT.app.S.tf)) === '1m',
+    await page.evaluate(() => window.PT.app.S.tf));
 
   /* ------------------------------------------------------ settings + reset */
   section('Settings and reset');

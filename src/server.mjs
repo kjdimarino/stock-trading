@@ -13,7 +13,8 @@
 import http from 'node:http';
 import { STOCKS, ETFS, CRYPTO, ASSETS, BY_ID } from './universe.mjs';
 import {
-  stockQuotes, cryptoQuotes, fetchCandles, searchSymbols, cryptoMarkets, providerHealth,
+  stockQuotes, cryptoQuotes, fetchCandles, searchSymbols, cryptoMarkets, cryptoProducts,
+  stockDirectory, tradeIdeas, providerHealth,
 } from './providers.mjs';
 import { postJSON } from './http.mjs';
 
@@ -92,7 +93,8 @@ export function createServer(getHTML) {
         const tf = qs.get('tf') || '5m';
         if (!asset) return sendJSON(res, 400, { error: 'asset is required' });
         try {
-          return sendJSON(res, 200, await fetchCandles(asset, tf));
+          const hint = { kind: qs.get('kind'), yh: qs.get('yh') };
+          return sendJSON(res, 200, await fetchCandles(asset, tf, hint));
         } catch (e) {
           return sendJSON(res, 502, { error: e.message, asset, tf });
         }
@@ -103,12 +105,40 @@ export function createServer(getHTML) {
         return sendJSON(res, 200, await searchSymbols(qs.get('q')));
       }
 
+      /* ---------------------------------------------- crypto product list */
+      if (p === '/api/crypto/products') {
+        try {
+          return sendJSON(res, 200, await cryptoProducts());
+        } catch (e) {
+          return sendJSON(res, 502, { error: e.message });
+        }
+      }
+
       /* -------------------------------------------------------- markets */
       if (p === '/api/markets') {
         const ids = splitList(qs.get('ids'));
         const list = ids.length ? ids : CRYPTO.map((c) => c.cg);
         try {
           return sendJSON(res, 200, await cryptoMarkets(list));
+        } catch (e) {
+          return sendJSON(res, 502, { error: e.message });
+        }
+      }
+
+      /* ---------------------------------------------------------- ideas */
+      if (p === '/api/ideas') {
+        try {
+          return sendJSON(res, 200, await tradeIdeas());
+        } catch (e) {
+          return sendJSON(res, 502, { error: e.message });
+        }
+      }
+
+      /* ------------------------------------------------------ directory */
+      if (p === '/api/directory') {
+        try {
+          const d = await stockDirectory();
+          return sendJSON(res, 200, { count: d.rows.length, source: d.source });
         } catch (e) {
           return sendJSON(res, 502, { error: e.message });
         }
@@ -192,6 +222,13 @@ export function start(getHTML, { port = PORT, host = HOST } = {}) {
       }
       reject(e);
     });
+    /*
+     * Warm the symbol directory in the background. It is ~7,000 rows and takes
+     * a couple of seconds cold; doing it now means the user's first search is
+     * instant instead of appearing to find nothing.
+     */
+    stockDirectory().catch(() => { /* search falls back to other sources */ });
+
     server.listen(port, host, () => {
       const url = `http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`;
       console.log(`

@@ -56,6 +56,7 @@
       prices: prices(),
       marketOpen: marketOpenFor(assetId),
       slippageEnabled: S.st.settings.slippageEnabled,
+      shortingEnabled: S.st.settings.shortingEnabled !== false,
       now: Date.now(),
     };
   }
@@ -91,6 +92,7 @@
 
   const NAV = [
     { id: 'trade', icon: 'trade', label: 'Trade' },
+    { id: 'ideas', icon: 'trending', label: 'Ideas' },
     { id: 'portfolio', icon: 'portfolio', label: 'Portfolio' },
     { id: 'ai', icon: 'ai', label: 'AI companion' },
     { id: 'compare', icon: 'compare', label: 'You vs AI' },
@@ -209,6 +211,8 @@
       V.renderAIView();
     } else if (view === 'compare') {
       V.renderCompareView();
+    } else if (view === 'ideas') {
+      V.renderIdeasView();
     }
     V.renderAll();
   }
@@ -229,24 +233,29 @@
   function wireOmnibox() {
     let cursor = -1;
     let results = [];
+    let searching = false;
 
     const close = () => { R.omniResults.classList.add('hidden'); cursor = -1; };
 
     const render = () => {
       R.omniResults.innerHTML = '';
       if (!results.length) {
-        R.omniResults.appendChild(el('div', { class: 'omni__hint', text: 'No matches.' }));
+        // "No matches" would be a claim we cannot make while a lookup is still
+        // running — the first search also warms a 7,000-symbol directory.
+        R.omniResults.appendChild(el('div', { class: 'omni__hint', text: searching ? 'Searching…' : 'No matches.' }));
         R.omniResults.classList.remove('hidden');
         return;
       }
       results.forEach((r, i) => {
-        const tradable = !!PT.byId[r.symbol];
+        // Tradable means the providers can price it, not that it was on a list.
+        const tradable = r.tradable !== false;
         const item = el('div', {
           class: 'omni__item' + (i === cursor ? ' is-cursor' : '') + (tradable ? '' : ' is-disabled'),
-          title: tradable ? '' : 'Not in this app’s tradable universe',
+          title: tradable ? '' : 'No price source for this symbol',
         }, [
           el('span', { class: 'omni__sym', text: r.symbol }),
           el('span', { class: 'omni__name', text: r.name }),
+          r.exchange ? el('span', { class: 'dimmer', style: 'font-size:10px', text: r.exchange }) : null,
           el('span', { class: 'badge ' + (r.kind === 'crypto' ? 'badge--sim' : 'badge--closed'), text: r.kind === 'crypto' ? 'Crypto' : r.kind === 'etf' ? 'ETF' : 'Stock' }),
         ]);
         if (tradable) {
@@ -254,8 +263,7 @@
             e.preventDefault();
             R.omniInput.value = '';
             close();
-            addToWatchlist(r.symbol);
-            setFocus(r.symbol);
+            adopt(r);
           });
         }
         R.omniResults.appendChild(item);
@@ -265,13 +273,18 @@
 
     const run = U.debounce(async (q) => {
       if (!q.trim()) return close();
+      searching = true;
+      render();
       const j = await PT.feed.search(q);
+      // A slower earlier query must not overwrite a newer one.
+      if (R.omniInput.value.trim() !== q.trim()) return;
+      searching = false;
       results = j.results || [];
-      cursor = results.findIndex((r) => PT.byId[r.symbol]);
+      cursor = results.findIndex((r) => r.tradable !== false);
       render();
     }, 180);
 
-    R.omniInput.addEventListener('input', () => run(R.omniInput.value));
+    R.omniInput.addEventListener('input', () => { results = []; run(R.omniInput.value); });
     R.omniInput.addEventListener('focus', () => { if (results.length && R.omniInput.value) render(); });
     R.omniInput.addEventListener('blur', () => setTimeout(close, 120));
     R.omniInput.addEventListener('keydown', (e) => {
@@ -282,17 +295,16 @@
         const dir = e.key === 'ArrowDown' ? 1 : -1;
         for (let i = 0; i < results.length; i++) {
           cursor = (cursor + dir + results.length) % results.length;
-          if (PT.byId[results[cursor].symbol]) break;
+          if (results[cursor].tradable !== false) break;
         }
         render();
       } else if (e.key === 'Enter' && results[cursor]) {
-        const sym = results[cursor].symbol;
-        if (!PT.byId[sym]) return;
+        const r = results[cursor];
+        if (r.tradable === false) return;
         R.omniInput.value = '';
         R.omniInput.blur();
         close();
-        addToWatchlist(sym);
-        setFocus(sym);
+        adopt(r);
       }
     });
   }
@@ -319,6 +331,30 @@
     R.watchlist.appendChild(el('div', { class: 'panel__foot' }, addBtn));
 
     renderWatchlist();
+  }
+
+  /**
+   * Take a search result into the app: register it so every other module can
+   * price, chart and trade it, then remember it so it survives a reload.
+   */
+  function adopt(result) {
+    const asset = PT.registerAsset({
+      id: result.symbol,
+      name: result.name,
+      kind: result.kind,
+      exchange: result.exchange,
+      yh: result.yh,
+    });
+    if (!asset) return;
+    if (asset.discovered) {
+      S.st.discovered = S.st.discovered || {};
+      S.st.discovered[asset.id] = {
+        id: asset.id, name: asset.name, kind: asset.kind, exchange: asset.exchange, yh: asset.yh,
+      };
+    }
+    addToWatchlist(asset.id);
+    setFocus(asset.id);
+    save();
   }
 
   function addToWatchlist(assetId) {

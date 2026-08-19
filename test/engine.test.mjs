@@ -28,9 +28,9 @@ describe('order validation', () => {
     throws(() => E.submitOrder(fresh(100), { assetId: 'AAPL', side: 'buy', type: 'market', qty: 5 },
       ctx(px({ AAPL: 100 }))), 'Not enough cash');
   });
-  it('rejects selling more than held (no shorting)', () => {
+  it('rejects selling more than held when shorting is off', () => {
     throws(() => E.submitOrder(fresh(), { assetId: 'AAPL', side: 'sell', type: 'market', qty: 1 },
-      ctx(px({ AAPL: 100 }))), 'Short selling is not supported');
+      ctx(px({ AAPL: 100 }))), 'Turn on short selling');
   });
   it('rejects stock orders while the market is closed', () => {
     throws(() => E.submitOrder(fresh(), { assetId: 'AAPL', side: 'buy', type: 'market', qty: 1 },
@@ -220,7 +220,7 @@ describe('limit orders', () => {
     // The resting order has claimed $900, so a $990 market buy must be refused
     // up front rather than silently killing the resting order later.
     throws(() => E.submitOrder(pf, { assetId: 'TSLA', side: 'buy', type: 'market', notional: 990 }, ctx(px({ TSLA: 200 }))),
-      'committed to open limit orders');
+      'held against open orders');
     ok(pf.orders.length === 1, 'the resting order survives');
   });
 
@@ -438,6 +438,197 @@ describe('review regressions', () => {
     eq(E.save(st), false);
     localStorage.setItem = real;
     eq(st.portfolios.user.fills.length, before, 'history is untouched by a non-quota failure');
+  });
+});
+
+
+describe('short selling', () => {
+  const sctx = (prices, o = {}) => ({
+    prices, marketOpen: true, slippageEnabled: false, shortingEnabled: true,
+    now: o.now ?? 1_000_000,
+  });
+
+  it('selling with no position opens a short', () => {
+    const pf = fresh(10000);
+    const r = E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 50 }, sctx(px({ AAPL: 100 })));
+    eq(r.fill.effect, 'open short');
+    near(pf.positions.AAPL.qty, -50, 1e-9);
+    near(pf.positions.AAPL.avgCost, 100, 1e-9);
+    near(pf.cash, 15000, 1e-6, 'proceeds are credited');
+    near(E.valuate(pf, px({ AAPL: 100 })).equity, 10000, 1e-6, 'equity is unchanged at entry');
+  });
+
+  it('a short gains when the price falls', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 50 }, sctx(px({ AAPL: 100 })));
+    const v = E.valuate(pf, px({ AAPL: 80 }));
+    near(v.unrealized, 1000, 1e-6);
+    near(v.equity, 11000, 1e-6);
+    eq(v.positions[0].isShort, true);
+  });
+
+  it('a short loses when the price rises', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 50 }, sctx(px({ AAPL: 100 })));
+    near(E.valuate(pf, px({ AAPL: 130 })).unrealized, -1500, 1e-6);
+  });
+
+  it('covering realises the gain and closes the position', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 50 }, sctx(px({ AAPL: 100 })));
+    const r = E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 50 }, sctx(px({ AAPL: 80 })));
+    eq(r.fill.effect, 'cover short');
+    near(r.fill.realized, 1000, 1e-6);
+    eq(pf.positions.AAPL, undefined);
+    near(pf.cash, 11000, 1e-6);
+    near(E.valuate(pf, px({})).realized, 1000, 1e-6);
+  });
+
+  it('partially covering leaves the entry price alone', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 50 }, sctx(px({ AAPL: 100 })));
+    const r = E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 20 }, sctx(px({ AAPL: 90 })));
+    near(r.fill.realized, 200, 1e-6);
+    near(pf.positions.AAPL.qty, -30, 1e-9);
+    near(pf.positions.AAPL.avgCost, 100, 1e-9);
+  });
+
+  it('selling through a long flips it to a short', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 }, sctx(px({ AAPL: 100 })));
+    const r = E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 30 }, sctx(px({ AAPL: 120 })));
+    eq(r.fill.effect, 'reverse to short');
+    near(r.fill.realized, 200, 1e-6, 'the long leg is realised');
+    near(pf.positions.AAPL.qty, -20, 1e-9);
+    near(pf.positions.AAPL.avgCost, 120, 1e-9, 'the short opens at the fill price');
+  });
+
+  it('holds 150% collateral against a short', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 50 }, sctx(px({ AAPL: 100 })));
+    const prices = px({ AAPL: 100 });
+    near(E.shortExposure(pf, prices), 5000, 1e-6);
+    near(E.shortCollateral(pf, prices), 7500, 1e-6);
+    near(E.availableCash(pf, prices), 7500, 1e-6, 'proceeds cannot be spent twice');
+  });
+
+  it('caps leverage at roughly 2x, the Reg T limit', () => {
+    const pf = fresh(10000);
+    throws(() => E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 250 }, sctx(px({ AAPL: 100 }))),
+      'Not enough margin');
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 190 }, sctx(px({ AAPL: 100 })));
+    near(pf.positions.AAPL.qty, -190, 1e-9);
+  });
+
+  it('refuses to short when the setting is off', () => {
+    throws(() => E.submitOrder(fresh(10000), { assetId: 'AAPL', side: 'sell', type: 'market', qty: 1 },
+      { ...sctx(px({ AAPL: 100 })), shortingEnabled: false }), 'Turn on short selling');
+  });
+
+  it('escalates from healthy to margin call to forced buy-in', () => {
+    // 100 shares shorted at 100 with 10,000 of own cash: equity 10,000 against
+    // 10,000 of exposure. A call lands when equity drops under 30% of the short.
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 100 }, sctx(px({ AAPL: 100 })));
+    eq(E.marginStatus(pf, px({ AAPL: 100 })).level, 'ok');
+    eq(E.marginStatus(pf, px({ AAPL: 130 })).level, 'ok', 'a 30% move is survivable');
+    eq(E.marginStatus(pf, px({ AAPL: 156 })).level, 'call');
+    eq(E.marginStatus(pf, px({ AAPL: 165 })).level, 'liquidate');
+  });
+
+  it('a freshly opened maximum short is not instantly liquidated', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 190 }, sctx(px({ AAPL: 100 })));
+    eq(E.marginStatus(pf, px({ AAPL: 100 })).level, 'ok');
+  });
+
+  it('counts a covered short as a closed winning trade', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 50 }, sctx(px({ AAPL: 100 })));
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 50 }, sctx(px({ AAPL: 80 })));
+    const st = E.stats(pf, E.valuate(pf, px({})));
+    eq(st.wins, 1);
+    eq(st.winRate, 100);
+  });
+
+  it('reconstruction reproduces a short book exactly', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 50 }, sctx(px({ AAPL: 100 })));
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 20 }, sctx(px({ AAPL: 90 })));
+    E.submitOrder(pf, { assetId: 'TSLA', side: 'buy', type: 'market', qty: 5 }, sctx(px({ TSLA: 200 })));
+    const rebuilt = E.reconstruct(pf);
+    near(rebuilt.cash, pf.cash, 0.01);
+    near(rebuilt.positions.AAPL.qty, pf.positions.AAPL.qty, 1e-9);
+    near(rebuilt.positions.AAPL.avgCost, pf.positions.AAPL.avgCost, 1e-9);
+    near(rebuilt.realizedTotal, pf.realizedTotal, 0.01);
+  });
+
+  it('never lets cash go negative across a randomised long/short run', () => {
+    const pf = fresh(50000);
+    let seed = 7;
+    const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+    const syms = ['AAPL', 'TSLA', 'BTC'];
+    for (let i = 0; i < 400; i++) {
+      const id = syms[Math.floor(rnd() * syms.length)];
+      const base = { AAPL: 180, TSLA: 340, BTC: 64000 }[id];
+      const prices = px({ [id]: base * (0.85 + rnd() * 0.3) });
+      try {
+        E.submitOrder(pf, {
+          assetId: id, side: rnd() < 0.5 ? 'buy' : 'sell', type: 'market',
+          notional: 100 + rnd() * 3000,
+        }, sctx(prices));
+      } catch { /* rejections are expected */ }
+      ok(pf.cash >= 0, `cash negative at ${i}: ${pf.cash}`);
+      for (const s of syms) {
+        const p = pf.positions[s];
+        if (p) ok(isFinite(p.qty) && p.qty !== 0 && isFinite(p.avgCost) && p.avgCost > 0, `${s} corrupt at ${i}`);
+      }
+    }
+    // Cash must still reconcile against the fill log.
+    const rebuilt = E.reconstruct(pf);
+    near(pf.cash, rebuilt.cash, 0.05, 'cash matches the fill log after 400 mixed trades');
+  });
+});
+
+describe('account repair', () => {
+  it('rebuilds a book whose cash was corrupted', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 }, ctx(px({ AAPL: 100 })));
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 10 }, ctx(px({ AAPL: 120 })));
+    pf.cash = null;                       // a partial write
+    const report = E.repair(pf);
+    ok(report, 'a repair happened');
+    eq(report.exact, true);
+    near(pf.cash, 10200, 1e-6);
+  });
+
+  it('does nothing to a healthy book', () => eq(E.repair(fresh(10000)), null));
+
+  it('a zeroed balance does not stay zero', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 }, ctx(px({ AAPL: 100 })));
+    pf.cash = NaN;
+    E.repair(pf);
+    near(pf.cash, 9000, 1e-6, 'restored from the trade history');
+    ok(E.availableCash(pf, px({ AAPL: 100 })) > 0, 'and it can trade again');
+  });
+
+  it('clamps rather than guessing when history is incomplete', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 }, ctx(px({ AAPL: 100 })));
+    pf.fillsTrimmed = true;
+    pf.cash = null;
+    const report = E.repair(pf);
+    eq(report.exact, false, 'does not claim an exact rebuild');
+    ok(isFinite(pf.cash) && pf.cash >= 0);
+  });
+
+  it('drops positions that cannot be valued', () => {
+    const pf = fresh(10000);
+    pf.positions.AAPL = { qty: NaN, avgCost: 10, realized: 0, kind: 'stock' };
+    pf.fillsTrimmed = true;
+    E.repair(pf);
+    eq(pf.positions.AAPL, undefined);
   });
 });
 

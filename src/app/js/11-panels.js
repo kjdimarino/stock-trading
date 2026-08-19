@@ -194,7 +194,7 @@
       el('div', { style: 'flex:1' }),
       el('span', { class: 'dimmer', style: 'font-size:10px' },
         S.st.settings.aiTraderEnabled
-          ? `runs every ${Math.round(S.st.settings.aiIntervalMs / 1000)}s`
+          ? `runs every ${Math.round((S.st.settings.aiIntervalMs || 5000) / 1000)}s`
           : 'paused'),
     ]));
     const logHost = el('div', { style: 'padding:12px' });
@@ -232,6 +232,7 @@
             class: 'num ' + U.dirClass(d.realized), style: 'font-size:11px',
             text: U.fmtSigned(d.realized),
           }) : null,
+          d.repeats > 1 ? el('span', { class: 'factor', text: `×${d.repeats}` }) : null,
           el('div', { class: 'logitem__spacer' }),
           el('span', { class: 'logitem__time', text: U.fmtDateTime(d.t) }),
         ]),
@@ -506,6 +507,91 @@
   /** Weekly bars are too coarse for the indicator set; fall back to daily. */
   const companionTf = () => (S.tf === '1W' ? '1D' : S.tf);
 
+  /* ================================ ideas ================================ */
+
+  /**
+   * Ready-made lists of things to look at, computed from live market data.
+   * Every list shows the screen it applied, so "top gainer" is never a bare
+   * claim — the reader can see whether penny-stock noise was filtered out.
+   */
+  async function renderIdeasView() {
+    const host = R.chartpane;
+    if (S.chart) { S.chart.destroy(); S.chart = null; S.bars = null; }
+    host.innerHTML = '';
+
+    const view = el('div', { class: 'ideas' });
+    view.appendChild(el('div', { class: 'panel__head' }, [
+      el('div', { class: 'panel__title', text: 'Ideas' }),
+      el('div', { style: 'flex:1' }),
+      el('span', { class: 'dimmer', style: 'font-size:10px' },
+        'live screens across every US-listed stock and Coinbase coin'),
+    ]));
+    const body = el('div', { class: 'ideas__body scroll' });
+    view.appendChild(body);
+    host.appendChild(view);
+
+    body.appendChild(el('div', { class: 'chart-msg', style: 'position:static;padding:40px' },
+      [el('div', { class: 'spinner' }), 'Screening the market…']));
+
+    let data;
+    try {
+      const res = await fetch('/api/ideas');
+      data = await res.json();
+      if (data.error) throw new Error(data.error);
+    } catch (e) {
+      body.innerHTML = '';
+      body.appendChild(UI.emptyState('alert', 'Could not load ideas', e.message));
+      return;
+    }
+    if (S.view !== 'ideas') return;   // the user moved on while this loaded
+
+    body.innerHTML = '';
+    body.appendChild(el('div', { class: 'disclaimer', style: 'margin:12px' }, [
+      el('b', {}, 'These are screens, not recommendations. '),
+      'They rank what the market is doing right now — a big riser is not a good buy, '
+      + 'and the sharpest movers are usually the riskiest things on the list.',
+    ]));
+
+    for (const list of data.lists) {
+      if (!list.items || !list.items.length) continue;
+      const section = el('div', { class: 'ideas__group' });
+      section.appendChild(el('div', { class: 'ideas__head' }, [
+        el('div', { class: 'ideas__title', text: list.title }),
+        el('div', { class: 'ideas__note', text: list.note }),
+      ]));
+
+      const grid = el('div', { class: 'ideas__grid' });
+      for (const item of list.items) {
+        const card = el('button', { class: 'idea' }, [
+          el('div', { class: 'idea__top' }, [
+            el('span', { class: 'idea__sym', text: item.symbol }),
+            el('span', {
+              class: 'idea__chg num ' + U.dirClass(item.changePct),
+              text: UI.changeText(item.changePct),
+            }),
+          ]),
+          el('div', { class: 'idea__name truncate', text: item.name || item.symbol }),
+          el('div', { class: 'idea__meta' }, [
+            el('span', { class: 'num', text: U.fmtUSD(item.price) }),
+            item.marketCap ? el('span', { class: 'dimmer', text: U.fmtCompact(item.marketCap) + ' cap' }) : null,
+            item.volume && !item.marketCap ? el('span', { class: 'dimmer', text: U.fmtCompact(item.volume) + ' vol' }) : null,
+          ]),
+        ]);
+        card.addEventListener('click', () => {
+          PT.registerAsset({ id: item.symbol, name: item.name, kind: item.kind });
+          S.st.discovered = S.st.discovered || {};
+          S.st.discovered[item.symbol] = { id: item.symbol, name: item.name, kind: item.kind };
+          A.addToWatchlist(item.symbol);
+          A.setFocus(item.symbol);
+          A.save();
+        });
+        grid.appendChild(card);
+      }
+      section.appendChild(grid);
+      body.appendChild(section);
+    }
+  }
+
   /* =============================== settings ============================== */
 
   function openSettings() {
@@ -514,6 +600,14 @@
     const slip = el('input', { type: 'checkbox' });
     slip.checked = !!S.st.settings.slippageEnabled;
     slip.addEventListener('change', () => { S.st.settings.slippageEnabled = slip.checked; A.save(); });
+
+    const shorts = el('input', { type: 'checkbox' });
+    shorts.checked = S.st.settings.shortingEnabled !== false;
+    shorts.addEventListener('change', () => {
+      S.st.settings.shortingEnabled = shorts.checked;
+      A.save();
+      V.buildOrderPane();
+    });
 
     const aiOn = el('input', { type: 'checkbox' });
     aiOn.checked = !!S.st.settings.aiTraderEnabled;
@@ -541,6 +635,13 @@
 
     body.append(
       toggleRow('Simulate spread and slippage', 'Market orders fill a few basis points into the spread, the way a real fill does. Turning this off makes fills perfectly clean, which flatters your results.', slip),
+      el('div', { class: 'dim', style: 'font-size:11px;line-height:1.5' },
+        'If your balance ever looks wrong or your cash seems stuck, "Repair account" '
+        + 'rebuilds it exactly from your trade history without losing anything.'),
+      toggleRow('Allow short selling',
+        'Sell more than you own to bet on a fall. Shorts are collateralised at 150% of their value, '
+        + 'so proceeds cannot be spent twice, and a position that moves far enough against you is bought back automatically.',
+        shorts),
       toggleRow('Run the autonomous AI trader', 'The AI portfolio trades its own money on a schedule while the app is open. Turning it off freezes its book where it stands.', aiOn),
       el('div', { class: 'field' }, [el('div', { class: 'field__label' }, 'Direction colours'), scheme]),
       el('div', { class: 'disclaimer' }, [
@@ -549,6 +650,28 @@
       ]),
     );
 
+    const fix = el('button', { class: 'btn', text: 'Repair account' });
+    fix.addEventListener('click', () => {
+      const reports = [];
+      for (const id of ['user', 'ai']) {
+        const r = E.repair(S.st.portfolios[id], { force: true });
+        if (r) reports.push({ id, r });
+      }
+      A.save();
+      UI.closeModal();
+      V.renderAll();
+      const changed = reports.filter((x) => x.r.before.cash !== x.r.after.cash
+        || x.r.before.positions !== x.r.after.positions);
+      UI.toast({
+        kind: changed.length ? 'warn' : 'info',
+        title: changed.length ? 'Account repaired' : 'Account is already consistent',
+        message: changed.length
+          ? changed.map((x) => `${x.id}: balance ${U.fmtUSD(x.r.before.cash)} → ${U.fmtUSD(x.r.after.cash)}`).join('; ')
+          : 'Cash and positions match your trade history exactly.',
+        timeout: 10000,
+      });
+    });
+
     const reset = el('button', { class: 'btn btn--danger', text: 'Reset portfolio…' });
     reset.addEventListener('click', () => { UI.closeModal(); confirmReset(); });
 
@@ -556,7 +679,7 @@
       title: 'Settings',
       width: 520,
       body,
-      actions: [reset, el('button', { class: 'btn btn--primary', text: 'Done', onclick: UI.closeModal })],
+      actions: [fix, reset, el('button', { class: 'btn btn--primary', text: 'Done', onclick: UI.closeModal })],
     });
   }
 
@@ -707,7 +830,7 @@
   }
 
   PT.views = Object.assign(PT.views || {}, {
-    renderPortfolioView, renderCompareView, renderAIView, renderTradeLog,
+    renderPortfolioView, renderCompareView, renderAIView, renderTradeLog, renderIdeasView,
     openSettings, showOnboarding, applyDirectionScheme, renderPositionsInto,
     askCompanion: ask,
   });

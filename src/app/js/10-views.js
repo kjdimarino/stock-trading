@@ -12,7 +12,7 @@
   const A = PT.app;
   const { S, R } = A;
 
-  const TIMEFRAMES = ['1m', '5m', '15m', '1h', '1D', '1W'];
+  const TIMEFRAMES = ['1s', '5s', '15s', '1m', '5m', '15m', '1h', '1D', '1W'];
 
   /* ============================== chart pane ============================= */
 
@@ -172,6 +172,14 @@
       R.blotterTabs[id] = { tab, count };
       head.appendChild(tab);
     }
+    /*
+     * Money summary. "How much have I actually put in, and how much is left"
+     * should never require opening another view.
+     */
+    R.moneyBar = el('div', { class: 'moneybar' });
+    head.appendChild(el('div', { style: 'flex:1' }));
+    head.appendChild(R.moneyBar);
+
     R.blotter.appendChild(head);
     R.blotterBody = el('div', { class: 'blotter__body scroll' });
     R.blotter.appendChild(R.blotterBody);
@@ -201,6 +209,8 @@
       R.blotterTabs.history.count.textContent = String(pf.fills.length);
     }
 
+    renderMoneyBar(val);
+
     const sig = blotterSignature(pf, val);
     if (sig === R.blotterSig && R.blotterBody.firstChild) {
       if (S.blotterTab === 'positions') updatePositionValues(val);
@@ -215,13 +225,39 @@
     else renderHistory(R.blotterBody, pf);
   }
 
+  /** Invested / free / short exposure, always visible above the blotter. */
+  function renderMoneyBar(val) {
+    if (!R.moneyBar) return;
+    R.moneyBar.innerHTML = '';
+    const item = (label, value, sub, cls) => R.moneyBar.appendChild(el('div', { class: 'moneybar__item' }, [
+      el('span', { class: 'moneybar__k', text: label }),
+      el('span', { class: 'moneybar__v num ' + (cls || ''), text: value }),
+      sub ? el('span', { class: 'moneybar__sub num', text: sub }) : null,
+    ]));
+
+    item('Invested', U.fmtUSD(val.invested, { fixed2: true }),
+      val.equity > 0 ? (val.invested / val.equity * 100).toFixed(1) + '%' : '0%');
+    item('Cash free', U.fmtUSD(val.buyingPower, { fixed2: true }),
+      val.equity > 0 ? (val.buyingPower / val.equity * 100).toFixed(1) + '%' : '0%');
+    if (val.reserved > 0.005) {
+      item('Reserved', U.fmtUSD(val.reserved, { fixed2: true }), 'held', 'dim');
+    }
+    if (val.shortValue > 0.005) {
+      item('Short', U.fmtUSD(val.shortValue, { fixed2: true }),
+        val.equity > 0 ? (val.shortValue / val.equity * 100).toFixed(1) + '%' : '0%', 'down');
+    }
+    item('Equity', U.fmtUSD(val.equity, { fixed2: true }), null,
+      U.dirClass(val.totalReturn));
+  }
+
   /** Write live valuation numbers into the existing position rows. */
   function updatePositionValues(val) {
     if (!R.posRows) return;
     for (const p of val.positions) {
       const row = R.posRows.get(p.assetId);
       if (!row || !row.value.isConnected) continue;
-      row.value.textContent = U.fmtUSD(p.value, { fixed2: true });
+      if (row.weight) row.weight.textContent = p.weightPct.toFixed(1) + '%';
+      row.value.textContent = U.fmtUSD(p.exposure, { fixed2: true });
       row.upl.textContent = U.fmtSigned(p.unrealized);
       row.upl.className = 'num ' + U.dirClass(p.unrealized);
       row.pct.textContent = U.fmtPct(p.unrealizedPct);
@@ -247,17 +283,18 @@
         'Buy something from the order panel and it will show up here with live P&L.'));
       return;
     }
-    const { t, tbody } = table(['Symbol', 'Qty', 'Avg cost', 'Last', 'Market value', 'Unrealized', '%', '']);
+    const { t, tbody } = table(['Symbol', 'Side', 'Qty', 'Avg cost', 'Last', 'Market value', '% of book', 'Unrealized', '%', '']);
     for (const p of val.positions) {
       const priceCell = UI.makePriceCell('');
-      const valueCell = el('span', { class: 'num' }, U.fmtUSD(p.value, { fixed2: true }));
+      const weightCell = el('span', { class: 'num dim' }, p.weightPct.toFixed(1) + '%');
+      const valueCell = el('span', { class: 'num' }, U.fmtUSD(p.exposure, { fixed2: true }));
       const uplCell = el('span', { class: 'num ' + U.dirClass(p.unrealized) }, U.fmtSigned(p.unrealized));
       const pctCell = el('span', { class: 'num ' + U.dirClass(p.unrealized) }, U.fmtPct(p.unrealizedPct));
       A.registerCell(p.assetId, { price: priceCell });
       UI.setPrice(priceCell, p.price);
-      if (R.posRows) R.posRows.set(p.assetId, { value: valueCell, upl: uplCell, pct: pctCell });
+      if (R.posRows) R.posRows.set(p.assetId, { value: valueCell, upl: uplCell, pct: pctCell, weight: weightCell });
 
-      const close = el('button', { class: 'btn btn--sm btn--danger', text: 'Close' });
+      const close = el('button', { class: 'btn btn--sm btn--danger', text: p.isShort ? 'Cover' : 'Close' });
       close.addEventListener('click', (ev) => { ev.stopPropagation(); closePosition(p); });
 
       const tr = el('tr', { class: 'is-clickable' }, [
@@ -265,10 +302,15 @@
           el('div', { class: 'table__sym', text: p.assetId }),
           el('div', { class: 'table__sub', text: (PT.byId[p.assetId] || {}).name || '' }),
         ]),
-        el('td', { class: 'num', text: U.fmtQty(p.qty) }),
+        el('td', {}, el('span', {
+          class: 'badge ' + (p.isShort ? 'badge--down' : 'badge--up'),
+          text: p.isShort ? 'Short' : 'Long',
+        })),
+        el('td', { class: 'num', text: U.fmtQty(Math.abs(p.qty)) }),
         el('td', { class: 'num', text: U.fmtUSD(p.avgCost) }),
         el('td', {}, [priceCell, p.stale ? el('span', { class: 'badge badge--delayed', style: 'margin-left:6px' }, 'stale') : null]),
         el('td', {}, valueCell),
+        el('td', {}, weightCell),
         el('td', {}, uplCell),
         el('td', {}, pctCell),
         el('td', {}, close),
@@ -280,15 +322,17 @@
   }
 
   function closePosition(p) {
+    const side = p.isShort ? 'buy' : 'sell';
     UI.confirmDialog({
-      title: `Close ${p.assetId}?`,
-      message: `Sell all ${U.fmtQty(p.qty)} ${p.assetId} at market. Unrealized P&L of ${U.fmtSigned(p.unrealized)} will be realized.`,
-      confirmLabel: 'Close position',
+      title: `${p.isShort ? 'Cover' : 'Close'} ${p.assetId}?`,
+      message: `${p.isShort ? 'Buy back' : 'Sell'} all ${U.fmtQty(Math.abs(p.qty))} ${p.assetId} at market. `
+        + `Unrealized P&L of ${U.fmtSigned(p.unrealized)} will be realized.`,
+      confirmLabel: p.isShort ? 'Cover short' : 'Close position',
       danger: true,
       onConfirm: () => {
         try {
           const r = E.submitOrder(A.pfUser(), {
-            assetId: p.assetId, side: 'sell', type: 'market', qty: p.qty,
+            assetId: p.assetId, side, type: 'market', qty: Math.abs(p.qty),
           }, A.orderCtx(p.assetId));
           UI.toast({
             kind: 'sell', title: `Sold ${U.fmtQty(r.fill.qty)} ${p.assetId}`,
@@ -314,6 +358,22 @@
       renderRejected(host, pf);
       return;
     }
+    const head = el('div', { class: 'panel__head' }, [
+      el('div', { class: 'panel__title', text: `${pf.orders.length} resting order${pf.orders.length === 1 ? '' : 's'}` }),
+      el('div', { style: 'flex:1' }),
+    ]);
+    const cancelAll = el('button', { class: 'btn btn--sm btn--danger', text: 'Cancel all' });
+    cancelAll.addEventListener('click', () => {
+      const n = pf.orders.length;
+      pf.orders = [];
+      A.save();
+      renderBlotter();
+      updateEstimate();
+      UI.toast({ title: `Cancelled ${n} order${n === 1 ? '' : 's'}`, message: 'The cash they were holding is spendable again.' });
+    });
+    head.appendChild(cancelAll);
+    host.appendChild(head);
+
     const { t, tbody } = table(['Placed', 'Symbol', 'Side', 'Type', 'Qty', 'Limit', 'Distance', '']);
     for (const o of pf.orders) {
       const q = A.prices()[o.assetId];
@@ -541,13 +601,16 @@
     const pf = A.pfUser();
 
     if (S.order.side === 'buy') {
-      const cash = pf.cash * fraction;
+      // Size against spendable cash: raw cash would produce an order the
+      // engine immediately rejects whenever a limit order holds a reservation.
+      const cash = E.availableCash(pf, A.prices()) * fraction;
       R.amountInput.value = S.order.sizeMode === 'notional'
         ? String(Math.floor(cash * 100) / 100)
-        : String(U.roundQty(cash / ref, PT.assetKind(assetId)));
+        : String(U.floorQty(cash / ref, PT.assetKind(assetId)));
     } else {
       const pos = pf.positions[assetId];
       if (!pos) { R.amountInput.value = '0'; updateEstimate(); return; }
+      const sellable = E.availableQty(pf, assetId);
 
       /*
        * "Max" on a sell means close the position, so it is always sized by
@@ -559,12 +622,12 @@
           S.order.sizeMode = 'qty';
           buildOrderPane();
         }
-        R.amountInput.value = String(U.roundQty(pos.qty, pos.kind));
+        R.amountInput.value = String(U.roundQty(sellable, pos.kind));
         updateEstimate();
         return;
       }
 
-      const qty = U.roundQty(pos.qty * fraction, pos.kind);
+      const qty = U.roundQty(sellable * fraction, pos.kind);
       // Floor the dollar figure so converting it back can never exceed `qty`.
       R.amountInput.value = S.order.sizeMode === 'notional'
         ? String(Math.floor(qty * ref * 100) / 100) : String(qty);
@@ -604,10 +667,33 @@
 
     if (R.buyingPower) {
       const v = R.buyingPower.querySelector('.v');
-      if (S.order.side === 'buy') v.textContent = U.fmtUSD(pf.cash, { fixed2: true });
-      else {
+      const k = R.buyingPower.querySelector('.k');
+      if (S.order.side === 'buy') {
+        // Show what can actually be spent. Showing raw cash while the engine
+        // validates against the free balance is how money looks "stuck".
+        const free = E.availableCash(pf, A.prices());
+        const reserved = pf.cash - free;
+        k.textContent = 'Buying power';
+        v.textContent = U.fmtUSD(free, { fixed2: true })
+          + (reserved > 0.005 ? `  (${U.fmtUSD(reserved, { fixed2: true })} reserved)` : '');
+      } else {
+        const free = E.availableQty(pf, assetId);
         const pos = pf.positions[assetId];
-        v.textContent = pos ? `${U.fmtQty(pos.qty)} ${assetId}` : `0 ${assetId}`;
+        const held = pos ? pos.qty : 0;
+        if (held < 0) {
+          k.textContent = 'Short position';
+          v.textContent = `${U.fmtQty(Math.abs(held))} ${assetId} short`;
+        } else if (S.st.settings.shortingEnabled !== false) {
+          // Selling past a holding opens a short, so show that headroom too.
+          const q = A.prices()[assetId];
+          const room = q && isFinite(q.price)
+            ? E.availableCash(pf, A.prices()) / (E.SHORT_INITIAL_MARGIN - 1) / q.price : 0;
+          k.textContent = 'Can sell';
+          v.textContent = `${U.fmtQty(free)} held  ·  up to ${U.fmtQty(free + room)} short`;
+        } else {
+          k.textContent = 'Available to sell';
+          v.textContent = `${U.fmtQty(free)} ${assetId}`;
+        }
       }
     }
 
