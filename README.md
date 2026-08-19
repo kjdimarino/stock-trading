@@ -51,8 +51,22 @@ in your browser's `localStorage`.
 - Cash, positions, open orders, trade history and both equity curves persist between sessions.
 - **Reset Portfolio** in Settings wipes everything and starts over (with a confirmation step).
 
+### What you can trade
+The curated list is a starting point, not a limit. **Every US-listed stock and
+ETF is tradable** — around 7,000 names, penny stocks included — plus every coin
+Coinbase carries (~400). Search finds anything; selecting it makes it tradable,
+chartable and watchable immediately, and it is remembered across sessions.
+
+The one gap: OTC / pink-sheet tickers are not in the listing directory, so a few
+very small names won't resolve.
+
 ### Trading
 - **Market and limit orders**, buy and sell, on stocks, ETFs and crypto.
+- **Short selling.** Sell more than you own to bet on a fall. Shorts hold 150%
+  of their value as collateral (Reg T, so about 2x leverage), the proceeds
+  cannot be spent twice, and if equity drops below 30% of the short you get a
+  margin call — below 25% it is bought back automatically, as a broker would.
+  Turn it off in Settings if you'd rather stay long-only.
 - **Fractional quantities** — size by dollars or by shares/coins. 8 decimals for crypto, 6 for equities.
 - Limit orders rest on a book and fill when the live price crosses them, with
   price improvement. Resting orders reserve their cash or shares, so you cannot
@@ -65,10 +79,14 @@ in your browser's `localStorage`.
 - Day P&L, total return, win rate, profit factor and max drawdown.
 - Full timestamped trade history, plus anything that reached its price but
   could not fill, with the reason why.
+- A permanent money bar above the blotter: how much is invested, how much cash
+  is free to spend, what is reserved, and each position's share of the book.
+- **Repair account** in Settings rebuilds cash and positions exactly from your
+  trade history if anything ever looks wrong.
 
-Short selling is deliberately not supported: simulating it honestly means
-simulating margin, borrow fees and forced buy-ins, and a paper account that got
-those subtly wrong would teach the wrong lesson.
+Shorting is modelled with real margin mechanics — collateral, a maintenance
+level and a forced buy-in — because a short that can't lose more than it cost
+would teach the wrong lesson. Borrow fees are the one thing not simulated.
 
 ### Market data
 | What | Source | Notes |
@@ -78,7 +96,8 @@ those subtly wrong would teach the wrong lesson.
 | Crypto candles | Coinbase Exchange | Falls back to Yahoo |
 | Stock quotes | Yahoo Finance v8 | Falls back to Nasdaq |
 | Stock candles | Yahoo Finance v8 | Falls back to Nasdaq intraday + historical |
-| Symbol search | Yahoo Finance | Falls back to the local universe |
+| Symbol search | Nasdaq listing directory (~7,000 names) | Coinbase products, then Yahoo |
+| Ideas / screens | Nasdaq screener + Coinbase 24h stats | — |
 
 Every quote is labelled with where it came from and how fresh it is —
 **LIVE**, **DELAYED**, **CACHED** or **STALE**. Nothing is ever invented: if a
@@ -88,15 +107,30 @@ early closes) while crypto trades 24/7.
 
 **Update rate.** Crypto is a true stream — every trade print, several per
 second. Equities are polled, because Yahoo bans an IP for minutes after a burst
-(see the note at the bottom): the symbol you are looking at refreshes every 4
-seconds while the market is open, the rest of the watchlist every 12, and far
+(see the note at the bottom): the symbol you are looking at refreshes every 1.5
+seconds while the market is open, the rest of the watchlist every 6, and far
 more slowly once the market shuts, when nothing is moving anyway. The app never
 interpolates between real quotes — a price on screen is a price that traded.
 
 ### Charts
 Candlestick and line charts drawn on raw canvas — no charting library.
-Timeframes from 1m to 1W, volume bars, a snapping crosshair with an OHLCV
-readout, and a live last-price line that updates as the tape moves.
+Timeframes from **1 second** to 1 week, volume bars, a snapping crosshair with
+an OHLCV readout, and a live last-price line that updates as the tape moves.
+
+No public feed serves sub-minute candles — Coinbase's smallest granularity is
+60 seconds — so the 1s/5s/15s views are built here from the live tick stream:
+real trade prints for crypto, polled quotes for stocks. They fill in as ticks
+arrive, and the chart labels the source as "live ticks" rather than pretending
+it fetched them.
+
+### Ideas
+A board of live screens across the whole market: top gainers and fallers, most
+actively traded, penny stocks on the move, large and steady names, biggest
+companies, small caps making moves, and crypto movers. Each list states the
+filter it applied — "top gainer" means little if you can't see whether
+penny-stock noise was screened out. Click any card to start trading it.
+
+These are screens, not recommendations.
 
 ### AI companion
 An analyst panel that answers questions about your book, any symbol, or a
@@ -148,9 +182,9 @@ return, realized and unrealized P&L, trade count, win rate and max drawdown.
 | Key | Action |
 |---|---|
 | `/` | Focus the symbol search |
-| `1`–`6` | Timeframe: 1m, 5m, 15m, 1h, 1D, 1W |
+| `1`–`9` | Timeframe: 1s, 5s, 15s, 1m, 5m, 15m, 1h, 1D, 1W |
 | `b` / `s` | Buy / sell side |
-| `t` `g` `a` `c` | Trade · Portfolio · AI · Compare |
+| `t` `g` `a` `c` | Trade · Portfolio · AI · Compare (Ideas is on the rail) |
 | `Esc` | Close a dialog |
 
 ---
