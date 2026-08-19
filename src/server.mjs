@@ -1,0 +1,215 @@
+/**
+ * Paper Trader local server.
+ *
+ * Two jobs, and nothing more:
+ *   1. Serve the (single-page, fully inlined) app.
+ *   2. Proxy market data, because Yahoo Finance sends no CORS headers and a
+ *      browser therefore cannot call it directly. Proxying also lets us cache,
+ *      coalesce and rate-limit so one machine never trips upstream throttles.
+ *
+ * No account data ever reaches this process — portfolios live in the browser's
+ * localStorage.
+ */
+import http from 'node:http';
+import { STOCKS, ETFS, CRYPTO, ASSETS, BY_ID } from './universe.mjs';
+import {
+  stockQuotes, cryptoQuotes, fetchCandles, searchSymbols, cryptoMarkets, providerHealth,
+} from './providers.mjs';
+import { postJSON } from './http.mjs';
+
+const PORT = Number(process.env.PORT || 7777);
+const HOST = process.env.HOST || '127.0.0.1';
+
+function send(res, status, body, headers = {}) {
+  const payload = typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    ...headers,
+  });
+  res.end(payload);
+}
+
+const sendJSON = (res, status, obj) => send(res, status, obj);
+
+function sendHTML(res, html) {
+  send(res, 200, html, { 'Content-Type': 'text/html; charset=utf-8' });
+}
+
+const splitList = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean).slice(0, 120);
+
+export function createServer(getHTML) {
+  return http.createServer(async (req, res) => {
+    let url;
+    try {
+      url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    } catch {
+      return sendJSON(res, 400, { error: 'bad request' });
+    }
+    const p = url.pathname;
+    const qs = url.searchParams;
+
+    try {
+      /* ------------------------------------------------------------ app */
+      if (req.method === 'GET' && (p === '/' || p === '/index.html')) {
+        return sendHTML(res, getHTML());
+      }
+
+      /* ---------------------------------------------------------- static */
+      if (req.method === 'GET' && p === '/favicon.ico') {
+        // Inline SVG favicon so the app needs no external asset.
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="7" fill="#0b0e14"/><path d="M6 21l5-6 4 4 5-8 6 7" stroke="#16c784" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+        return send(res, 200, svg, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'max-age=86400' });
+      }
+
+      /* ------------------------------------------------------- universe */
+      if (p === '/api/universe') {
+        return sendJSON(res, 200, {
+          assets: ASSETS, counts: { stocks: STOCKS.length, etfs: ETFS.length, crypto: CRYPTO.length },
+        });
+      }
+
+      /* --------------------------------------------------------- quotes */
+      if (p === '/api/quotes') {
+        const stocks = splitList(qs.get('stocks'));
+        const crypto = splitList(qs.get('crypto'));
+        const ttl = Math.max(1000, Math.min(120000, Number(qs.get('ttl')) || 5000));
+
+        const [s, c] = await Promise.all([
+          stocks.length ? stockQuotes(stocks, ttl) : { quotes: {}, errors: {} },
+          crypto.length ? cryptoQuotes(crypto, ttl) : { quotes: {}, errors: {} },
+        ]);
+        return sendJSON(res, 200, {
+          quotes: { ...s.quotes, ...c.quotes },
+          errors: { ...s.errors, ...c.errors },
+          t: Date.now(),
+        });
+      }
+
+      /* -------------------------------------------------------- candles */
+      if (p === '/api/candles') {
+        const asset = qs.get('asset');
+        const tf = qs.get('tf') || '5m';
+        if (!asset) return sendJSON(res, 400, { error: 'asset is required' });
+        try {
+          return sendJSON(res, 200, await fetchCandles(asset, tf));
+        } catch (e) {
+          return sendJSON(res, 502, { error: e.message, asset, tf });
+        }
+      }
+
+      /* --------------------------------------------------------- search */
+      if (p === '/api/search') {
+        return sendJSON(res, 200, await searchSymbols(qs.get('q')));
+      }
+
+      /* -------------------------------------------------------- markets */
+      if (p === '/api/markets') {
+        const ids = splitList(qs.get('ids'));
+        const list = ids.length ? ids : CRYPTO.map((c) => c.cg);
+        try {
+          return sendJSON(res, 200, await cryptoMarkets(list));
+        } catch (e) {
+          return sendJSON(res, 502, { error: e.message });
+        }
+      }
+
+      /* --------------------------------------------------------- health */
+      if (p === '/api/health') {
+        return sendJSON(res, 200, {
+          ok: true,
+          uptimeSec: Math.round(process.uptime()),
+          llm: llmStatus(),
+          providers: providerHealth(),
+        });
+      }
+
+      /* ------------------------------------------------------------ llm */
+      if (p === '/api/llm' && req.method === 'POST') {
+        return handleLLM(req, res);
+      }
+
+      return sendJSON(res, 404, { error: 'not found', path: p });
+    } catch (e) {
+      console.error('[server]', p, e);
+      return sendJSON(res, 500, { error: e.message });
+    }
+  });
+}
+
+/* -------------------------------------------------------------------- LLM */
+
+/**
+ * Optional: if the user exports ANTHROPIC_API_KEY, the AI companion upgrades
+ * from computed analytics to real model commentary. The key stays on this
+ * machine — the browser never sees it.
+ */
+function llmStatus() {
+  const key = process.env.ANTHROPIC_API_KEY || '';
+  return { available: !!key, model: process.env.PT_LLM_MODEL || 'claude-sonnet-4-5-20250929' };
+}
+
+function handleLLM(req, res) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) {
+    return sendJSON(res, 503, {
+      error: 'no_api_key',
+      message: 'Set ANTHROPIC_API_KEY before starting the server to enable LLM commentary.',
+    });
+  }
+  let body = '';
+  req.on('data', (c) => {
+    body += c;
+    if (body.length > 200000) req.destroy();
+  });
+  req.on('end', async () => {
+    try {
+      const parsed = JSON.parse(body || '{}');
+      const upstream = await postJSON('https://api.anthropic.com/v1/messages', {
+        model: parsed.model || llmStatus().model,
+        max_tokens: Math.min(2000, parsed.max_tokens || 900),
+        system: parsed.system,
+        messages: parsed.messages || [],
+      }, {
+        headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      });
+      return send(res, upstream.status, upstream.body, { 'Content-Type': 'application/json' });
+    } catch (e) {
+      return sendJSON(res, 502, { error: e.message });
+    }
+  });
+}
+
+/* ------------------------------------------------------------------ boot */
+
+export function start(getHTML, { port = PORT, host = HOST } = {}) {
+  const server = createServer(getHTML);
+  return new Promise((resolve, reject) => {
+    server.on('error', (e) => {
+      if (e.code === 'EADDRINUSE') {
+        console.error(`\n  Port ${port} is already in use. Start on another port with:\n    PORT=8080 node paper-trader.mjs\n`);
+        process.exit(1);
+      }
+      reject(e);
+    });
+    server.listen(port, host, () => {
+      const url = `http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`;
+      console.log(`
+  ┌──────────────────────────────────────────────┐
+  │  Paper Trader                                │
+  │  Practice trading with real market data      │
+  └──────────────────────────────────────────────┘
+
+  ▸ Open  ${url}
+
+  Live crypto streams straight from Coinbase in your browser.
+  Stock quotes are proxied through this process (Yahoo Finance
+  blocks direct browser calls), with Nasdaq as a fallback.
+
+  LLM commentary: ${llmStatus().available ? 'enabled' : 'off (computed analytics in use)'}
+  Press Ctrl+C to stop.
+`);
+      resolve(server);
+    });
+  });
+}

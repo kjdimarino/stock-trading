@@ -1,0 +1,17 @@
+{
+  "name": "paper-trader",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A self-contained paper trading terminal with real live market data.",
+  "scripts": {
+    "start": "node paper-trader.mjs",
+    "dev": "node tools/dev.mjs",
+    "build": "node tools/gen-universe.mjs && node tools/build.mjs",
+    "test": "node test/run-all.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.56.1"
+  },
+  "engines": { "node": ">=18" }
+}

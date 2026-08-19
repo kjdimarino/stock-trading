@@ -1,0 +1,117 @@
+/* ============================== reset + base ============================= */
+*, *::before, *::after { box-sizing: border-box; }
+* { margin: 0; padding: 0; }
+
+html, body, #root { height: 100%; }
+
+html {
+  font-family: var(--font-sans);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--text-primary);
+  background: var(--bg-base);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-synthesis-weight: none;
+}
+
+body { overflow: hidden; overscroll-behavior: none; }
+
+button, input, select, textarea { font: inherit; color: inherit; background: none; border: none; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+ul, ol { list-style: none; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { color: var(--accent-hover); }
+svg { display: block; }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: var(--r-xs);
+}
+:focus:not(:focus-visible) { outline: none; }
+
+/* Every number in the app is tabular so columns never jitter as prices tick. */
+.num, .mono, td.num, input[type="text"].num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1, "cv01" 1;
+  letter-spacing: var(--ls-tight);
+  line-height: 1;
+}
+.mono { font-family: var(--font-mono); }
+
+.up { color: var(--dir-up); }
+.down { color: var(--dir-down); }
+.flat { color: var(--flat); }
+.dim { color: var(--text-tertiary); }
+.dimmer { color: var(--text-quaternary); }
+.sec { color: var(--text-secondary); }
+
+.label {
+  font-size: var(--fs-2xs);
+  letter-spacing: var(--ls-label);
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  font-weight: var(--fw-semi);
+}
+
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hidden { display: none !important; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden;
+  clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+/* --------------------------------- scroll -------------------------------- */
+.scroll { overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; scrollbar-color: var(--surface-4) transparent; }
+.scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+.scroll::-webkit-scrollbar-track { background: transparent; }
+.scroll::-webkit-scrollbar-thumb {
+  background: var(--surface-4); border-radius: var(--r-full);
+  border: 3px solid transparent; background-clip: content-box;
+}
+.scroll::-webkit-scrollbar-thumb:hover { background: #333c4b; background-clip: content-box; }
+
+/* ------------------------------ tick flash ------------------------------- */
+/*
+  No fade-in: the wash lands at full strength on frame 0, holds ~90ms, then
+  decays. Fading in makes fast ticks invisible.
+*/
+@keyframes tick-up {
+  0%, 22% { background-color: var(--dir-up-wash); color: var(--pos-bright); }
+  100% { background-color: transparent; color: inherit; }
+}
+@keyframes tick-down {
+  0%, 22% { background-color: var(--dir-down-wash); color: var(--neg-bright); }
+  100% { background-color: transparent; color: inherit; }
+}
+.tick { position: relative; border-radius: var(--r-xs); }
+.tick.is-up { animation: tick-up var(--d-flash) var(--ease-decay) 1; }
+.tick.is-down { animation: tick-down var(--d-flash) var(--ease-decay) 1; }
+
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes rise-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes pop-in { from { opacity: 0; transform: scale(.96); } to { opacity: 1; transform: none; } }
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .45; transform: scale(.82); }
+}
+@keyframes shimmer { from { background-position: -200% 0; } to { background-position: 200% 0; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.skeleton {
+  background: linear-gradient(90deg, var(--surface-2) 25%, var(--surface-3) 37%, var(--surface-2) 63%);
+  background-size: 200% 100%;
+  animation: shimmer var(--d-shimmer) linear infinite;
+  border-radius: var(--r-xs);
+  color: transparent !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
+}

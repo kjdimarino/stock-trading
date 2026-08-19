@@ -1,0 +1,129 @@
+/* =========================================================================
+   Design tokens.
+   Surfaces are a cool blue-black ramp; direction colours are routed through a
+   --dir-* indirection layer so the whole app can be flipped for inverted or
+   colour-vision-deficient schemes without touching a component.
+   ========================================================================= */
+:root {
+  color-scheme: dark;
+
+  /* surfaces */
+  --bg-void: #06080b;
+  --bg-base: #0a0c10;
+  --surface-1: #10131a;
+  --surface-2: #161a23;
+  --surface-3: #1d222d;
+  --surface-4: #262c38;
+  --surface-hover: #1a1f29;
+  --surface-active: #222834;
+
+  /* borders composite over any elevation */
+  --border-subtle: rgba(255, 255, 255, .055);
+  --border-default: rgba(255, 255, 255, .095);
+  --border-strong: rgba(255, 255, 255, .155);
+  --divider-v: rgba(255, 255, 255, .07);
+
+  /* text — never pure white, which halates on OLED at this density */
+  --text-primary: #e6eaf2;
+  --text-secondary: #9ba6bc;
+  --text-tertiary: #79839a;
+  --text-quaternary: #5a6478;
+  --text-disabled: #454e5e;
+
+  /* accent is blue-violet so interaction never reads as direction */
+  --accent: #4c82f7;
+  --accent-hover: #6b99ff;
+  --accent-active: #3a6fe0;
+  --accent-fg: #04091a;
+  --accent-wash: rgba(76, 130, 247, .12);
+  --accent-wash-lg: rgba(76, 130, 247, .22);
+  --accent-border: rgba(76, 130, 247, .38);
+
+  /* up / down */
+  --pos: #0ecb81;
+  --pos-bright: #34e89e;
+  --pos-dim: #0a8c63;
+  --pos-fg: #032015;
+  --pos-wash: rgba(14, 203, 129, .10);
+  --pos-wash-lg: rgba(14, 203, 129, .22);
+  --pos-border: rgba(14, 203, 129, .32);
+
+  --neg: #ff4d5e;
+  --neg-bright: #ff7b88;
+  --neg-dim: #b33642;
+  --neg-fg: #1e0206;
+  --neg-wash: rgba(255, 77, 94, .10);
+  --neg-wash-lg: rgba(255, 77, 94, .22);
+  --neg-border: rgba(255, 77, 94, .32);
+
+  --flat: #79839a;
+  --flat-wash: rgba(121, 131, 154, .10);
+
+  /* status */
+  --warn: #f0b90b;
+  --warn-wash: rgba(240, 185, 11, .12);
+  --warn-border: rgba(240, 185, 11, .30);
+  --sim: #9d7bff;
+  --sim-wash: rgba(157, 123, 255, .12);
+  --sim-border: rgba(157, 123, 255, .32);
+  --scrim: rgba(4, 6, 9, .72);
+
+  /* direction indirection */
+  --dir-up: var(--pos);
+  --dir-up-wash: var(--pos-wash-lg);
+  --dir-down: var(--neg);
+  --dir-down-wash: var(--neg-wash-lg);
+
+  /* type */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI",
+    system-ui, Roboto, "Helvetica Neue", "Noto Sans", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+    "Roboto Mono", "DejaVu Sans Mono", "Liberation Mono", monospace;
+
+  --fs-3xs: 9px;  --fs-2xs: 10px; --fs-xs: 11px;  --fs-sm: 12px;
+  --fs-md: 13px;  --fs-lg: 15px;  --fs-xl: 18px;  --fs-2xl: 22px;
+  --fs-3xl: 30px; --fs-4xl: 42px;
+
+  --fw-regular: 400; --fw-medium: 500; --fw-semi: 600; --fw-bold: 700;
+
+  --ls-hero: -.024em; --ls-display: -.018em; --ls-tight: -.008em;
+  --ls-label: .08em;  --ls-micro: .10em;
+
+  /* spacing / shape */
+  --sp-0-5: 2px; --sp-1: 4px; --sp-1-5: 6px; --sp-2: 8px; --sp-2-5: 10px;
+  --sp-3: 12px; --sp-4: 16px; --sp-5: 20px; --sp-6: 24px; --sp-8: 32px;
+  --sp-10: 40px; --sp-12: 48px;
+
+  --row-h: 32px;
+  --row-h-list: 46px;
+  --gutter: 12px;
+
+  --r-xs: 3px; --r-sm: 5px; --r-md: 8px; --r-lg: 12px; --r-full: 999px;
+
+  /* elevation pairs a shadow with a 1px specular rim, or it vanishes on dark */
+  --e1: 0 1px 2px rgba(0,0,0,.40), inset 0 1px 0 rgba(255,255,255,.035);
+  --e2: 0 2px 6px -1px rgba(0,0,0,.50), 0 1px 2px rgba(0,0,0,.30), inset 0 1px 0 rgba(255,255,255,.045);
+  --e3: 0 8px 24px -6px rgba(0,0,0,.62), 0 2px 6px -2px rgba(0,0,0,.40), inset 0 1px 0 rgba(255,255,255,.055);
+  --e4: 0 16px 48px -12px rgba(0,0,0,.72), 0 4px 12px -4px rgba(0,0,0,.50), inset 0 1px 0 rgba(255,255,255,.065);
+
+  /* motion */
+  --ease-out: cubic-bezier(.16, 1, .30, 1);
+  --ease-spring: cubic-bezier(.34, 1.56, .64, 1);
+  --ease-decay: cubic-bezier(.22, .61, .36, 1);
+  --d-instant: 80ms; --d-fast: 140ms; --d-base: 220ms; --d-slow: 320ms;
+  --d-flash: 420ms; --d-shimmer: 1400ms;
+
+  --z-sticky: 100; --z-dropdown: 400; --z-scrim: 800; --z-modal: 810;
+  --z-toast: 900; --z-tooltip: 1000;
+}
+
+/* Markets that draw up-moves in red (TW/JP/KR/CN convention). */
+[data-direction-scheme="inverted"] {
+  --dir-up: var(--neg); --dir-up-wash: var(--neg-wash-lg);
+  --dir-down: var(--pos); --dir-down-wash: var(--pos-wash-lg);
+}
+/* Deuteranopia-safe: blue up, amber down. */
+[data-direction-scheme="cvd"] {
+  --dir-up: #4da3ff; --dir-up-wash: rgba(77,163,255,.22);
+  --dir-down: #ffa53d; --dir-down-wash: rgba(255,165,61,.22);
+}
