@@ -30,6 +30,17 @@
       "status status";
   }
 
+  /*
+   * On one-column layouts the order pane fills the centre, so its action
+   * button is bottom-centre. Drop toasts down from the top instead.
+   */
+  .toasts {
+    top: calc(48px + var(--sp-3)); bottom: auto;
+    left: calc(56px + var(--sp-3)); right: var(--sp-3);
+    flex-direction: column;
+  }
+  .toast { max-width: none; }
+
   /* One region at a time in the centre column. */
   .terminal > .watchlist,
   .terminal > .blotter,

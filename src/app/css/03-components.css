@@ -200,8 +200,13 @@
 
 /* -------------------------------- toasts --------------------------------- */
 .toasts {
-  /* Clear the 24px status bar rather than sitting under it. */
-  position: fixed; bottom: calc(24px + var(--sp-3)); right: var(--sp-5); z-index: var(--z-toast);
+  /*
+   * Clear the 24px status bar rather than sitting under it, and stack on the
+   * left: the order pane's Buy/Sell button lives in the bottom-right corner,
+   * and a toast parked on top of it swallows the click.
+   */
+  position: fixed; bottom: calc(24px + var(--sp-3));
+  left: calc(56px + var(--sp-3)); z-index: var(--z-toast);
   display: flex; flex-direction: column-reverse; gap: var(--sp-2); pointer-events: none;
 }
 .toast {

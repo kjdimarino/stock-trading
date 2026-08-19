@@ -132,14 +132,28 @@ window.PT = window.PT || {};
       Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   }
 
-  /** Trailing-edge debounce, with a cancel so a pending call can be abandoned. */
+  /**
+   * Trailing-edge debounce. `cancel` abandons a pending call; `flush` runs it
+   * right now instead of waiting out the timer, which is what makes it safe to
+   * debounce something durable like a save.
+   */
   function debounce(fn, wait) {
-    let t;
-    const wrapped = function (...args) {
-      clearTimeout(t);
-      t = setTimeout(() => fn.apply(this, args), wait);
+    let t = null, self = null, args = null;
+    const run = () => {
+      clearTimeout(t); t = null;
+      if (!args) return;
+      const a = args, s = self;
+      args = null; self = null;
+      fn.apply(s, a);
     };
-    wrapped.cancel = () => clearTimeout(t);
+    const wrapped = function (...called) {
+      self = this; args = called;
+      clearTimeout(t);
+      t = setTimeout(run, wait);
+    };
+    wrapped.cancel = () => { clearTimeout(t); t = null; self = null; args = null; };
+    wrapped.pending = () => args != null;
+    wrapped.flush = run;
     return wrapped;
   }
 

@@ -362,10 +362,59 @@ try {
   check('trade history survived the reload', after.fills === before.fills, `${before.fills} -> ${after.fills}`);
   check('watchlist survived the reload', after.watchlist === before.watchlist);
 
+  /*
+   * Saves are debounced 600ms, so a trade placed just before the tab closes
+   * would only ever live in memory. `pagehide` has to flush it synchronously.
+   */
+  await page.waitForFunction(() => {
+    const p = window.PT && window.PT.feed && window.PT.feed.prices;
+    return p && ['BTC', 'ETH', 'SOL', 'DOGE'].some((k) => isFinite((p[k] || {}).price));
+  }, { timeout: 30000 });
+  const durability = await page.evaluate(() => {
+    const PT = window.PT, A = PT.app, E = PT.engine;
+    const pf = A.pfUser();
+    // Crypto, so this works whether or not the equity session is open.
+    const id = ['BTC', 'ETH', 'SOL', 'DOGE'].find((k) => isFinite((PT.feed.prices[k] || {}).price));
+    const qty = 5 / PT.feed.prices[id].price;   // ~$5, clear of the $1 minimum
+    E.submitOrder(pf, { assetId: id, side: 'buy', type: 'market', qty }, A.orderCtx(id));
+    A.save();                                    // debounced — nothing written yet
+    const mid = JSON.parse(localStorage.getItem(E.STORAGE_KEY)).portfolios.user;
+    window.dispatchEvent(new Event('pagehide')); // the tab goes away mid-debounce
+    const end = JSON.parse(localStorage.getItem(E.STORAGE_KEY)).portfolios.user;
+    return {
+      memory: { cash: pf.cash, fills: pf.fills.length },
+      preFlush: { cash: mid.cash, fills: mid.fills.length },
+      postFlush: { cash: end.cash, fills: end.fills.length },
+    };
+  });
+  check('a trade inside the debounce window is not yet on disk',
+    durability.preFlush.fills === durability.memory.fills - 1,
+    `disk ${durability.preFlush.fills} vs memory ${durability.memory.fills}`);
+  check('pagehide flushes the pending save',
+    durability.postFlush.fills === durability.memory.fills &&
+    Math.abs(durability.postFlush.cash - durability.memory.cash) < 1e-9,
+    `${durability.preFlush.cash} -> ${durability.postFlush.cash}`);
+
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('.terminal', { timeout: 20000 });
+  const reopened = await page.evaluate(() => {
+    const pf = window.PT.app.pfUser();
+    return { cash: pf.cash, fills: pf.fills.length };
+  });
+  check('the last-second trade is still there after reopening',
+    reopened.fills === durability.memory.fills &&
+    Math.abs(reopened.cash - durability.memory.cash) < 0.01,
+    `${reopened.cash} / ${reopened.fills} fills`);
+
   /* ------------------------------------------------------------- search */
   section('Symbol search');
   await page.locator('.omni__input').fill('nvid');
-  await page.waitForTimeout(1500);
+  // The directory fetch can be slow on a cold cache, so wait for the result
+  // list rather than guessing at a fixed delay.
+  await page.waitForFunction(
+    () => document.querySelectorAll('.omni__item').length > 0,
+    { timeout: 20000 },
+  ).catch(() => {});
   const results = await page.locator('.omni__item').count();
   check('search returns results', results > 0, `${results} results`);
   if (results > 0) {

@@ -65,6 +65,9 @@
   /** Debounced persistence. No-ops once a reset is under way. */
   const save = (...a) => { if (!S.resetting) persist(...a); };
   save.cancel = () => persist.cancel();
+  /** Write a pending save immediately — used when the page is going away. */
+  save.flush = () => { if (!S.resetting) persist.flush(); };
+  save.pending = () => persist.pending();
 
   /* --------------------------------------------------------------- shell */
 

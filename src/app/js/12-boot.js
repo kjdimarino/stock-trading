@@ -279,6 +279,22 @@
 
   /* ---------------------------------------------------------------- boot */
 
+  /*
+   * Saves are debounced by 600ms so a burst of updates writes once. That leaves
+   * a window where a trade lives only in memory, so flush it the moment the page
+   * is going away. `pagehide` is the reliable signal on mobile Safari, where a
+   * backgrounded tab may never see `unload` at all; `visibilitychange` covers
+   * tab switches and app switches that precede a silent kill.
+   */
+  function wireDurability() {
+    const flush = () => { try { A.save.flush(); } catch (_) { /* nothing to do while unloading */ } };
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('beforeunload', flush);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') flush();
+    });
+  }
+
   function startApp(state) {
     S.st = state;
 
@@ -310,6 +326,7 @@
 
     wireFeed();
     wireShortcuts();
+    wireDurability();
     V.renderAll();
     tickLoop();
 
