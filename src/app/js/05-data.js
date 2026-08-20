@@ -319,12 +319,30 @@
     return res.json();
   }
 
-  /** Crypto over REST — the fallback path when the socket cannot connect. */
+  /**
+   * Crypto over REST — the fallback path when the socket cannot connect, and
+   * the only path for coins outside Coinbase.
+   *
+   * Coins split into two tiers here. Anything with a Coinbase product is asked
+   * for by symbol and comes back live. Anything carrying a CoinGecko id is sent
+   * as `SYMBOL:coin-id` and comes back as a delayed snapshot; the server caches
+   * those for 45s, so polling them on the same fast timer costs no extra
+   * upstream requests and keeps the free tier's budget intact.
+   */
   async function pollCrypto() {
-    const ids = [...state.watched].filter((id) => PT.isCrypto(id));
-    if (!ids.length) return;
+    const live = [], delayed = [];
+    for (const id of state.watched) {
+      const a = PT.byId[id];
+      if (!a || a.kind !== 'crypto') continue;
+      if (a.cg) delayed.push(`${id}:${a.cg}`);
+      else live.push(id);
+    }
+    if (!live.length && !delayed.length) return;
+    const params = [];
+    if (live.length) params.push(`crypto=${encodeURIComponent(live.join(','))}`);
+    if (delayed.length) params.push(`gecko=${encodeURIComponent(delayed.join(','))}`);
     try {
-      const j = await api(`/api/quotes?crypto=${encodeURIComponent(ids.join(','))}&ttl=4000`);
+      const j = await api(`/api/quotes?${params.join('&')}&ttl=4000`);
       state.ready.crypto = true;
       for (const id in j.quotes) {
         const q = j.quotes[id];
@@ -351,7 +369,8 @@
   /** True when a watched coin still has no price at all. */
   function cryptoAwaitingPrice() {
     for (const id of state.watched) {
-      if (!PT.isCrypto(id)) continue;
+      // Delayed coins are never expected to arrive over the socket.
+      if (!PT.isCrypto(id) || PT.isDelayedCoin(id)) continue;
       const q = state.prices[id];
       if (!q || !isFinite(q.price)) return true;
     }
@@ -470,7 +489,10 @@
 
     const a = PT.byId[assetId] || {};
     const hint = `&kind=${encodeURIComponent(a.kind || 'stock')}`
-      + (a.yh ? `&yh=${encodeURIComponent(a.yh)}` : '');
+      + (a.yh ? `&yh=${encodeURIComponent(a.yh)}` : '')
+      // Only for coins with no Coinbase product: the curated coins carry a
+      // CoinGecko id too, and theirs is for market caps, not candles.
+      + (a.cg && !a.cb ? `&cg=${encodeURIComponent(a.cg)}` : '');
     const j = await api(`/api/candles?asset=${encodeURIComponent(assetId)}&tf=${encodeURIComponent(tf)}${hint}`);
     if (j.error) throw new Error(j.error);
     const entry = {

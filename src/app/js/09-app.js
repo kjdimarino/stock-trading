@@ -24,6 +24,8 @@
     order: { side: 'buy', type: 'limit', sizeMode: 'notional' },
     wlTab: 'watchlist',
     aiTab: 'chat',
+    drawMode: false,         // is the drawing toolbar showing
+    drawTool: null,          // which drawing tool is armed
     chart: null,
     equityChart: null,
     bars: null,              // candles for the focused asset
@@ -347,12 +349,16 @@
       kind: result.kind,
       exchange: result.exchange,
       yh: result.yh,
+      // Long-tail coins carry their CoinGecko id; it is the only way to price them.
+      cg: result.cg,
+      delayed: result.delayed,
     });
     if (!asset) return;
     if (asset.discovered) {
       S.st.discovered = S.st.discovered || {};
       S.st.discovered[asset.id] = {
-        id: asset.id, name: asset.name, kind: asset.kind, exchange: asset.exchange, yh: asset.yh,
+        id: asset.id, name: asset.name, kind: asset.kind, exchange: asset.exchange,
+        yh: asset.yh, cg: asset.cg || null,
       };
     }
     addToWatchlist(asset.id);

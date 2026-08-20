@@ -88,12 +88,40 @@
       modeSeg.appendChild(b);
     }
 
+    /* drawing tools */
+    const drawSeg = el('div', { class: 'seg seg--draw hidden' });
+    R.drawButtons = {};
+    const TOOLS = [
+      // Not "Line": the chart-mode switch next to it already has one, and two
+      // buttons with the same word in one toolbar is a coin toss.
+      ['trend', 'Trend', 'Drag a trendline between two points'],
+      ['level', 'Level', 'Click to drop a horizontal price line'],
+      ['free', 'Free', 'Draw freehand'],
+      ['erase', 'Erase', 'Click a drawing to remove it'],
+    ];
+    for (const [tool, label, title] of TOOLS) {
+      const b = el('button', { class: 'seg__item', title, text: label });
+      b.addEventListener('click', () => setDrawTool(S.drawTool === tool ? null : tool));
+      R.drawButtons[tool] = b;
+      drawSeg.appendChild(b);
+    }
+    const undo = el('button', { class: 'btn btn--ghost btn--sm hidden', title: 'Undo the last drawing', text: 'Undo' });
+    undo.addEventListener('click', () => { S.chart.undoDrawing(); });
+    const clearDraw = el('button', { class: 'btn btn--ghost btn--sm hidden', title: 'Remove every drawing on this symbol', text: 'Clear' });
+    clearDraw.addEventListener('click', () => { S.chart.clearDrawings(); });
+    R.drawExtras = [undo, clearDraw];
+
+    const drawToggle = el('button', { class: 'btn btn--ghost btn--sm', title: 'Draw on the chart', text: 'Draw' });
+    drawToggle.addEventListener('click', () => setDrawMode(!S.drawMode));
+    R.drawToggle = drawToggle;
+    R.drawSeg = drawSeg;
+
     R.chartSource = el('span', { class: 'dimmer', style: 'font-size:10px' }, '');
     const refresh = el('button', { class: 'btn btn--ghost btn--icon btn--sm', title: 'Reload candles' }, icon('refresh', 13));
     refresh.addEventListener('click', () => loadChart(true));
 
     R.chartpane.appendChild(el('div', { class: 'charttools' }, [
-      tfSeg, modeSeg,
+      tfSeg, modeSeg, drawToggle, drawSeg, undo, clearDraw,
       el('div', { class: 'charttools__spacer' }),
       R.chartSource, refresh,
     ]));
@@ -106,6 +134,8 @@
 
     S.chart = new PT.chart.PriceChart(R.chartWrap);
     S.chart.setMode(S.chartMode);
+    bindDrawings(S.focus);
+    setDrawMode(S.drawMode === true);
     S.chart.onHover = (bar) => {
       if (!bar) { R.chartLegend.classList.add('hidden'); return; }
       R.chartLegend.classList.remove('hidden');
@@ -121,6 +151,48 @@
     loadChart(true);
   }
 
+  /* ------------------------------------------------------------ drawings */
+
+  /**
+   * Drawings belong to a symbol, not to a timeframe: a level you marked on the
+   * daily is the same level on the 5m, so it is stored once in (time, price)
+   * and re-projected whenever the chart geometry changes.
+   */
+  function drawingsFor(assetId) {
+    const all = S.st.drawings || (S.st.drawings = {});
+    return all[assetId] || [];
+  }
+
+  function setDrawMode(on) {
+    S.drawMode = !!on;
+    if (!S.drawMode) setDrawTool(null);
+    else if (!S.drawTool) setDrawTool('trend');
+    if (R.drawToggle) R.drawToggle.classList.toggle('is-active', S.drawMode);
+    if (R.drawSeg) R.drawSeg.classList.toggle('hidden', !S.drawMode);
+    for (const b of (R.drawExtras || [])) b.classList.toggle('hidden', !S.drawMode);
+  }
+
+  function setDrawTool(tool) {
+    S.drawTool = tool || null;
+    if (S.chart) S.chart.setDrawTool(S.drawTool);
+    for (const k in (R.drawButtons || {})) {
+      R.drawButtons[k].classList.toggle('is-active', k === S.drawTool);
+    }
+  }
+
+  /** Point the chart at this symbol's drawings and persist anything new. */
+  function bindDrawings(assetId) {
+    if (!S.chart) return;
+    S.chart.setDrawings(drawingsFor(assetId).slice());
+    S.chart.onDrawingsChange = (list) => {
+      const all = S.st.drawings || (S.st.drawings = {});
+      // A runaway freehand session should not be able to bloat the save file.
+      if (list.length) all[assetId] = list.slice(-200);
+      else delete all[assetId];
+      A.save();
+    };
+  }
+
   /*
    * Sub-minute candles are aggregated locally from the print stream, so the
    * series starts empty and fills in as prints arrive. Say that plainly instead
@@ -128,11 +200,12 @@
    * crypto is a genuine trade feed, equities are a poll.
    */
   function tickSeriesState(assetId, tf, bars) {
-    const crypto = PT.isCrypto(assetId);
+    // A CoinGecko-only coin is polled like an equity, not streamed like BTC.
+    const crypto = PT.isCrypto(assetId) && !PT.isDelayedCoin(assetId);
     const label = crypto ? 'live trades' : 'polled quotes';
     const n = bars ? bars.length : 0;
     if (n >= 3) return { label, message: null };
-    if (!crypto && !PT.calendar.stockStatus().isOpen) {
+    if (!crypto && !PT.isCrypto(assetId) && !PT.calendar.stockStatus().isOpen) {
       return {
         label,
         message: `${tf} candles are built from live prints. The US market is closed, `
@@ -233,7 +306,9 @@
    */
   function blotterSignature(pf, val) {
     if (S.blotterTab === 'positions') return 'p:' + val.positions.map((p) => p.assetId + ':' + p.qty).join('|');
-    if (S.blotterTab === 'orders') return 'o:' + pf.orders.map((o) => o.id).join('|') + '/r:' + (pf.rejected || []).length;
+    // Status is part of the signature: an order released at the bell has to
+    // redraw, not sit there still labelled as waiting.
+    if (S.blotterTab === 'orders') return 'o:' + pf.orders.map((o) => o.id + o.status).join('|') + '/r:' + (pf.rejected || []).length;
     return 'h:' + pf.fills.length;
   }
 
@@ -391,14 +466,20 @@
     if (!pf.orders.length) {
       if (!rejected.length) {
         host.appendChild(UI.emptyState('orders', 'No open orders',
-          'Limit orders that have not filled yet will rest here until the market reaches your price.'));
+          'Limit orders rest here until the market reaches your price, and anything you buy '
+          + 'while the stock market is shut waits here until the opening bell.'));
         return;
       }
       renderRejected(host, pf);
       return;
     }
+    const queuedCount = pf.orders.filter((o) => o.status === 'queued').length;
+    const restingCount = pf.orders.length - queuedCount;
+    const parts = [];
+    if (restingCount) parts.push(`${restingCount} resting`);
+    if (queuedCount) parts.push(`${queuedCount} waiting for the open`);
     const head = el('div', { class: 'panel__head' }, [
-      el('div', { class: 'panel__title', text: `${pf.orders.length} resting order${pf.orders.length === 1 ? '' : 's'}` }),
+      el('div', { class: 'panel__title', text: parts.join(' · ') }),
       el('div', { style: 'flex:1' }),
     ]);
     const cancelAll = el('button', { class: 'btn btn--sm btn--danger', text: 'Cancel all' });
@@ -413,11 +494,22 @@
     head.appendChild(cancelAll);
     host.appendChild(head);
 
-    const { t, tbody } = table(['Placed', 'Symbol', 'Side', 'Type', 'Qty', 'Limit', 'Distance', '']);
+    const openAt = PT.calendar.stockStatus().nextChange;
+    const { t, tbody } = table(['Placed', 'Symbol', 'Side', 'Type', 'Qty', 'Limit', 'Status', '']);
     for (const o of pf.orders) {
       const q = A.prices()[o.assetId];
-      const dist = q && isFinite(q.price)
+      const dist = o.limitPrice != null && q && isFinite(q.price)
         ? ((o.limitPrice - q.price) / q.price) * 100 : null;
+
+      /*
+       * "Distance to my limit" is the useful thing to know about a resting
+       * order; for one parked until the bell it is when the bell is. Same
+       * column, different question.
+       */
+      const status = o.status === 'queued'
+        ? el('span', { class: 'badge badge--delayed' },
+          openAt ? `Opens in ${PT.calendar.untilText(openAt)}` : 'At the open')
+        : el('span', { class: 'num dim', text: dist == null ? '—' : U.fmtPct(dist) });
       const cancel = el('button', { class: 'btn btn--sm', text: 'Cancel' });
       cancel.addEventListener('click', () => {
         E.cancelOrder(pf, o.id);
@@ -430,9 +522,9 @@
         el('td', {}, el('span', { class: 'table__sym', text: o.assetId })),
         el('td', {}, el('span', { class: 'badge ' + (o.side === 'buy' ? 'badge--up' : 'badge--down'), text: o.side })),
         el('td', { class: 'table__sub', text: o.type }),
-        el('td', { class: 'num', text: U.fmtQty(o.qty) }),
-        el('td', { class: 'num', text: U.fmtUSD(o.limitPrice) }),
-        el('td', { class: 'num dim', text: dist == null ? '—' : U.fmtPct(dist) }),
+        el('td', { class: 'num', text: o.notional != null ? U.fmtUSD(o.notional) : U.fmtQty(o.qty) }),
+        el('td', { class: 'num', text: o.limitPrice == null ? '—' : U.fmtUSD(o.limitPrice) }),
+        el('td', {}, status),
         el('td', {}, cancel),
       ]));
     }
@@ -747,16 +839,25 @@
           [S.order.sizeMode === 'notional' ? 'notional' : 'qty']: raw,
         }, A.orderCtx(assetId));
       } catch (e) { error = e.message; }
-    } else if (!marketOpen && !PT.isCrypto(assetId)) {
-      error = 'US equities are closed right now. Crypto trades 24/7.';
     }
 
+    /*
+     * A closed session is a note, not an error: the order will be taken and
+     * held for the bell. Keep it visually distinct from a real rejection so
+     * "this will happen later" never reads as "this failed".
+     */
+    const willQueue = !error && !marketOpen && !PT.isCrypto(assetId);
     if (error) {
       R.orderError.textContent = error;
-      R.orderError.classList.remove('hidden');
-    } else {
-      R.orderError.classList.add('hidden');
+      R.orderError.className = 'order__err';
+    } else if (willQueue) {
+      const openAt = PT.calendar.stockStatus().nextChange;
+      R.orderError.textContent = openAt
+        ? `${assetId} is closed — this order waits and fills at the open, in ${PT.calendar.untilText(openAt)}.`
+        : `${assetId} is closed — this order waits and fills at the next open.`;
+      R.orderError.className = 'order__err order__err--note';
     }
+    R.orderError.classList.toggle('hidden', !error && !willQueue);
     if (R.submitBtn) R.submitBtn.disabled = !!error || !(raw > 0);
   }
 
@@ -779,6 +880,24 @@
           title: `${S.order.side === 'buy' ? 'Bought' : 'Sold'} ${U.fmtQty(r.fill.qty)} ${assetId}`,
           message: `at ${U.fmtUSD(r.fill.price)} · ${U.fmtUSD(r.fill.notional, { fixed2: true })}`
             + (r.fill.side === 'sell' ? ` · realized ${U.fmtSigned(r.fill.realized)}` : ''),
+        });
+      } else if (r.queued) {
+        const openAt = PT.calendar.stockStatus().nextChange;
+        const when = openAt
+          ? `${U.fmtDateTime(openAt)} (in ${PT.calendar.untilText(openAt)})`
+          : 'the next open';
+        const size = r.order.notional != null
+          ? U.fmtUSD(r.order.notional, { fixed2: true }) + ' of'
+          : U.fmtQty(r.order.qty);
+        UI.toast({
+          kind: 'warn',
+          title: 'Queued for the opening bell',
+          message: `${r.order.side.toUpperCase()} ${size} ${assetId} `
+            + (r.order.type === 'limit'
+              ? `will join the book at ${when} and fill at ${U.fmtUSD(r.order.limitPrice)} or better.`
+              : `will fill at the opening price on ${when}.`)
+            + ' Cancel it any time from Open orders.',
+          timeout: 9000,
         });
       } else {
         UI.toast({
@@ -895,6 +1014,6 @@
   PT.views = Object.assign(PT.views || {}, {
     buildChartPane, loadChart, buildBlotter, renderBlotter, buildOrderPane,
     updateEstimate, renderAll, renderTopbar, renderSymbolHeader, renderStatusbar,
-    table, TIMEFRAMES, tickSeriesState, showChartMsg,
+    table, TIMEFRAMES, tickSeriesState, showChartMsg, bindDrawings, setDrawMode, setDrawTool,
   });
 })(window.PT);

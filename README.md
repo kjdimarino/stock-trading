@@ -53,9 +53,24 @@ in your browser's `localStorage`.
 
 ### What you can trade
 The curated list is a starting point, not a limit. **Every US-listed stock and
-ETF is tradable** — around 7,000 names, penny stocks included — plus every coin
-Coinbase carries (~400). Search finds anything; selecting it makes it tradable,
-chartable and watchable immediately, and it is remembered across sessions.
+ETF is tradable** — around 7,000 names, penny stocks included — plus crypto in
+two tiers. Search finds anything; selecting it makes it tradable, chartable and
+watchable immediately, and it is remembered across sessions.
+
+**Crypto comes in two tiers, and the app always tells you which one you are
+looking at:**
+
+| Tier | Coins | Prices | Charts |
+|---|---|---|---|
+| Live | ~400 on Coinbase | Real trade prints over a WebSocket, badged `LIVE` | Full OHLCV down to seconds |
+| Delayed | ~2,000 more via CoinGecko | Snapshots refreshed about once a minute, badged `DELAYED` | 5m and slower, close-only |
+
+The delayed tier exists because Coinbase is the only source that streams real
+trades to a browser without an API key. Everything beyond it is a snapshot, and
+CoinGecko's free tier is a handful of calls a minute — enough to price a coin you
+are looking at, not enough to stream a watchlist. So those coins are priced and
+tradable, never pretend to be live, and refuse sub-5-minute candles outright
+rather than resampling a coarser series and calling it a minute bar.
 
 The one gap: OTC / pink-sheet tickers are not in the listing directory, so a few
 very small names won't resolve.
@@ -71,6 +86,13 @@ very small names won't resolve.
 - Limit orders rest on a book and fill when the live price crosses them, with
   price improvement. Resting orders reserve their cash or shares, so you cannot
   commit the same balance twice and have an order quietly vanish later.
+- **Orders placed while the stock market is shut are queued, not rejected.** Buy
+  AAPL at midnight and it fills at the opening print; a limit joins the book at
+  the bell and fills normally from there. Queued orders hold their cash or shares
+  like any resting order, show what they are waiting for in **Open orders**, and
+  can be cancelled at any time. A dollar-sized queued order buys its dollars at
+  the open rather than a stale share count, so an overnight gap cannot turn
+  "$500 of AAPL" into a rejection.
 - A simulated spread (2bp equities, 5bp crypto) is applied to market fills so an
   instant round trip costs you something, the way a real one does. You can turn
   it off in Settings.
@@ -96,7 +118,9 @@ would teach the wrong lesson. Borrow fees are the one thing not simulated.
 | Crypto candles | Coinbase Exchange | Falls back to Yahoo |
 | Stock quotes | Yahoo Finance v8 | Falls back to Nasdaq |
 | Stock candles | Yahoo Finance v8 | Falls back to Nasdaq intraday + historical |
-| Symbol search | Nasdaq listing directory (~7,000 names) | Coinbase products, then Yahoo |
+| Crypto, long tail | CoinGecko markets + simple price | ~2,000 more coins, delayed and labelled as such |
+| Long-tail crypto candles | CoinGecko market_chart | Close-only; 5m and slower only |
+| Symbol search | Nasdaq listing directory (~7,000 names) | Coinbase products, then CoinGecko, then Yahoo |
 | Ideas / screens | Nasdaq screener + Coinbase 24h stats | — |
 
 Every quote is labelled with where it came from and how fresh it is —
@@ -118,10 +142,28 @@ Timeframes from **1 second** to 1 week, volume bars, a snapping crosshair with
 an OHLCV readout, and a live last-price line that updates as the tape moves.
 
 No public feed serves sub-minute candles — Coinbase's smallest granularity is
-60 seconds — so the 1s/5s/15s views are built here from the live tick stream:
-real trade prints for crypto, polled quotes for stocks. They fill in as ticks
-arrive, and the chart labels the source as "live ticks" rather than pretending
-it fetched them.
+60 seconds — so the 1s/5s/15s views are built here from the live print stream:
+real trade prints for crypto, polled quotes for stocks. They fill in as prints
+arrive, and the chart names the source ("live trades" or "polled quotes") rather
+than pretending it fetched them. A second with no prints is carried forward flat
+instead of being dropped, so the time axis stays uniform.
+
+Where a source gives one price per bar rather than OHLC — Nasdaq's 1m intraday,
+and every CoinGecko series — each bar opens where the previous one closed, so the
+body shows the real move. Highs and lows from two known prices understate the
+true range, so those charts say **close-only, no intraday high/low** instead of
+passing themselves off as full OHLC.
+
+**Draw on the chart.** The **Draw** button opens four tools: a trendline you drag
+between two points, a horizontal level placed with a click and labelled with its
+price, freehand, and an eraser that removes the shape under the pointer. Undo and
+Clear sit beside them.
+
+Drawings are stored in *time and price*, never in pixels. A trendline drawn on
+the 5m chart still touches the same two highs on the 1h, after a resize, and
+after fifty new bars have pushed everything left. They belong to the symbol, not
+the timeframe, and persist across sessions. A level far from the current price
+can sit off-screen — the price axis follows the candles, not your annotations.
 
 ### Ideas
 A board of live screens across the whole market: top gainers and fallers, most

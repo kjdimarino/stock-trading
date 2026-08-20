@@ -113,6 +113,50 @@ describe('freshness labelling', () => {
     }
   });
 
+  it('a coin with a Coinbase market keeps real OHLCV even though it has a gecko id', async () => {
+    // Every curated coin carries a CoinGecko id for market caps. That must not
+    // divert its candles to CoinGecko's close-only series.
+    const r = await P.fetchCandles('BTC', '1h', { kind: 'crypto', cg: 'bitcoin', yh: 'BTC-USD' });
+    eq(r.source, 'coinbase');
+    ok(!r.closeOnly, 'Coinbase gives full OHLC');
+    const flat = r.bars.filter((b) => b.o === b.h && b.h === b.l && b.l === b.c).length;
+    ok(flat < r.bars.length * 0.2, `${flat}/${r.bars.length} bars have no body`);
+  });
+
+  it('the long tail directory covers thousands of coins with prices', async () => {
+    const dir = await P.geckoDirectory();
+    ok(dir.coins.length > 500, `only ${dir.coins.length} coins`);
+    eq(dir.quality, 'delayed');
+    for (const c of dir.coins.slice(0, 50)) {
+      ok(c.cg && c.symbol && c.name, `incomplete coin ${JSON.stringify(c)}`);
+      ok(isFinite(c.price) && c.price > 0, `${c.symbol} has no price`);
+    }
+  });
+
+  it('a long-tail quote is labelled delayed', async () => {
+    const dir = await P.geckoDirectory();
+    const coin = dir.coins[dir.coins.length - 1];
+    let q;
+    try {
+      q = await P.geckoQuotes([coin.cg]);
+    } catch (e) {
+      /*
+       * CoinGecko's keyless tier is a few calls a minute and the rest of this
+       * suite spends them. A refused request is their budget, not our bug — but
+       * say so out loud rather than letting it read as a pass.
+       */
+      if (/429|rate/i.test(e.message)) {
+        console.log(`    (skipped the live quote check: CoinGecko returned ${e.message})`);
+        return;
+      }
+      throw e;
+    }
+    const got = q.quotes[coin.cg];
+    ok(got && got.price > 0, `no price for ${coin.cg}`);
+    eq(got.quality, 'delayed');
+    eq(got.source, 'coingecko');
+  });
+
   it('health reports every provider budget', () => {
     const h = P.providerHealth();
     for (const k of ['nasdaq', 'coingecko', 'coinbase']) ok(h[k], `missing ${k}`);

@@ -83,6 +83,9 @@
       },
       watchlist: PT.defaultWatchlist.slice(),
       aiLog: [],
+      // Chart annotations, keyed by symbol. See views: they live in (time,
+      // price) so they survive timeframe changes.
+      drawings: {},
       settings: {
         slippageEnabled: true,
         shortingEnabled: true,
@@ -115,11 +118,19 @@
    * several limit buys that each pass on their own but cannot all be honoured,
    * and the losers would silently disappear when they later fail to fill.
    */
+  /** Statuses that still hold cash or shares: resting, or waiting for the bell. */
+  const LIVE_ORDER = new Set(['open', 'queued']);
+
   function committedCash(pf, exceptId) {
     let total = 0;
     for (const o of pf.orders) {
-      if (o.status !== 'open' || o.side !== 'buy' || o.id === exceptId) continue;
-      total += o.qty * o.limitPrice;
+      if (!LIVE_ORDER.has(o.status) || o.side !== 'buy' || o.id === exceptId) continue;
+      /*
+       * A queued market buy has no limit price to reserve against, so it holds
+       * what it was sized at. A dollar-sized one holds exactly its dollars,
+       * which is what it will actually spend at the open.
+       */
+      total += o.notional != null ? o.notional : o.qty * (o.limitPrice ?? o.refPrice ?? 0);
     }
     return total;
   }
@@ -128,7 +139,7 @@
   function committedQty(pf, assetId, exceptId) {
     let total = 0;
     for (const o of pf.orders) {
-      if (o.status !== 'open' || o.side !== 'sell') continue;
+      if (!LIVE_ORDER.has(o.status) || o.side !== 'sell') continue;
       if (o.assetId !== assetId || o.id === exceptId) continue;
       total += o.qty;
     }
@@ -211,7 +222,14 @@
       throw new OrderError(`No live price for ${assetId} yet — wait for the feed to connect.`);
     }
 
-    if (kind !== 'crypto' && !ctx.marketOpen) {
+    /*
+     * A closed equity session is no longer a rejection. The order is parked and
+     * released at the next open, which is what a real broker does with an order
+     * entered overnight. `allowQueue: false` opts out — the autonomous trader
+     * uses that, since its decisions are made against a price it can see now.
+     */
+    const queued = kind !== 'crypto' && !ctx.marketOpen;
+    if (queued && ctx.allowQueue === false) {
       throw new OrderError('US equities are closed. Crypto trades 24/7 — try BTC, ETH or DOGE.');
     }
 
@@ -274,9 +292,6 @@
             `You hold ${U.fmtQty(Math.max(0, held))} ${assetId}. Turn on short selling in Settings to sell more than you own.`,
           );
         }
-        if (kind !== 'crypto' && !ctx.marketOpen) {
-          throw new OrderError('US equities are closed, so shorts cannot be opened right now.');
-        }
 
         // Reg T: the new short's collateral must be covered by free cash plus
         // the proceeds the sale itself will generate.
@@ -304,7 +319,18 @@
       type,
       qty,
       limitPrice,
-      status: 'open',
+      status: queued ? 'queued' : 'open',
+      // What the order was sized against, so a queued buy can reserve the right
+      // amount of cash before there is a fill price to reserve against.
+      refPrice,
+      /*
+       * Dollar-sized orders keep their dollar amount. A queued "$500 of AAPL"
+       * re-derives its quantity from the opening price, so the user gets the
+       * $500 of stock they asked for rather than a rejection because the gap up
+       * made yesterday's share count unaffordable.
+       */
+      notional: req.notional != null && req.notional !== '' ? Number(req.notional) : null,
+      queuedAt: queued ? (ctx.now ?? Date.now()) : null,
       createdAt: ctx.now ?? Date.now(),
       note: req.note || null,
     };
@@ -412,6 +438,12 @@
     const order = buildOrder(pf, req, ctx);
     const ts = ctx.now ?? Date.now();
 
+    // Parked until the session opens — see buildOrder.
+    if (order.status === 'queued') {
+      pf.orders.push(order);
+      return { order, fill: null, queued: true };
+    }
+
     if (order.type === 'market') {
       const price = effectivePrice(order.assetId, order.side,
         ctx.prices[order.assetId].price, ctx.slippageEnabled);
@@ -455,13 +487,44 @@
     const rejected = [];
     const still = [];
 
+    const released = [];
+
     for (const order of pf.orders) {
-      if (order.status !== 'open') continue;
+      if (!LIVE_ORDER.has(order.status)) continue;
       // Equities only fill during regular hours.
       if (order.kind !== 'crypto' && !ctx.marketOpen) { still.push(order); continue; }
 
       const q = ctx.prices[order.assetId];
       if (!q || !isFinite(q.price)) { still.push(order); continue; }
+
+      /*
+       * The bell has rung on an order entered while the market was shut. Market
+       * orders go off at the opening print; limit orders simply join the book
+       * and are matched by the same crossing test as everything else.
+       */
+      if (order.status === 'queued') {
+        order.status = 'open';
+        order.releasedAt = ts;
+        released.push(order);
+
+        if (order.type === 'market') {
+          try {
+            // Dollar-sized orders buy their dollars, not yesterday's share count.
+            if (order.notional != null) {
+              const sized = roundQty(order.notional / q.price, order.kind);
+              if (sized > 0) order.qty = sized;
+            }
+            const price = effectivePrice(order.assetId, order.side, q.price, ctx.slippageEnabled);
+            fills.push(applyFill(pf, order, price, ts, 'Queued order filled at the open'));
+          } catch (e) {
+            order.status = 'rejected';
+            order.rejectedReason = e.message;
+            order.rejectedAt = ts;
+            rejected.push(order);
+          }
+          continue;
+        }
+      }
 
       if (!crosses(order, q.price)) { still.push(order); continue; }
 
@@ -481,6 +544,7 @@
       pf.rejected = (pf.rejected || []).concat(rejected).slice(-50);
     }
     fills.rejected = rejected;
+    fills.released = released;
     return fills;
   }
 
@@ -862,6 +926,7 @@
       }
       parsed.watchlist = parsed.watchlist || PT.defaultWatchlist.slice();
       parsed.aiLog = parsed.aiLog || [];
+      parsed.drawings = parsed.drawings || {};
       parsed.settings = Object.assign(newState(0).settings, parsed.settings || {});
       return parsed;
     } catch (e) {

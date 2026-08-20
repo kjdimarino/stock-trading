@@ -624,6 +624,72 @@ async function nasdaqCandles(symbol, tf) {
   return nasdaqIntradayCandles(symbol, tf);
 }
 
+/*
+ * Candles for long-tail coins. CoinGecko serves a price series, not OHLC, and
+ * its granularity is fixed by the window you ask for: five-minute samples for
+ * one day, hourly out to ninety, daily beyond that. So the finest honest bar
+ * here is five minutes — anything shorter is refused by name rather than faked
+ * by resampling a coarser series.
+ */
+const GECKO_TF = {
+  '5m': { days: 1, width: 300e3 },
+  '15m': { days: 1, width: 900e3 },
+  '1h': { days: 90, width: 3600e3 },
+  // The free tier refuses anything past 365 days, so a weekly chart is a year
+  // of dailies rolled up rather than the three years the other sources give.
+  '1D': { days: 365, width: 86400e3 },
+  '1W': { days: 365, width: 86400e3 },
+};
+
+async function geckoCandles(cgId, tf) {
+  const spec = GECKO_TF[tf];
+  if (!spec) {
+    throw new Error(
+      `CoinGecko samples this coin every 5 minutes, so ${tf} candles do not exist for it. `
+      + 'Try 5m or longer.',
+    );
+  }
+
+  await geckoLimiter.take();
+  const j = await getJSON(
+    `https://api.coingecko.com/api/v3/coins/${encodeURIComponent(cgId)}/market_chart`
+    + `?vs_currency=usd&days=${spec.days}`,
+    { timeout: 15000 },
+  );
+  const points = Array.isArray(j?.prices) ? j.prices : [];
+  if (!points.length) throw new Error(`CoinGecko has no price history for ${cgId}`);
+
+  const buckets = new Map();
+  for (const [t, price] of points) {
+    if (!isFinite(t) || !isFinite(price)) continue;
+    const key = Math.floor(t / spec.width) * spec.width;
+    const b = buckets.get(key);
+    if (!b) buckets.set(key, { t: key, o: price, h: price, l: price, c: price, v: 0, n: 1 });
+    else {
+      if (price > b.h) b.h = price;
+      if (price < b.l) b.l = price;
+      b.c = price;
+      b.n++;
+    }
+  }
+
+  let bars = [...buckets.values()].sort((a, b) => a.t - b.t);
+  // Same reasoning as the Nasdaq intraday path: a one-sample bucket has no body
+  // of its own, so it opens where the previous bar closed.
+  for (let i = 0; i < bars.length; i++) {
+    const b = bars[i];
+    if (b.n === 1 && bars[i - 1]) {
+      b.o = bars[i - 1].c;
+      b.h = Math.max(b.o, b.c);
+      b.l = Math.min(b.o, b.c);
+    }
+    delete b.n;
+  }
+  if (tf === '1W') bars = toWeekly(bars);
+  if (!bars.length) throw new Error(`CoinGecko history for ${cgId} produced no bars`);
+  return bars;
+}
+
 const CANDLE_TTL = { '1m': 20000, '5m': 60000, '15m': 120000, '1h': 300000, '1D': 900000, '1W': 1800000 };
 
 export function fetchCandles(assetId, tf, hint) {
@@ -631,7 +697,23 @@ export function fetchCandles(assetId, tf, hint) {
   const spec = YH_TF[tf];
   if (!spec) return Promise.reject(new Error(`unsupported timeframe ${tf}`));
 
+  /*
+   * Every curated coin carries a CoinGecko id already — it is what the market
+   * cap panel looks up — so the id alone must not decide the candle source, or
+   * BTC would quietly drop from real Coinbase OHLCV to a close-only snapshot.
+   * The gecko path is for coins with no Coinbase product at all.
+   */
+  const cgId = asset.cb ? null : (hint && hint.cg);
+
   return through(`k:${asset.id}:${tf}`, CANDLE_TTL[tf] ?? 60000, async () => {
+    if (cgId) {
+      return {
+        bars: await geckoCandles(cgId, tf),
+        source: 'coingecko', quality: 'delayed', tf, assetId,
+        closeOnly: true, volume: false,
+      };
+    }
+
     if (asset.kind === 'crypto') {
       try {
         const gran = CB_TF[tf];
@@ -667,6 +749,93 @@ export function fetchCandles(assetId, tf, hint) {
         note: `yahoo: ${yErr.message}`,
       };
     }
+  });
+}
+
+/* ------------------------------------------- the long tail of crypto ----- */
+
+/*
+ * Coinbase lists a few hundred coins and streams every trade on them. Beyond
+ * that there are thousands more with no free key-less real-time feed at all —
+ * CoinGecko is the honest source for those: a snapshot per request, minutes old
+ * rather than live, and rate limited hard enough that it cannot back a ticking
+ * watchlist. So they are a second tier: discoverable, priceable, tradable, and
+ * labelled `delayed` everywhere they appear so they are never mistaken for the
+ * live ones.
+ *
+ * Eight pages by descending market cap is about the top 2,000 coins, which
+ * covers anything with a real market while leaving out the tail of dead and
+ * duplicate tickers that makes a symbol search useless.
+ */
+const GECKO_PAGES = 8;
+
+export function geckoDirectory() {
+  return through('cg:dir', 1800000, async () => {
+    const coins = [];
+    let pages = 0;
+    for (let page = 1; page <= GECKO_PAGES; page++) {
+      try {
+        await geckoLimiter.take();
+        const rows = await getJSON(
+          'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc'
+          + `&per_page=250&page=${page}&sparkline=false&price_change_percentage=24h`,
+          { timeout: 15000 },
+        );
+        if (!Array.isArray(rows) || !rows.length) break;
+        for (const r of rows) {
+          if (!r.id || !r.symbol) continue;
+          coins.push({
+            cg: r.id,
+            symbol: String(r.symbol).toUpperCase(),
+            name: r.name || r.id,
+            price: r.current_price,
+            changePct: r.price_change_percentage_24h,
+            marketCap: r.market_cap,
+            volume: r.total_volume,
+            rank: r.market_cap_rank,
+          });
+        }
+        pages++;
+      } catch (e) {
+        // A partial directory is far more useful than none: the first pages
+        // hold the coins anyone is actually looking for.
+        if (!coins.length) throw e;
+        break;
+      }
+    }
+    return { coins, pages, source: 'coingecko', quality: 'delayed' };
+  });
+}
+
+/**
+ * Delayed snapshot quotes for coins that only CoinGecko carries. One request
+ * covers many ids, which matters: the free tier is a handful of calls a minute.
+ */
+export function geckoQuotes(ids) {
+  const list = [...new Set(ids.filter(Boolean))].sort();
+  if (!list.length) return Promise.resolve({ quotes: {}, source: 'coingecko', quality: 'delayed' });
+
+  return through(`cg:q:${list.join(',')}`, 45000, async () => {
+    await geckoLimiter.take();
+    const j = await getJSON(
+      'https://api.coingecko.com/api/v3/simple/price?ids=' + encodeURIComponent(list.join(','))
+      + '&vs_currencies=usd&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true',
+      { timeout: 15000 },
+    );
+    const quotes = {};
+    for (const id of list) {
+      const r = j[id];
+      if (!r || !isFinite(r.usd)) continue;
+      quotes[id] = {
+        price: r.usd,
+        changePct: isFinite(r.usd_24h_change) ? r.usd_24h_change : null,
+        marketCap: r.usd_market_cap ?? null,
+        volume: r.usd_24h_vol ?? null,
+        source: 'coingecko',
+        quality: 'delayed',
+      };
+    }
+    return { quotes, source: 'coingecko', quality: 'delayed' };
   });
 }
 
@@ -800,6 +969,40 @@ export function searchSymbols(query) {
           if (out.length >= 24) break;
         }
       } catch { /* ignore */ }
+    }
+
+    /*
+     * The long tail goes after Coinbase, never before it: if a coin can be
+     * streamed live, that is the one the user wants. A gecko-only match carries
+     * its `cg` id and a delayed flag so nothing downstream has to guess.
+     */
+    if (out.length < 24) {
+      try {
+        const dir = await geckoDirectory();
+        const exact = [], prefix = [], byName = [];
+        for (const c of dir.coins) {
+          if (c.symbol === upper) exact.push(c);
+          else if (c.symbol.startsWith(upper)) prefix.push(c);
+          else if (c.name.toLowerCase().includes(needle)) byName.push(c);
+        }
+        const ranked = (a, b) => (a.rank || 1e9) - (b.rank || 1e9);
+        exact.sort(ranked); prefix.sort(ranked); byName.sort(ranked);
+        for (const c of [...exact, ...prefix, ...byName]) {
+          push({
+            symbol: c.symbol,
+            name: c.name,
+            kind: 'crypto',
+            exchange: 'CoinGecko',
+            price: c.price,
+            changePct: c.changePct,
+            marketCap: c.marketCap,
+            tradable: true,
+            cg: c.cg,
+            delayed: true,
+          });
+          if (out.length >= 24) break;
+        }
+      } catch { /* the long tail is a bonus, not a dependency */ }
     }
 
     if (out.length < 6) {

@@ -44,7 +44,14 @@ const out = `/* AUTO-GENERATED from src/universe.mjs by tools/gen-universe.mjs â
       sector: a.sector || (a.kind === 'crypto' ? 'Crypto' : 'Equity'),
       exchange: a.exchange || null,
       yh: a.yh || (a.kind === 'crypto' ? id + '-USD' : id),
-      cb: a.cb || (a.kind === 'crypto' ? id + '-USD' : null),
+      /*
+       * A coin that only CoinGecko carries has no Coinbase product, so it must
+       * not be handed to the live socket or the REST ticker â€” both would 404 on
+       * it forever. \`cg\` marks it as the delayed tier instead.
+       */
+      cb: a.cg ? null : (a.cb || (a.kind === 'crypto' ? id + '-USD' : null)),
+      cg: a.cg || null,
+      delayed: a.delayed === true || !!a.cg,
       discovered: true,
     };
     PT.byId[id] = entry;
@@ -54,6 +61,8 @@ const out = `/* AUTO-GENERATED from src/universe.mjs by tools/gen-universe.mjs â
 
   PT.assetKind = function (id) { var a = PT.byId[id]; return a ? a.kind : 'stock'; };
   PT.isCrypto = function (id) { return PT.assetKind(id) === 'crypto'; };
+  /** A coin priced by CoinGecko snapshots rather than the live Coinbase feed. */
+  PT.isDelayedCoin = function (id) { var a = PT.byId[id]; return !!(a && a.cg); };
 })(window.PT);
 `;
 fs.writeFileSync(path.join(ROOT, 'src/app/js/02-universe.js'), out);

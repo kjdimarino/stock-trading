@@ -82,6 +82,16 @@
 
   /* ============================== PriceChart ============================== */
 
+  /*
+   * Bar widths, duplicated from the feed rather than imported: the chart is
+   * usable on its own (the tests drive it with hand-made bars) and should not
+   * need the whole data layer just to extrapolate past the last candle.
+   */
+  const TF_MS_LOCAL = {
+    '1s': 1e3, '5s': 5e3, '15s': 15e3,
+    '1m': 60e3, '5m': 300e3, '15m': 900e3, '1h': 3600e3, '1D': 86400e3, '1W': 604800e3,
+  };
+
   class PriceChart {
     constructor(container) {
       this.el = container;
@@ -93,6 +103,17 @@
       this.dpr = 1;
       this.raf = 0;
       this.onHover = null;
+
+      /*
+       * Drawings are stored in (time, price), never in pixels. That is the only
+       * way a trendline drawn on the 5m chart still touches the same two highs
+       * after switching to 1h, resizing the window, or letting fifty new bars
+       * arrive — all of which move every pixel on screen.
+       */
+      this.drawings = [];
+      this.drawTool = null;    // null | 'trend' | 'level' | 'free' | 'erase'
+      this.onDrawingsChange = null;
+      this._pending = null;    // the shape being dragged out right now
 
       this.base = document.createElement('canvas');
       this.over = document.createElement('canvas');
@@ -112,6 +133,11 @@
       container.addEventListener('touchmove', this._onMove, { passive: true });
       container.addEventListener('touchend', this._onLeave);
 
+      this._onDown = this._onDown.bind(this);
+      this._onDrag = this._onDrag.bind(this);
+      this._onUp = this._onUp.bind(this);
+      container.addEventListener('pointerdown', this._onDown);
+
       this.ro = new ResizeObserver(() => this.resize());
       this.ro.observe(container);
       this.resize();
@@ -121,6 +147,9 @@
       this.ro.disconnect();
       this.el.removeEventListener('mousemove', this._onMove);
       this.el.removeEventListener('mouseleave', this._onLeave);
+      this.el.removeEventListener('pointerdown', this._onDown);
+      window.removeEventListener('pointermove', this._onDrag);
+      window.removeEventListener('pointerup', this._onUp);
       cancelAnimationFrame(this.raf);
       this.base.remove();
       this.over.remove();
@@ -206,6 +235,75 @@
       return p.y1 - ((price - r.lo) / (r.hi - r.lo)) * p.height;
     }
 
+    /* --------------------------------------------------- drawing geometry */
+
+    /** Nominal bar width in milliseconds, for extrapolating past either end. */
+    _stepMs() {
+      const n = this.bars.length;
+      if (n >= 2) {
+        // The median of a few gaps, so one session boundary does not skew it.
+        const gaps = [];
+        for (let i = 1; i < n && gaps.length < 9; i++) gaps.push(this.bars[i].t - this.bars[i - 1].t);
+        gaps.sort((a, b) => a - b);
+        const mid = gaps[Math.floor(gaps.length / 2)];
+        if (mid > 0) return mid;
+      }
+      return TF_MS_LOCAL[this.tf] || 60e3;
+    }
+
+    /**
+     * Fractional bar index for a timestamp. Fractional so a drawing anchored
+     * between two bars does not snap, and extrapolated beyond either end so a
+     * line drawn at the right edge stays put as new bars push it left.
+     */
+    _fracIndexOfTime(t) {
+      const n = this.bars.length;
+      if (!n) return 0;
+      const step = this._stepMs();
+      if (t <= this.bars[0].t) return (t - this.bars[0].t) / step;
+      if (t >= this.bars[n - 1].t) return (n - 1) + (t - this.bars[n - 1].t) / step;
+      // Binary search for the bracketing pair.
+      let lo = 0, hi = n - 1;
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1;
+        if (this.bars[mid].t <= t) lo = mid; else hi = mid;
+      }
+      const span = this.bars[hi].t - this.bars[lo].t;
+      return span > 0 ? lo + (t - this.bars[lo].t) / span : lo;
+    }
+
+    _timeOfFracIndex(f) {
+      const n = this.bars.length;
+      if (!n) return Date.now();
+      const step = this._stepMs();
+      if (f <= 0) return this.bars[0].t + f * step;
+      if (f >= n - 1) return this.bars[n - 1].t + (f - (n - 1)) * step;
+      const lo = Math.floor(f);
+      const frac = f - lo;
+      return this.bars[lo].t + (this.bars[lo + 1].t - this.bars[lo].t) * frac;
+    }
+
+    _xOfTime(t, p) {
+      const bw = this._barWidth(p);
+      return p.x0 + this._fracIndexOfTime(t) * bw + bw / 2;
+    }
+
+    _timeAtX(x, p) {
+      const bw = this._barWidth(p);
+      if (bw <= 0) return Date.now();
+      return this._timeOfFracIndex((x - p.x0 - bw / 2) / bw);
+    }
+
+    _priceAtY(y, p, r) {
+      return r.lo + ((p.y1 - y) / p.height) * (r.hi - r.lo);
+    }
+
+    /** Pointer position in CSS pixels relative to the chart box. */
+    _localPoint(ev) {
+      const rect = this.el.getBoundingClientRect();
+      return { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
+    }
+
     _indexAt(clientX) {
       const p = this._plot();
       const rect = this.el.getBoundingClientRect();
@@ -234,6 +332,185 @@
       this.hover = null;
       this._drawOverlay();
       if (this.onHover) this.onHover(null, null);
+    }
+
+    /* ---------------------------------------------------------- drawings */
+
+    setDrawings(list) {
+      this.drawings = Array.isArray(list) ? list : [];
+      this._drawOverlay();
+    }
+
+    setDrawTool(tool) {
+      this.drawTool = tool || null;
+      this._pending = null;
+      // Freehand on a touch screen must not also scroll the page.
+      this.el.style.touchAction = this.drawTool ? 'none' : '';
+      this.el.classList.toggle('is-drawing', !!this.drawTool);
+      this._drawOverlay();
+    }
+
+    _emitDrawings() {
+      if (this.onDrawingsChange) this.onDrawingsChange(this.drawings);
+    }
+
+    undoDrawing() {
+      if (!this.drawings.length) return false;
+      this.drawings.pop();
+      this._emitDrawings();
+      this._drawOverlay();
+      return true;
+    }
+
+    clearDrawings() {
+      if (!this.drawings.length) return false;
+      this.drawings = [];
+      this._emitDrawings();
+      this._drawOverlay();
+      return true;
+    }
+
+    _onDown(ev) {
+      if (!this.drawTool || ev.button != null && ev.button !== 0) return;
+      if (!this.bars.length || !this._r) return;
+      const p = this._plot();
+      const { x, y } = this._localPoint(ev);
+      const t = this._timeAtX(x, p);
+      const price = this._priceAtY(y, p, this._r);
+
+      if (this.drawTool === 'erase') {
+        this._eraseAt(x, y, p);
+        return;
+      }
+
+      ev.preventDefault();
+      this._pending = this.drawTool === 'free'
+        ? { kind: 'free', pts: [{ t, price }] }
+        : { kind: this.drawTool, pts: [{ t, price }, { t, price }] };
+
+      window.addEventListener('pointermove', this._onDrag);
+      window.addEventListener('pointerup', this._onUp);
+      this._drawOverlay();
+    }
+
+    _onDrag(ev) {
+      if (!this._pending || !this._r) return;
+      const p = this._plot();
+      const { x, y } = this._localPoint(ev);
+      const pt = { t: this._timeAtX(x, p), price: this._priceAtY(y, p, this._r) };
+      if (this._pending.kind === 'free') {
+        const last = this._pending.pts[this._pending.pts.length - 1];
+        // Thin the stream: a point per pixel is thousands of points a second.
+        const dx = Math.abs(this._xOfTime(pt.t, p) - this._xOfTime(last.t, p));
+        const dy = Math.abs(this._yOf(pt.price, p, this._r) - this._yOf(last.price, p, this._r));
+        if (dx * dx + dy * dy >= 9) this._pending.pts.push(pt);
+      } else {
+        this._pending.pts[1] = pt;
+      }
+      this._drawOverlay();
+    }
+
+    _onUp() {
+      window.removeEventListener('pointermove', this._onDrag);
+      window.removeEventListener('pointerup', this._onUp);
+      const shape = this._pending;
+      this._pending = null;
+      if (!shape) return;
+
+      // A click that never moved is not a drawing — except a level, which is
+      // meant to be placed with a single click.
+      if (shape.kind === 'free' && shape.pts.length < 2) { this._drawOverlay(); return; }
+      if (shape.kind === 'trend') {
+        const p = this._plot();
+        const dx = this._xOfTime(shape.pts[1].t, p) - this._xOfTime(shape.pts[0].t, p);
+        const dy = this._yOf(shape.pts[1].price, p, this._r) - this._yOf(shape.pts[0].price, p, this._r);
+        if (dx * dx + dy * dy < 25) { this._drawOverlay(); return; }
+      }
+
+      this.drawings.push(shape);
+      this._emitDrawings();
+      this._drawOverlay();
+    }
+
+    /** Squared distance from a point to a segment, in pixels. */
+    static _distToSeg(px, py, ax, ay, bx, by) {
+      const vx = bx - ax, vy = by - ay;
+      const len = vx * vx + vy * vy;
+      const t = len > 0 ? U.clamp(((px - ax) * vx + (py - ay) * vy) / len, 0, 1) : 0;
+      const cx = ax + t * vx, cy = ay + t * vy;
+      return (px - cx) * (px - cx) + (py - cy) * (py - cy);
+    }
+
+    _eraseAt(x, y, p) {
+      const r = this._r;
+      const TOL = 10 * 10;
+      for (let i = this.drawings.length - 1; i >= 0; i--) {
+        const d = this.drawings[i];
+        let hit = false;
+        if (d.kind === 'level') {
+          hit = Math.abs(this._yOf(d.pts[0].price, p, r) - y) <= 10;
+        } else {
+          for (let k = 1; k < d.pts.length && !hit; k++) {
+            const ax = this._xOfTime(d.pts[k - 1].t, p), ay = this._yOf(d.pts[k - 1].price, p, r);
+            const bx = this._xOfTime(d.pts[k].t, p), by = this._yOf(d.pts[k].price, p, r);
+            hit = PriceChart._distToSeg(x, y, ax, ay, bx, by) <= TOL;
+          }
+        }
+        if (hit) {
+          this.drawings.splice(i, 1);
+          this._emitDrawings();
+          this._drawOverlay();
+          return true;
+        }
+      }
+      return false;
+    }
+
+    _paintDrawing(ctx, d, p, r, pending) {
+      const colour = cssVar('--accent', '#4c8dff');
+      ctx.save();
+      ctx.strokeStyle = colour;
+      ctx.lineWidth = pending ? 1.5 : 1.75;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      if (pending) ctx.globalAlpha = 0.75;
+
+      if (d.kind === 'level') {
+        const y = Math.round(this._yOf(d.pts[0].price, p, r)) + 0.5;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(p.x0, y);
+        ctx.lineTo(p.x1, y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // The level is only useful if you can read the price off it.
+        const v = d.pts[0].price;
+        const txt = fmtAxis(v, v < 1 ? 6 : v < 100 ? 3 : 2);
+        ctx.font = `600 10px ${cssVar('--font-sans', 'system-ui')}`;
+        const w = Math.min(ctx.measureText(txt).width + 12, this.pad.r - 5);
+        const ly = U.clamp(y - 8, p.y0, p.y1 - 16);
+        ctx.fillStyle = colour;
+        ctx.fillRect(p.x1 + 3, ly, w, 16);
+        ctx.fillStyle = cssVar('--accent-fg', '#04091a');
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(txt, p.x1 + 9, ly + 8);
+      } else {
+        ctx.beginPath();
+        for (let i = 0; i < d.pts.length; i++) {
+          const x = this._xOfTime(d.pts[i].t, p);
+          const y = this._yOf(d.pts[i].price, p, r);
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    _paintDrawings(ctx, p, r) {
+      for (const d of this.drawings) this._paintDrawing(ctx, d, p, r, false);
+      if (this._pending) this._paintDrawing(ctx, this._pending, p, r, true);
     }
 
     /* ------------------------------------------------------------- paint */
@@ -446,7 +723,12 @@
       const ctx = this.octx;
       if (!this.w || !this.h) return;
       ctx.clearRect(0, 0, this.w, this.h);
-      if (this.hover == null || !this.bars.length || !this._r) return;
+      if (!this.bars.length || !this._r) return;
+
+      // Drawings sit under the crosshair: the crosshair is transient, they are not.
+      this._paintDrawings(ctx, this._plot(), this._r);
+
+      if (this.hover == null) return;
 
       const c = this._colors();
       const p = this._plot();

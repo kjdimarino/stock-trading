@@ -34,9 +34,10 @@
       });
       for (const f of fills) {
         if (id === 'user') {
+          const atOpen = /at the open/.test(f.reason || '');
           UI.toast({
             kind: f.side,
-            title: `Limit filled: ${f.side} ${U.fmtQty(f.qty)} ${f.assetId}`,
+            title: `${atOpen ? 'Filled at the open' : 'Limit filled'}: ${f.side} ${U.fmtQty(f.qty)} ${f.assetId}`,
             message: `at ${U.fmtUSD(f.price)}` + (f.side === 'sell' ? ` · realized ${U.fmtSigned(f.realized)}` : ''),
           });
         }
@@ -191,6 +192,9 @@
         // The autonomous strategy stays long-only regardless of the user's
         // own setting: its rules were designed and tested without shorts.
         shortingEnabled: false,
+        // It decides against a price it can see, so it does not park orders
+        // for a bell that is hours away.
+        allowQueue: false,
       });
 
       for (const d of result.decisions) {

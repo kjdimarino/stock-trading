@@ -88,6 +88,11 @@
   border: 1px solid var(--neg-border); border-radius: var(--r-sm); padding: var(--sp-2);
   line-height: 1.45; animation: rise-in var(--d-fast) var(--ease-out);
 }
+/* Not a rejection — the order is accepted, it just fills later. */
+.order__err--note {
+  color: var(--warn); background: var(--warn-wash);
+  border-color: var(--warn-border);
+}
 .order__foot { padding: var(--sp-2-5) var(--gutter); border-top: 1px solid var(--border-subtle); }
 
 /* ============================== money bar ================================ */
@@ -274,3 +279,9 @@
 .mover__rank { font-size: var(--fs-3xs); color: var(--text-quaternary); width: 14px; font-variant-numeric: tabular-nums; }
 .mover__sym { font-size: var(--fs-xs); font-weight: var(--fw-semi); flex: 1; }
 .mover__chg { font-size: var(--fs-xs); font-weight: var(--fw-semi); font-variant-numeric: tabular-nums; }
+
+/* ------------------------------- drawing --------------------------------- */
+/* A chart armed for drawing gets a crosshair cursor and loses text selection,
+   so a dragged trendline never turns into a highlighted price label. */
+.chartwrap.is-drawing { cursor: crosshair; user-select: none; }
+.seg--draw { margin-left: var(--sp-1); }

@@ -557,6 +557,114 @@ try {
   check('returning to the trade view rebuilds a working chart',
     await page.evaluate(() => !!window.PT.app.S.chart && (window.PT.app.S.bars || []).length > 5));
 
+  /* ------------------------------------------------------------ drawings */
+  section('Chart drawing');
+
+  await page.evaluate(() => { window.PT.app.setView('trade'); window.PT.app.setFocus('BTC'); });
+  await page.waitForFunction(() => (window.PT.app.S.bars || []).length > 5, { timeout: 30000 });
+
+  await page.locator('button:text-is("Draw")').click();
+  check('the drawing toolbar opens', (await page.locator('.seg--draw .seg__item').count()) === 4);
+  check('a tool is armed straight away',
+    (await page.evaluate(() => window.PT.app.S.drawTool)) === 'trend');
+
+  const chartBox = await page.locator('.chartwrap').boundingBox();
+  const at = (fx, fy) => ({ x: chartBox.x + chartBox.width * fx, y: chartBox.y + chartBox.height * fy });
+
+  // Trendline: press, drag, release.
+  const from = at(0.25, 0.6), to = at(0.7, 0.3);
+  await page.mouse.move(from.x, from.y);
+  await page.mouse.down();
+  await page.mouse.move(to.x, to.y, { steps: 12 });
+  await page.mouse.up();
+
+  // Horizontal level: a single click is enough.
+  await page.locator('.seg--draw .seg__item:text-is("Level")').click();
+  const lvlPt = at(0.5, 0.45);
+  await page.mouse.move(lvlPt.x, lvlPt.y);
+  await page.mouse.down();
+  await page.mouse.up();
+
+  // Freehand.
+  await page.locator('.seg--draw .seg__item:text-is("Free")').click();
+  await page.mouse.move(at(0.3, 0.7).x, at(0.3, 0.7).y);
+  await page.mouse.down();
+  for (let i = 0; i < 10; i++) await page.mouse.move(at(0.3 + i * 0.03, 0.7 - i * 0.02).x, at(0.3 + i * 0.03, 0.7 - i * 0.02).y);
+  await page.mouse.up();
+  await page.waitForTimeout(300);
+
+  const drawn = await page.evaluate(() => {
+    const ch = window.PT.app.S.chart;
+    return {
+      kinds: ch.drawings.map((d) => d.kind),
+      anchored: ch.drawings.every((d) => d.pts.every((pt) => Number.isFinite(pt.t) && Number.isFinite(pt.price))),
+      stored: (window.PT.app.S.st.drawings.BTC || []).length,
+    };
+  });
+  check('all three tools produce a shape',
+    JSON.stringify(drawn.kinds) === JSON.stringify(['trend', 'level', 'free']), drawn.kinds.join(','));
+  check('shapes are anchored in time and price, not pixels', drawn.anchored);
+  check('drawings are stored against the symbol', drawn.stored === 3, String(drawn.stored));
+
+  /*
+   * Erase, while every shape is still on screen. A level drawn at one
+   * timeframe's price can sit outside another's range — which is correct, the
+   * axis follows the candles, not the annotations — so this has to run before
+   * the timeframe switch below.
+   */
+  await page.locator('.seg--draw .seg__item:text-is("Erase")').click();
+  const lvlNow = await page.evaluate(() => {
+    const ch = window.PT.app.S.chart;
+    const d = ch.drawings.find((x) => x.kind === 'level');
+    const p = ch._plot();
+    return { x: (p.x0 + p.x1) / 2, y: ch._yOf(d.pts[0].price, p, ch._r) };
+  });
+  await page.mouse.move(chartBox.x + lvlNow.x, chartBox.y + lvlNow.y);
+  await page.mouse.down();
+  await page.mouse.up();
+  await page.waitForTimeout(250);
+  const erased = await page.evaluate(() => window.PT.app.S.chart.drawings.map((d) => d.kind));
+  check('erase removes the shape under the pointer and leaves the rest',
+    JSON.stringify(erased) === JSON.stringify(['trend', 'free']), erased.join(','));
+
+  await page.locator('button:text-is("Undo")').click();
+  check('undo drops the most recent drawing',
+    (await page.evaluate(() => window.PT.app.S.chart.drawings.length)) === 1);
+  await page.locator('.seg--draw .seg__item:text-is("Trend")').click();
+
+  /*
+   * The point of anchoring: switching timeframe must move the drawing on screen
+   * while leaving what it is attached to alone.
+   */
+  const geom = () => page.evaluate(() => {
+    const ch = window.PT.app.S.chart;
+    const d = ch.drawings.find((x) => x.kind === 'trend');
+    const p = ch._plot();
+    return {
+      pts: d.pts,
+      px: d.pts.map((q) => [Math.round(ch._xOfTime(q.t, p)), Math.round(ch._yOf(q.price, p, ch._r))]),
+    };
+  });
+  const beforeTf = await geom();
+  await page.locator('.seg__item:text-is("1h")').first().click();
+  await page.waitForTimeout(3000);
+  const afterTf = await geom();
+  check('a trendline keeps its anchors across a timeframe change',
+    JSON.stringify(beforeTf.pts) === JSON.stringify(afterTf.pts));
+  check('and lands on different pixels, because the axes changed',
+    JSON.stringify(beforeTf.px) !== JSON.stringify(afterTf.px),
+    `${JSON.stringify(beforeTf.px)} -> ${JSON.stringify(afterTf.px)}`);
+
+  await page.locator('button:text-is("Clear")').click();
+  check('clear empties the chart',
+    (await page.evaluate(() => window.PT.app.S.chart.drawings.length)) === 0);
+  check('and clearing empties the stored copy too',
+    (await page.evaluate(() => (window.PT.app.S.st.drawings.BTC || []).length)) === 0);
+
+  await page.locator('button:text-is("Draw")').click();
+  check('leaving draw mode disarms the tool',
+    (await page.evaluate(() => window.PT.app.S.drawTool)) === null);
+
   /* ---------------------------------------------------------- responsive */
   section('Responsive layout');
   await page.setViewportSize({ width: 900, height: 800 });

@@ -32,9 +32,9 @@ describe('order validation', () => {
     throws(() => E.submitOrder(fresh(), { assetId: 'AAPL', side: 'sell', type: 'market', qty: 1 },
       ctx(px({ AAPL: 100 }))), 'Turn on short selling');
   });
-  it('rejects stock orders while the market is closed', () => {
+  it('rejects stock orders while the market is closed only when queueing is off', () => {
     throws(() => E.submitOrder(fresh(), { assetId: 'AAPL', side: 'buy', type: 'market', qty: 1 },
-      ctx(px({ AAPL: 100 }), { marketOpen: false })), 'US equities are closed');
+      { ...ctx(px({ AAPL: 100 }), { marketOpen: false }), allowQueue: false }), 'US equities are closed');
   });
   it('allows crypto orders while equities are closed', () => {
     const pf = fresh();
@@ -204,6 +204,82 @@ describe('limit orders', () => {
     E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'limit', qty: 10, limitPrice: 90 }, ctx(px({ AAPL: 100 })));
     eq(E.processOpenOrders(pf, ctx(px({ AAPL: 80 }), { marketOpen: false })).length, 0);
     eq(pf.orders.length, 1);
+  });
+
+  it('an equity order placed while shut is queued, not rejected', () => {
+    const pf = fresh(10000);
+    const r = E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 },
+      ctx(px({ AAPL: 100 }), { marketOpen: false }));
+    eq(r.fill, null, 'nothing fills while the market is shut');
+    eq(r.queued, true);
+    eq(pf.orders.length, 1);
+    eq(pf.orders[0].status, 'queued');
+    eq(pf.cash, 10000, 'cash is held, not spent');
+  });
+
+  it('a queued market order fills at the opening price', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 },
+      ctx(px({ AAPL: 100 }), { marketOpen: false }));
+    const fills = E.processOpenOrders(pf, ctx(px({ AAPL: 104 })));
+    eq(fills.length, 1);
+    near(fills[0].price, 104, 1e-9, 'fills at the open, not at the previous close');
+    eq(pf.orders.length, 0);
+    eq(pf.positions.AAPL.qty, 10);
+  });
+
+  it('a queued order stays put until the bell', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 },
+      ctx(px({ AAPL: 100 }), { marketOpen: false }));
+    eq(E.processOpenOrders(pf, ctx(px({ AAPL: 104 }), { marketOpen: false })).length, 0);
+    eq(pf.orders[0].status, 'queued', 'still waiting');
+  });
+
+  it('a queued buy reserves its cash so it cannot be spent twice', () => {
+    const pf = fresh(1000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 9 },
+      ctx(px({ AAPL: 100 }), { marketOpen: false }));
+    const free = E.availableCash(pf, px({ AAPL: 100 }));
+    ok(free < 200, `expected the queued order to hold ~$900, free was ${free}`);
+    throws(() => E.submitOrder(pf, { assetId: 'BTC', side: 'buy', type: 'market', notional: 500 },
+      ctx(px({ AAPL: 100, BTC: 50000 }), { marketOpen: false })), 'Not enough');
+  });
+
+  it('a dollar-sized queued buy buys its dollars at the open, not a stale share count', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', notional: 500 },
+      ctx(px({ AAPL: 100 }), { marketOpen: false }));
+    // Gap up overnight: the same share count would now cost more than was reserved.
+    const fills = E.processOpenOrders(pf, ctx(px({ AAPL: 125 })));
+    eq(fills.length, 1);
+    near(fills[0].notional, 500, 1, 'spends the dollars that were reserved');
+    near(pf.positions.AAPL.qty, 4, 1e-6);
+  });
+
+  it('a queued sell holds the shares it will deliver', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 }, ctx(px({ AAPL: 100 })));
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 10 },
+      ctx(px({ AAPL: 100 }), { marketOpen: false }));
+    eq(E.availableQty(pf, 'AAPL'), 0, 'the shares are spoken for');
+  });
+
+  it('a queued order can be cancelled and gives its cash back', () => {
+    const pf = fresh(1000);
+    const r = E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 9 },
+      ctx(px({ AAPL: 100 }), { marketOpen: false }));
+    eq(E.cancelOrder(pf, r.order.id), true);
+    near(E.availableCash(pf, px({ AAPL: 100 })), 1000, 1e-9);
+  });
+
+  it('a queued limit joins the book at the open rather than filling blind', () => {
+    const pf = fresh(10000);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'limit', qty: 10, limitPrice: 90 },
+      ctx(px({ AAPL: 100 }), { marketOpen: false }));
+    eq(E.processOpenOrders(pf, ctx(px({ AAPL: 95 }))).length, 0, 'the open is above the limit');
+    eq(pf.orders[0].status, 'open', 'released, now resting');
+    eq(E.processOpenOrders(pf, ctx(px({ AAPL: 89 }))).length, 1, 'fills when the price comes to it');
   });
 
   it('resting crypto orders fill around the clock', () => {

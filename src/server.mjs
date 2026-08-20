@@ -14,7 +14,7 @@ import http from 'node:http';
 import { STOCKS, ETFS, CRYPTO, ASSETS, BY_ID } from './universe.mjs';
 import {
   stockQuotes, cryptoQuotes, fetchCandles, searchSymbols, cryptoMarkets, cryptoProducts,
-  stockDirectory, tradeIdeas, providerHealth,
+  stockDirectory, tradeIdeas, providerHealth, geckoQuotes, geckoDirectory,
 } from './providers.mjs';
 import { postJSON } from './http.mjs';
 
@@ -74,15 +74,34 @@ export function createServer(getHTML) {
       if (p === '/api/quotes') {
         const stocks = splitList(qs.get('stocks'));
         const crypto = splitList(qs.get('crypto'));
+        /*
+         * Coins only CoinGecko carries. Sent as SYMBOL:coingecko-id pairs so the
+         * reply can be keyed by the symbol the client trades under, without the
+         * server having to hold a symbol table for 18,000 coins.
+         */
+        const geckoPairs = splitList(qs.get('gecko'))
+          .map((pair) => pair.split(':'))
+          .filter(([sym, cgId]) => sym && cgId);
         const ttl = Math.max(1000, Math.min(120000, Number(qs.get('ttl')) || 5000));
 
-        const [s, c] = await Promise.all([
+        const [s, c, g] = await Promise.all([
           stocks.length ? stockQuotes(stocks, ttl) : { quotes: {}, errors: {} },
           crypto.length ? cryptoQuotes(crypto, ttl) : { quotes: {}, errors: {} },
+          geckoPairs.length
+            ? geckoQuotes(geckoPairs.map(([, cgId]) => cgId)).catch((e) => ({ quotes: {}, error: e.message }))
+            : { quotes: {} },
         ]);
+
+        const geckoBySymbol = {};
+        const geckoErrors = {};
+        for (const [sym, cgId] of geckoPairs) {
+          if (g.quotes[cgId]) geckoBySymbol[sym] = g.quotes[cgId];
+          else geckoErrors[sym] = g.error || 'no CoinGecko price for this coin';
+        }
+
         return sendJSON(res, 200, {
-          quotes: { ...s.quotes, ...c.quotes },
-          errors: { ...s.errors, ...c.errors },
+          quotes: { ...s.quotes, ...c.quotes, ...geckoBySymbol },
+          errors: { ...s.errors, ...c.errors, ...geckoErrors },
           t: Date.now(),
         });
       }
@@ -93,7 +112,7 @@ export function createServer(getHTML) {
         const tf = qs.get('tf') || '5m';
         if (!asset) return sendJSON(res, 400, { error: 'asset is required' });
         try {
-          const hint = { kind: qs.get('kind'), yh: qs.get('yh') };
+          const hint = { kind: qs.get('kind'), yh: qs.get('yh'), cg: qs.get('cg') };
           return sendJSON(res, 200, await fetchCandles(asset, tf, hint));
         } catch (e) {
           return sendJSON(res, 502, { error: e.message, asset, tf });
@@ -228,6 +247,13 @@ export function start(getHTML, { port = PORT, host = HOST } = {}) {
      * instant instead of appearing to find nothing.
      */
     stockDirectory().catch(() => { /* search falls back to other sources */ });
+
+    /*
+     * Same for the coin directory. It is eight rate-limited requests, so warming
+     * it at start-up is the difference between a search that finds the long tail
+     * and one that times out waiting for the budget.
+     */
+    geckoDirectory().catch(() => { /* Coinbase coins still search fine */ });
 
     server.listen(port, host, () => {
       const url = `http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`;
