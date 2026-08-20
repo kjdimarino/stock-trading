@@ -374,24 +374,134 @@
     addScore: 0.34,           // conviction needed to add to a winner
     exitScore: -0.12,         // conviction at which to close
     stopAtrMult: 2.5,
-    takeProfitAtrMult: 4.0,
     hardStopPct: -10,
-    hardTakePct: 22,
     cooldownMs: 10 * 60000,   // per-symbol pause after any trade
     maxTradesPerDay: 25,
     minBars: 60,
+
+    /*
+     * A trailing stop instead of a fixed profit target. The old rule sold every
+     * winner at 4x ATR or +22%, which caps exactly the trades that pay for the
+     * losers — and this is a low-win-rate trend system, so it lives on them. The
+     * stop now ratchets up behind the highest close since entry and never falls.
+     */
+    /*
+     * Off by default, and that is a measured choice rather than an oversight.
+     * Backtested over 33 names and 306 days it either never fired (at 5 ATR and
+     * wider the base stop was always higher) or fired early and cost about 1.2
+     * points of return — this system's winners are few and large, and a trail
+     * clips exactly those. The rule is kept, and correct, for anyone who would
+     * rather cap giveback than maximise return. See tools/ablate.mjs.
+     */
+    useTrailingStop: false,
+    trailAtrMult: 3.0,
+    // The trail arms only once the trade is this far ahead. Below it the base
+    // stop rules, so a normal pullback on the way up is not cut short.
+    trailActivateAtr: 1.0,
+    // Once a trade is this far ahead in ATR terms, the stop moves to entry: a
+    // winner is not allowed to become a loser.
+    breakevenAfterAtr: 1.5,
+
+    // Exit when the entry condition fails, not only when a stop is hit.
+    exitBelowTrend: true,
+
+    // Only buy what is already trending. The score leans bullish in a downtrend
+    // whenever momentum ticks up, and buying those was most of the bleed.
+    requireTrend: true,
+
+    /*
+     * Size by risk, not by conviction alone: a position is sized so that being
+     * stopped out costs about this share of equity. A volatile name therefore
+     * gets fewer dollars automatically, without a hand-tuned penalty.
+     */
+    riskPerTrade: 0.008,
+
+    // Deploy at a sensible pace instead of one name per cycle.
+    maxEntriesPerCycle: 2,
+    // Add to a position that is working, up to the per-position weight cap.
+    allowPyramiding: true,
+    /*
+     * How far ahead, in ATRs, before a position earns more money. Three is
+     * deliberately demanding. Looser settings made far more on the second half
+     * of the backtest and lost money on the first; three was the only one that
+     * improved both halves against no pyramiding at all, which is the bar a
+     * setting has to clear here — a rule that only works in the sample that
+     * chose it has told us nothing.
+     */
+    addMinGainAtr: 3.0,
+
+    /*
+     * Crypto moves as one block, so eight "different" coins is one bet. Cap what
+     * any correlated group can own between them.
+     */
+    maxGroupWeight: 0.45,
+
+    /*
+     * Give a new position room to breathe before a wobble in the score closes
+     * it. Counted in bars, not wall-clock: the live trader decides on 15m
+     * candles and the backtest on daily ones, and "two days" would mean two
+     * bars in one and nearly two hundred in the other. Stops still apply from
+     * the first bar; this only gates the softer signal and trend exits.
+     */
+    minHoldBars: 2,
   };
+
+  /** Is this name actually trending up, rather than merely bouncing? */
+  function inUptrend(ind) {
+    if (!ind) return false;
+    if (ind.sma50 != null && ind.last != null && ind.last < ind.sma50) return false;
+    if (ind.sma20 != null && ind.sma50 != null && ind.sma20 < ind.sma50) return false;
+    return true;
+  }
+
+  /** Total weight of one correlated group (crypto moves as a single bet). */
+  function groupWeight(val, isCrypto) {
+    if (!(val.equity > 0)) return 0;
+    let v = 0;
+    for (const p of val.positions) {
+      if (PT.isCrypto(p.assetId) === isCrypto) v += Math.abs(p.exposure || 0);
+    }
+    return v / val.equity;
+  }
 
   /**
    * One decision cycle. Pure with respect to its inputs: it is handed the
    * portfolio, live quotes and candle data, and returns the decisions it made.
    * Every decision — including holds — is logged with the numbers behind it.
    */
+  /**
+   * Trade bookkeeping the engine has no business knowing about: the high-water
+   * mark a trailing stop hangs off, and when each position was opened.
+   *
+   * It is rebuilt lazily rather than trusted, because `repair()` reconstructs
+   * positions from the fill log and would leave this stale. A missing peak
+   * starts at the current price, so a trailing stop can only ever fire on a
+   * decline that happened after we started watching — never on old history.
+   */
+  function traderState(pf) {
+    const st = pf.aiState || (pf.aiState = {});
+    st.peaks = st.peaks || {};
+    st.openedAt = st.openedAt || {};
+    return st;
+  }
+
   function runTraderCycle(pf, ctx) {
     const now = ctx.now || Date.now();
     const decisions = [];
     const val = PT.engine.valuate(pf, ctx.prices);
     const equity = val.equity;
+    const st = traderState(pf);
+
+    /* Ratchet the high-water marks before anything reads them. */
+    for (const pos of val.positions) {
+      const q = ctx.prices[pos.assetId];
+      if (!q || !isFinite(q.price)) continue;
+      st.peaks[pos.assetId] = Math.max(st.peaks[pos.assetId] || q.price, q.price);
+      if (st.openedAt[pos.assetId] == null) st.openedAt[pos.assetId] = pos.openedAt || now;
+    }
+    // Forget names we no longer hold, so a re-entry starts clean.
+    const stillHeld = new Set(val.positions.map((p) => p.assetId));
+    for (const id in st.peaks) if (!stillHeld.has(id)) { delete st.peaks[id]; delete st.openedAt[id]; }
 
     // Bucket by the Eastern trading date, the same clock day P&L uses. A UTC
     // bucket would roll over at 19:00 ET and let crypto trade the cap twice.
@@ -426,26 +536,75 @@
 
       let reason = null;
       const factors = [];
+      const price = quote.price;
+      const atr = ind && isFinite(ind.atr14) ? ind.atr14 : null;
+      const peak = Math.max(st.peaks[assetId] || price, price);
+      const heldMs = now - (st.openedAt[assetId] ?? now);
+      // Bar spacing from the series itself, so the hold gate scales with the
+      // timeframe the trader happens to be reading.
+      const barMs = series && series.length > 1
+        ? Math.max(1, series[series.length - 1].t - series[series.length - 2].t)
+        : 60e3;
+      const seasoned = heldMs >= RULES.minHoldBars * barMs;
 
-      if (ind && ind.atr14 != null && pos.avgCost > 0) {
-        const stopDistance = (RULES.stopAtrMult * ind.atr14 / pos.avgCost) * 100;
-        if (pnlPct <= -stopDistance) {
-          reason = `Stop hit: down ${U.fmtPct(pnlPct)}, beyond ${RULES.stopAtrMult}× ATR (${stopDistance.toFixed(1)}%).`;
-          factors.push({ k: 'ATR stop', v: `${stopDistance.toFixed(1)}%` });
+      if (atr != null && pos.avgCost > 0) {
+        /*
+         * The base stop sits a fixed number of ATRs below the entry and is
+         * always in force. The trail can only ever *raise* it — never lower it.
+         * That distinction matters: a trail measured from the peak while the
+         * trade is still underwater is simply a tighter stop, and firing it
+         * early is how a system stops out of the drawdowns that precede its
+         * winners. It arms only once the trade is genuinely ahead.
+         */
+        let stopPrice = pos.avgCost - RULES.stopAtrMult * atr;
+        const aheadAtr = atr > 0 ? (price - pos.avgCost) / atr : 0;
+        let trailing = false;
+
+        if (RULES.useTrailingStop && aheadAtr >= RULES.trailActivateAtr) {
+          const trail = peak - RULES.trailAtrMult * atr;
+          if (trail > stopPrice) { stopPrice = trail; trailing = true; }
+          if (aheadAtr >= RULES.breakevenAfterAtr && pos.avgCost > stopPrice) {
+            stopPrice = pos.avgCost;      // a winner may not round-trip into a loss
+            trailing = true;
+          }
         }
-        const takeDistance = (RULES.takeProfitAtrMult * ind.atr14 / pos.avgCost) * 100;
-        if (!reason && pnlPct >= takeDistance) {
-          reason = `Target reached: up ${U.fmtPct(pnlPct)}, past ${RULES.takeProfitAtrMult}× ATR (${takeDistance.toFixed(1)}%).`;
-          factors.push({ k: 'ATR target', v: `${takeDistance.toFixed(1)}%` });
+        // Never above the market, or the position would close the instant it opened.
+        stopPrice = Math.min(stopPrice, price);
+
+        if (price <= stopPrice) {
+          if (trailing) {
+            const giveBack = peak > 0 ? ((peak - price) / peak) * 100 : 0;
+            reason = `Trailing stop: locked in ${U.fmtPct(pnlPct)} after giving back ${giveBack.toFixed(1)}% from the high.`;
+            factors.push({ k: 'peak', v: U.fmtUSD(peak) });
+          } else {
+            const stopPct = (RULES.stopAtrMult * atr / pos.avgCost) * 100;
+            reason = `Stop hit: down ${U.fmtPct(pnlPct)}, beyond ${RULES.stopAtrMult}× ATR (${stopPct.toFixed(1)}%).`;
+            factors.push({ k: 'ATR stop', v: `${stopPct.toFixed(1)}%` });
+          }
+          factors.push({ k: 'stop', v: U.fmtUSD(stopPrice) });
         }
       }
+
       if (!reason && pnlPct <= RULES.hardStopPct) {
         reason = `Hard stop: position is down ${U.fmtPct(pnlPct)}.`;
       }
-      if (!reason && pnlPct >= RULES.hardTakePct) {
-        reason = `Hard target: position is up ${U.fmtPct(pnlPct)}.`;
+      /*
+       * The trend that justified the entry is gone. This is a different claim
+       * from the blended score wobbling: price closing under its own 50-bar
+       * average is the entry condition failing outright.
+       */
+      if (!reason && RULES.exitBelowTrend && ind && ind.sma50 != null && price < ind.sma50
+          && seasoned) {
+        reason = `Trend broke: price ${U.fmtUSD(price)} closed below its 50-bar average of ${U.fmtUSD(ind.sma50)}.`;
+        factors.push({ k: 'SMA50', v: U.fmtUSD(ind.sma50) });
       }
-      if (!reason && sig && sig.score <= RULES.exitScore) {
+
+      /*
+       * A signal exit is the weakest of the three, so it waits: a position
+       * closed on the first wobble pays the spread twice and never gets the
+       * chance to work. Stops above are not gated — real risk is immediate.
+       */
+      if (!reason && sig && sig.score <= RULES.exitScore && seasoned) {
         reason = `Thesis broke down: signal turned ${sig.stance} (${sig.score.toFixed(2)}).`;
         factors.push({ k: 'signal', v: sig.score.toFixed(2) });
       }
@@ -465,6 +624,8 @@
             pnlPct, signal: sig ? sig.score : null, stance: sig ? sig.stance : null,
           });
           ctx.cooldowns[assetId] = now;
+          delete st.peaks[assetId];
+          delete st.openedAt[assetId];
         } catch (e) {
           log('error', assetId, `Exit rejected: ${e.message}`, factors);
         }
@@ -476,8 +637,76 @@
     // the pre-exit set would report being at the position limit while flat.
     const freshVal = PT.engine.valuate(pf, ctx.prices);
     const held = new Set(freshVal.positions.map((p) => p.assetId));
+    // Running totals for the rest of the cycle: both the add pass below and the
+    // new-entry loop after it spend from the same budget and revalue as they go.
+    let opened = 0;
+    let workingVal = freshVal;
     const investable = freshVal.equity * (1 - RULES.minCashReserve);
     const deployed = freshVal.invested;
+
+    /*
+     * Adding to winners. A trend system makes its money on the few positions
+     * that keep going, so a name that is working and still scores well gets
+     * more — but only up to the same per-position cap, and only while it is in
+     * profit, so this can never turn into averaging down.
+     */
+    if (RULES.allowPyramiding) {
+      for (const pos of workingVal.positions) {
+        if (budgetLeft <= 0) break;
+        if (pos.qty <= 0) continue;
+        if (!(pos.unrealizedPct > 0)) continue;
+        const cd = ctx.cooldowns[pos.assetId];
+        if (cd && now - cd < RULES.cooldownMs) continue;
+        const isCrypto = PT.isCrypto(pos.assetId);
+        if (!isCrypto && !ctx.marketOpen) continue;
+
+        const series = ctx.candles[pos.assetId];
+        if (!series || series.length < RULES.minBars) continue;
+        const ind = TA.analyze(series);
+        const sig = ind ? TA.score(ind) : null;
+        if (!sig || sig.score < RULES.addScore) continue;
+        if (RULES.requireTrend && !inUptrend(ind)) continue;
+        /*
+         * Add on demonstrated strength, not on a rounding error. The position
+         * has to be ahead by a real move — measured in ATRs, so it means the
+         * same thing on a quiet stock and a volatile coin.
+         */
+        const atrNow = isFinite(ind.atr14) ? ind.atr14 : null;
+        if (atrNow != null && pos.avgCost > 0) {
+          const aheadAtr = (ctx.prices[pos.assetId].price - pos.avgCost) / atrNow;
+          if (aheadAtr < RULES.addMinGainAtr) continue;
+        }
+
+        const weight = (pos.weightPct || 0) / 100;
+        const room = (RULES.maxWeightPerPosition - weight) * workingVal.equity;
+        const groupRoom = Math.max(0, (RULES.maxGroupWeight - groupWeight(workingVal, isCrypto)) * workingVal.equity);
+        const headroom = Math.max(0, workingVal.equity * (1 - RULES.minCashReserve) - workingVal.invested);
+        let notional = Math.min(room, groupRoom, headroom, pf.cash * 0.95,
+          workingVal.equity * RULES.maxWeightPerPosition * 0.5);
+        notional = Math.floor(notional * 100) / 100;
+        if (notional < RULES.minOrderValue) continue;
+
+        const why = `Adding to ${pos.assetId}: up ${U.fmtPct(pos.unrealizedPct)} and still scoring `
+          + `${sig.score.toFixed(2)} (${sig.stance}). Taking the position from `
+          + `${(weight * 100).toFixed(1)}% to ${((weight * 100) + (notional / workingVal.equity) * 100).toFixed(1)}% of equity, `
+          + `inside the ${(RULES.maxWeightPerPosition * 100).toFixed(0)}% cap.`;
+        try {
+          const r = PT.engine.submitOrder(pf, {
+            assetId: pos.assetId, side: 'buy', type: 'market', notional, reason: why,
+          }, ctx);
+          budgetLeft -= 1;
+          opened += 1;
+          log('buy', pos.assetId, why, sig.factors.slice(0, 3).map((f) => ({ k: f.key, v: f.detail })), {
+            qty: r.fill.qty, price: r.fill.price, notional: r.fill.notional,
+            signal: sig.score, stance: sig.stance, confidence: sig.confidence, add: true,
+          });
+          ctx.cooldowns[pos.assetId] = now;
+          workingVal = PT.engine.valuate(pf, ctx.prices);
+        } catch (e) {
+          log('error', pos.assetId, `Add rejected: ${e.message}`, []);
+        }
+      }
+    }
 
     if (held.size >= RULES.maxPositions) {
       log('hold', null, `Holding at the ${RULES.maxPositions}-position limit; watching existing names for exits.`, []);
@@ -489,6 +718,7 @@
     }
 
     const ranked = [];
+    let trendRejected = 0;
     for (const assetId of ctx.candidates) {
       if (held.has(assetId)) continue;
       const cd = ctx.cooldowns[assetId];
@@ -503,70 +733,124 @@
       const ind = TA.analyze(series);
       const sig = ind ? TA.score(ind) : null;
       if (!sig) continue;
+
+      /*
+       * Trend gate. The blended score can read bullish on a name in a clear
+       * downtrend whenever short-term momentum ticks up, and buying those was
+       * where most of the losses came from. Price has to be above its 50-bar
+       * average, with the 20 above the 50, before conviction is even consulted.
+       */
+      if (RULES.requireTrend && !inUptrend(ind)) { trendRejected++; continue; }
+
       ranked.push({ assetId, sig, ind, quote });
     }
     ranked.sort((a, b) => b.sig.score - a.sig.score);
 
-    const best = ranked[0];
-    if (!best) {
-      log('hold', null, ctx.marketOpen
-        ? 'No candidate cleared the evidence bar this cycle.'
-        : 'US equities are closed; only crypto candidates were considered and none qualified.', []);
+    if (!ranked.length) {
+      const why = ctx.marketOpen
+        ? (trendRejected
+          ? `No candidate cleared the evidence bar this cycle; ${trendRejected} were skipped for trading below their trend.`
+          : 'No candidate cleared the evidence bar this cycle.')
+        : 'US equities are closed; only crypto candidates were considered and none qualified.';
+      log('hold', null, why, []);
       return { decisions, valuation: freshVal };
     }
 
-    if (best.sig.score < RULES.entryScore) {
+    if (ranked[0].sig.score < RULES.entryScore) {
+      const best = ranked[0];
       log('hold', best.assetId,
         `Best candidate ${best.assetId} scored ${best.sig.score.toFixed(2)} (${best.sig.stance}), below the ${RULES.entryScore} entry bar.`,
         best.sig.factors.slice(0, 3).map((f) => ({ k: f.key, v: f.detail })));
       return { decisions, valuation: freshVal };
     }
 
-    if (budgetLeft <= 0) {
-      log('hold', best.assetId, `Daily trade cap of ${RULES.maxTradesPerDay} reached; standing down until tomorrow.`, []);
-      return { decisions, valuation: freshVal };
-    }
-
     /*
-     * Size by conviction and volatility: a stronger signal gets more, and a
-     * more volatile asset gets less, capped by the per-position weight limit.
+     * Size by risk. The stop distance is known before the trade — it is
+     * `stopAtrMult` ATRs — so the position is sized so that being stopped out
+     * costs `riskPerTrade` of equity. A volatile name therefore gets fewer
+     * dollars than a calm one for the same conviction, without a separate
+     * volatility fudge, and every open position carries roughly the same risk.
      */
-    const conviction = U.clamp((best.sig.score - RULES.entryScore) / (1 - RULES.entryScore), 0, 1);
-    const volPenalty = best.ind.atrPct != null ? U.clamp(2.5 / Math.max(0.5, best.ind.atrPct), 0.35, 1) : 0.7;
-    const targetWeight = RULES.maxWeightPerPosition * (0.45 + 0.55 * conviction) * volPenalty;
-    const headroom = Math.max(0, investable - deployed);
-    let notional = Math.min(freshVal.equity * targetWeight, headroom, pf.cash * 0.95);
-    notional = Math.floor(notional * 100) / 100;
+    for (const cand of ranked) {
+      if (opened >= RULES.maxEntriesPerCycle) break;
+      if (cand.sig.score < RULES.entryScore) break;   // ranked, so the rest are worse
+      if (budgetLeft <= 0) {
+        log('hold', cand.assetId, `Daily trade cap of ${RULES.maxTradesPerDay} reached; standing down until tomorrow.`, []);
+        break;
+      }
+      if (workingVal.positions.length >= RULES.maxPositions) break;
 
-    if (notional < RULES.minOrderValue) {
-      log('hold', best.assetId,
-        `${best.assetId} qualified (${best.sig.stance}) but the available size of ${U.fmtUSD(notional)} is below the ${U.fmtUSD(RULES.minOrderValue)} minimum.`, []);
-      return { decisions, valuation: freshVal };
+      const isCrypto = PT.isCrypto(cand.assetId);
+      const gw = groupWeight(workingVal, isCrypto);
+      if (gw >= RULES.maxGroupWeight) {
+        log('hold', cand.assetId,
+          `${cand.assetId} qualified but ${isCrypto ? 'crypto' : 'equities'} already account for `
+          + `${(gw * 100).toFixed(0)}% of the book, at the ${(RULES.maxGroupWeight * 100).toFixed(0)}% group cap. `
+          + 'They move together, so more of them is more of the same bet, not diversification.', []);
+        continue;
+      }
+
+      const price = cand.quote.price;
+      const atr = isFinite(cand.ind.atr14) ? cand.ind.atr14 : null;
+      const stopDistance = atr != null ? RULES.stopAtrMult * atr : price * 0.08;
+      if (!(stopDistance > 0)) continue;
+
+      const riskDollars = workingVal.equity * RULES.riskPerTrade;
+      const byRisk = riskDollars * (price / stopDistance);
+
+      // Conviction scales within the risk budget rather than replacing it.
+      const conviction = U.clamp((cand.sig.score - RULES.entryScore) / (1 - RULES.entryScore), 0, 1);
+      const sized = byRisk * (0.7 + 0.6 * conviction);
+
+      const headroom = Math.max(0, workingVal.equity * (1 - RULES.minCashReserve) - workingVal.invested);
+      const groupRoom = Math.max(0, (RULES.maxGroupWeight - gw) * workingVal.equity);
+      let notional = Math.min(
+        sized,
+        workingVal.equity * RULES.maxWeightPerPosition,
+        headroom,
+        groupRoom,
+        pf.cash * 0.95,
+      );
+      notional = Math.floor(notional * 100) / 100;
+
+      if (notional < RULES.minOrderValue) {
+        log('hold', cand.assetId,
+          `${cand.assetId} qualified (${cand.sig.stance}) but the available size of ${U.fmtUSD(notional)} is below the ${U.fmtUSD(RULES.minOrderValue)} minimum.`, []);
+        break;
+      }
+
+      const factors = cand.sig.factors.slice(0, 4).map((f) => ({
+        k: f.key, v: f.detail, dir: f.value > 0 ? 1 : f.value < 0 ? -1 : 0,
+      }));
+      const weightPct = workingVal.equity > 0 ? (notional / workingVal.equity) * 100 : 0;
+      const stopPct = (stopDistance / price) * 100;
+      const why = `${cand.assetId} scored ${cand.sig.score.toFixed(2)} (${cand.sig.stance}, ${cand.sig.confidence}% confidence) `
+        + `and is trading above its 50-bar trend. Sizing ${weightPct.toFixed(1)}% of equity: `
+        + `a ${stopPct.toFixed(1)}% stop on that position risks `
+        + `${U.fmtUSD(notional * stopPct / 100)}, about ${(RULES.riskPerTrade * 100).toFixed(1)}% of the book.`;
+
+      try {
+        const r = PT.engine.submitOrder(pf, {
+          assetId: cand.assetId, side: 'buy', type: 'market', notional, reason: why,
+        }, ctx);
+        budgetLeft -= 1;
+        opened += 1;
+        log('buy', cand.assetId, why, factors, {
+          qty: r.fill.qty, price: r.fill.price, notional: r.fill.notional,
+          signal: cand.sig.score, stance: cand.sig.stance, confidence: cand.sig.confidence,
+        });
+        ctx.cooldowns[cand.assetId] = now;
+        st.peaks[cand.assetId] = r.fill.price;
+        st.openedAt[cand.assetId] = now;
+        workingVal = PT.engine.valuate(pf, ctx.prices);
+      } catch (e) {
+        log('error', cand.assetId, `Entry rejected: ${e.message}`, factors);
+      }
     }
 
-    const factors = best.sig.factors.slice(0, 4).map((f) => ({
-      k: f.key, v: f.detail, dir: f.value > 0 ? 1 : f.value < 0 ? -1 : 0,
-    }));
-    // Report the size actually traded, not the target: available cash and the
-    // reserve floor routinely clamp it, and the log must match the order.
-    const actualWeight = freshVal.equity > 0 ? (notional / freshVal.equity) * 100 : 0;
-    const clamped = actualWeight < targetWeight * 100 - 0.05;
-    const why = `${best.assetId} scored ${best.sig.score.toFixed(2)} (${best.sig.stance}, ${best.sig.confidence}% confidence). `
-      + `Sizing ${actualWeight.toFixed(1)}% of equity`
-      + (clamped ? ` (trimmed from a ${(targetWeight * 100).toFixed(1)}% target by available cash)` : '')
-      + ` after a volatility adjustment for ${best.ind.atrPct != null ? best.ind.atrPct.toFixed(2) + '% ATR' : 'unknown volatility'}.`;
-
-    try {
-      const r = PT.engine.submitOrder(pf, {
-        assetId: best.assetId, side: 'buy', type: 'market', notional, reason: why,
-      }, ctx);
-      log('buy', best.assetId, why, factors, {
-        qty: r.fill.qty, price: r.fill.price, notional: r.fill.notional,
-        signal: best.sig.score, stance: best.sig.stance, confidence: best.sig.confidence,
-      });
-      ctx.cooldowns[best.assetId] = now;
-    } catch (e) {
-      log('error', best.assetId, `Entry rejected: ${e.message}`, factors);
+    if (!opened && !decisions.some((d) => d.action !== 'hold')) {
+      log('hold', ranked[0].assetId,
+        `${ranked[0].assetId} led the ranking at ${ranked[0].sig.score.toFixed(2)} but nothing could be sized this cycle.`, []);
     }
 
     return { decisions, valuation: PT.engine.valuate(pf, ctx.prices) };

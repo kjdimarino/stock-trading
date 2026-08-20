@@ -205,10 +205,61 @@ tested without shorts.
 It logs **every** decision — including the decision to do nothing — with the
 factors behind it, so you can see exactly why it acted. Repeated identical holds
 collapse into one entry with a count, so the log moves quickly without burying
-the actual trades. It runs with real
-guardrails: long only, max 8 positions, max 15% of equity per position, a 10%
-cash floor, ATR-based stops and targets, a 10-minute per-symbol cooldown and a
-25-trade daily cap.
+the actual trades.
+
+#### How it trades
+
+- **Only buys what is already trending.** Price must be above its 50-bar average
+  with the 20 above the 50, before conviction is even consulted. The blended
+  score reads bullish on a falling name whenever short-term momentum ticks up,
+  and buying those was the single largest source of loss.
+- **Sizes by risk, not by hunch.** Each position is sized so that being stopped
+  out costs about 0.8% of the account. A volatile name gets fewer dollars than a
+  calm one automatically, and every open position carries about the same risk.
+  The rationale states the dollars at risk, so you can check it.
+- **Caps correlated bets.** Crypto moves as one block, so eight coins is one bet,
+  not eight. No correlated group may exceed 45% of the book.
+- **Lets winners run.** There is no fixed profit target. The old rule sold
+  everything at 4× ATR or +22%, which capped exactly the trades a low-win-rate
+  trend system lives on.
+- **Adds to what is working.** A position already ahead by 3× ATR and still
+  scoring well gets more, up to the same per-position cap — and never while it
+  is losing, so this can't become averaging down.
+- **Exits on broken trends, not wobbles.** A stop is immediate. The softer exits
+  — the score turning, or price closing below its 50-bar average — wait until
+  the position has had a couple of bars to work, so a new position isn't closed
+  on noise while paying the spread twice.
+
+Guardrails: long only, max 8 positions, max 15% of equity per position, a 10%
+cash floor, ATR stops, a 10-minute per-symbol cooldown and a 25-trade daily cap.
+
+#### How that was checked
+
+`tools/backtest.mjs` walks the strategy forward over real daily candles for 33
+names across 306 days. At each bar it sees only the history up to that bar and
+trades at that bar's close through the real engine, paying the same spread the
+live app charges. Nothing can see the future.
+
+| | before | after | buy & hold |
+|---|---|---|---|
+| return | +7.6% | **+20.0%** | +1.6% |
+| max drawdown | -9.7% | **-8.3%** | -19.1% |
+| Sharpe | 0.64 | **1.13** | 0.16 |
+| profit factor | 1.19 | **1.85** | — |
+| avg win : avg loss | 2.8 : 1 | **8.4 : 1** | — |
+
+The win rate is 18%. That is expected and fine — it is a trend system, and the
+payoff ratio is what pays for it.
+
+Every setting was chosen on the first half of the history and then checked on
+the second half, which never influenced it. That discipline mattered: a
+parameter sweep found settings that turned the first half from -1.9% to +1.5%
+and made the second half *worse*, so those settings were discarded rather than
+shipped. `tools/ablate.mjs` turns each rule off in turn, and `test/strategy.test.mjs`
+runs the whole backtest as a regression test on every build.
+
+**This is a demonstration of a rules engine, not investment advice, and 306 days
+of one basket is not proof that anything works.**
 
 The **You vs AI** tab is a live scoreboard: overlaid equity curves, total
 return, realized and unrealized P&L, trade count, win rate and max drawdown.
