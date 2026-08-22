@@ -235,8 +235,13 @@
 
     try {
       const res = await PT.feed.candles(assetId, tf, { force });
-      // The user may have moved on while this was in flight.
-      if (S.focus !== assetId || S.tf !== tf) return;
+      /*
+       * The user may have moved on while this was in flight — to another
+       * symbol, another timeframe, or to a view that tears the chart down
+       * altogether. The last of those leaves S.chart null, so it has to be
+       * re-checked here and not only on the way in.
+       */
+      if (S.focus !== assetId || S.tf !== tf || !S.chart) return;
       S.bars = res.bars;
       S.barsMeta = res;
       S.candleCache[assetId + ':' + tf] = res.bars;
@@ -252,9 +257,10 @@
           + (res.closeOnly ? ' · close-only, no intraday high/low' : '');
       }
     } catch (e) {
-      // Guard on the timeframe too: a slow failure for a timeframe the user has
-      // already moved on from would otherwise blank a chart that loaded fine.
-      if (S.focus !== assetId || S.tf !== tf) return;
+      // Guard on the timeframe and the chart's existence too: a slow failure for
+      // a timeframe the user has already left would otherwise blank a chart that
+      // loaded fine, or throw against a chart that has since been destroyed.
+      if (S.focus !== assetId || S.tf !== tf || !S.chart || !R.chartMsg) return;
       S.bars = null;
       S.chart.setData([], tf);
       R.chartMsg.classList.remove('hidden');
@@ -930,6 +936,7 @@
   }
 
   function renderTopbar() {
+    A.renderAccountButton();
     const val = E.valuate(A.pfUser(), A.prices());
     const day = E.dayPnl(A.pfUser(), val, PT.calendar.stockStatus().etDate);
     R.topEquity.textContent = U.fmtUSD(val.equity, { fixed2: true });

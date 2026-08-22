@@ -20,10 +20,15 @@
     const now = Date.now();
     const px = A.prices();
 
-    /* Resting limit orders for both books. */
-    for (const id of ['user', 'ai']) {
+    /*
+     * Resting and queued orders for every open account plus the AI's. An order
+     * left on an account the user is not looking at must still fill — the whole
+     * point of a resting order is that it works while you are elsewhere.
+     */
+    const activeId = S.st.activeAccount;
+    for (const id of E.accountIds(S.st).concat('ai')) {
       const pf = S.st.portfolios[id];
-      if (!pf.orders.length) continue;
+      if (!pf || !pf.orders.length) continue;
       const fills = E.processOpenOrders(pf, {
         prices: px,
         // Each order's own asset class decides whether it may fill.
@@ -33,21 +38,23 @@
         now,
       });
       for (const f of fills) {
-        if (id === 'user') {
+        if (id !== 'ai') {
           const atOpen = /at the open/.test(f.reason || '');
+          const where = id === activeId ? '' : ` · ${pf.name}`;
           UI.toast({
             kind: f.side,
-            title: `${atOpen ? 'Filled at the open' : 'Limit filled'}: ${f.side} ${U.fmtQty(f.qty)} ${f.assetId}`,
+            title: `${atOpen ? 'Filled at the open' : 'Limit filled'}: ${f.side} ${U.fmtQty(f.qty)} ${f.assetId}${where}`,
             message: `at ${U.fmtUSD(f.price)}` + (f.side === 'sell' ? ` · realized ${U.fmtSigned(f.realized)}` : ''),
           });
         }
       }
       // An order that could not fill must say so; silently vanishing is worse.
       for (const r of (fills.rejected || [])) {
-        if (id === 'user') {
+        if (id !== 'ai') {
           UI.toast({
             kind: 'error',
-            title: `Order could not fill: ${r.side} ${U.fmtQty(r.qty)} ${r.assetId}`,
+            title: `Order could not fill: ${r.side} ${U.fmtQty(r.qty)} ${r.assetId}`
+              + (id === activeId ? '' : ` · ${pf.name}`),
             message: r.rejectedReason,
             timeout: 9000,
           });
@@ -57,7 +64,7 @@
     }
 
     /*
-     * Equity curve sampling for both books.
+     * Equity curve sampling for every account and the AI.
      *
      * Only sample a fully priced book. At startup the feed is empty, so
      * `valuate` values positions at cost basis — sampling that would write a
@@ -66,8 +73,9 @@
      */
     if (now - lastEquitySample > 10000) {
       let sampled = false;
-      for (const id of ['user', 'ai']) {
+      for (const id of E.accountIds(S.st).concat('ai')) {
         const pf = S.st.portfolios[id];
+        if (!pf) continue;
         const v = E.valuate(pf, px);
         if (v.staleCount > 0) continue;
         E.sampleEquity(pf, v.equity, now);
@@ -95,11 +103,22 @@
    * pass. Below the maintenance level the user is warned; below the hard floor
    * the engine buys the shorts back, exactly as a broker would, and says so.
    */
-  let lastMarginLevel = 'ok';
+  /*
+   * Per account, because a short on an account you are not looking at can still
+   * lose more than that account can cover, and a single shared flag would let
+   * one account's healthy state suppress another's margin call.
+   */
+  const lastMarginLevel = Object.create(null);
   function checkMargin(now, px) {
-    const pf = A.pfUser();
+    for (const id of E.accountIds(S.st)) checkAccountMargin(S.st.portfolios[id], id, px);
+  }
+
+  function checkAccountMargin(pf, id, px) {
+    if (!pf) return;
+    const active = id === S.st.activeAccount;
+    const where = active ? '' : ` · ${pf.name}`;
     const m = E.marginStatus(pf, px);
-    if (m.level === 'none') { lastMarginLevel = 'ok'; return; }
+    if (m.level === 'none') { lastMarginLevel[id] = 'ok'; return; }
 
     if (m.level === 'liquidate') {
       const shorts = E.valuate(pf, px).positions.filter((p) => p.isShort);
@@ -111,7 +130,7 @@
           }, { ...A.orderCtx(pos.assetId), marketOpen: true });
           UI.toast({
             kind: 'error',
-            title: `Forced buy-in: ${pos.assetId}`,
+            title: `Forced buy-in: ${pos.assetId}${where}`,
             message: `Your short lost more than the account could cover, so it was bought back at `
               + `${U.fmtUSD(r.fill.price)} (${U.fmtSigned(r.fill.realized)}). This is what a broker would do.`,
             timeout: 15000,
@@ -119,21 +138,21 @@
         } catch (e) { console.warn('[margin] could not buy in', pos.assetId, e.message); }
       }
       A.save();
-      lastMarginLevel = 'liquidate';
+      lastMarginLevel[id] = 'liquidate';
       return;
     }
 
-    if (m.level === 'call' && lastMarginLevel !== 'call') {
+    if (m.level === 'call' && lastMarginLevel[id] !== 'call') {
       UI.toast({
         kind: 'warn',
-        title: 'Margin call on your short positions',
+        title: `Margin call on your short positions${where}`,
         message: `Equity is ${U.fmtUSD(m.equity)} against ${U.fmtUSD(m.exposure)} of shorts. `
           + `Equity must stay above ${U.fmtUSD(m.maintenance)} (30% of the short). `
           + `Below ${U.fmtUSD(m.forceLevel)} the positions are bought back automatically.`,
         timeout: 15000,
       });
     }
-    lastMarginLevel = m.level;
+    lastMarginLevel[id] = m.level;
   }
 
   /* ------------------------------------------------------- AI trader loop */

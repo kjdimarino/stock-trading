@@ -72,6 +72,23 @@
 
   let openModal = null;
 
+  /*
+   * An action may be a ready-made node, or a description of one:
+   * `{ label, primary, danger, keepOpen, onClick }`. The descriptor form keeps
+   * call sites to one line each, and `keepOpen` is what lets a dialog show a
+   * validation error in place instead of closing on a bad value.
+   */
+  function toActionButton(a) {
+    if (!a || a.nodeType === 1) return a;
+    const cls = 'btn' + (a.primary ? ' btn--primary' : '') + (a.danger ? ' btn--danger' : '');
+    const btn = el('button', { class: cls, text: a.label });
+    btn.addEventListener('click', () => {
+      if (!a.keepOpen) closeModal();
+      if (a.onClick) a.onClick();
+    });
+    return btn;
+  }
+
   function modal({ title, body, actions, width, onClose }) {
     closeModal();
     const scrim = el('div', { class: 'scrim' });
@@ -83,7 +100,9 @@
       el('div', { class: 'modal__title', text: title }), closeBtn,
     ]));
     box.appendChild(el('div', { class: 'modal__body' }, body));
-    if (actions && actions.length) box.appendChild(el('div', { class: 'modal__foot' }, actions));
+    if (actions && actions.length) {
+      box.appendChild(el('div', { class: 'modal__foot' }, actions.map(toActionButton)));
+    }
 
     document.body.appendChild(scrim);
     document.body.appendChild(box);

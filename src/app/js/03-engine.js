@@ -71,14 +71,94 @@
     };
   }
 
+  /* ------------------------------------------------------------- accounts */
+
+  /** Ordered user account ids, always at least one, never including the AI. */
+  function accountIds(state) {
+    const list = (state.accounts || []).filter((id) => id !== 'ai' && state.portfolios[id]);
+    return list.length ? list : ['user'];
+  }
+
+  /** The account the user is currently trading. */
+  function activeAccount(state) {
+    const ids = accountIds(state);
+    const id = ids.includes(state.activeAccount) ? state.activeAccount : ids[0];
+    return state.portfolios[id];
+  }
+
+  function setActiveAccount(state, id) {
+    if (!state.portfolios[id] || id === 'ai') return false;
+    state.activeAccount = id;
+    return true;
+  }
+
+  const MAX_ACCOUNTS = 12;
+
+  /**
+   * Open another account. Each is completely independent: its own cash,
+   * positions, orders, history and equity curve. Nothing is shared but the
+   * watchlist and the chart drawings, which are about symbols rather than money.
+   */
+  function addAccount(state, name, startingCash) {
+    const ids = accountIds(state);
+    if (ids.length >= MAX_ACCOUNTS) {
+      throw new OrderError(`You can keep up to ${MAX_ACCOUNTS} accounts open at once.`);
+    }
+    const cash = money(startingCash);
+    if (!(cash > 0)) throw new OrderError('Enter a starting balance greater than zero.');
+
+    const id = U.uid('acct');
+    const label = String(name || '').trim() || `Account ${ids.length + 1}`;
+    state.portfolios[id] = newPortfolio(id, label, cash);
+    state.accounts = ids.concat(id);
+    return state.portfolios[id];
+  }
+
+  /** Close an account for good. The last one standing cannot be removed. */
+  function removeAccount(state, id) {
+    const ids = accountIds(state);
+    if (id === 'ai' || !state.portfolios[id]) return false;
+    if (ids.length <= 1) return false;
+    delete state.portfolios[id];
+    state.accounts = ids.filter((x) => x !== id);
+    if (state.activeAccount === id) state.activeAccount = state.accounts[0];
+    return true;
+  }
+
+  function renameAccount(state, id, name) {
+    const pf = state.portfolios[id];
+    const label = String(name || '').trim();
+    if (!pf || id === 'ai' || !label) return false;
+    pf.name = label.slice(0, 40);
+    return true;
+  }
+
+  /** Wipe one account back to a starting balance, leaving the others alone. */
+  function resetAccount(state, id, startingCash) {
+    const pf = state.portfolios[id];
+    if (!pf || id === 'ai') return false;
+    const cash = money(startingCash != null ? startingCash : pf.startingCash);
+    if (!(cash > 0)) return false;
+    const fresh = newPortfolio(id, pf.name, cash);
+    state.portfolios[id] = fresh;
+    return true;
+  }
+
   function newState(startingCash) {
     const now = Date.now();
     return {
       version: SCHEMA_VERSION,
       createdAt: now,
       startingCash: money(startingCash),
+      /*
+       * User accounts, in the order they are shown, alongside the AI's book.
+       * The first one keeps the id 'user' so that every save written before
+       * multiple accounts existed loads as an account rather than as nothing.
+       */
+      accounts: ['user'],
+      activeAccount: 'user',
       portfolios: {
-        user: newPortfolio('user', 'You', startingCash),
+        user: newPortfolio('user', 'Main', startingCash),
         ai: newPortfolio('ai', 'AI Trader', startingCash),
       },
       watchlist: PT.defaultWatchlist.slice(),
@@ -902,10 +982,27 @@
     try {
       const parsed = migrate(JSON.parse(raw));
       if (!parsed) return null;
+      if (!parsed.portfolios || !parsed.portfolios.user || !parsed.portfolios.ai) return null;
+
+      /*
+       * Saves written before multiple accounts existed have no account list.
+       * Their single book keeps its id and simply becomes the first account —
+       * nothing is copied, moved or renamed, so no history can be lost here.
+       */
+      if (!Array.isArray(parsed.accounts) || !parsed.accounts.length) {
+        parsed.accounts = ['user'];
+      }
+      parsed.accounts = parsed.accounts.filter((id) => id !== 'ai' && parsed.portfolios[id]);
+      if (!parsed.accounts.length) parsed.accounts = ['user'];
+      if (!parsed.portfolios[parsed.activeAccount] || parsed.activeAccount === 'ai') {
+        parsed.activeAccount = parsed.accounts[0];
+      }
+
       // Defensive: fill in anything a partial write may have lost.
-      for (const id of ['user', 'ai']) {
+      for (const id of parsed.accounts.concat('ai')) {
         const pf = parsed.portfolios && parsed.portfolios[id];
         if (!pf) return null;
+        if (!pf.name) pf.name = id === 'ai' ? 'AI Trader' : 'Main';
         pf.positions = pf.positions || {};
         pf.orders = pf.orders || [];
         pf.fills = pf.fills || [];
@@ -960,8 +1057,9 @@
         return false;
       }
       const now = Date.now();
-      for (const id of ['user', 'ai']) {
+      for (const id of accountIds(state).concat('ai')) {
         const pf = state.portfolios[id];
+        if (!pf) continue;
         pf.equity = pruneEquity(pf.equity, now).filter((s) => now - s.t < 30 * 86400e3);
         if (pf.fills.length > 1000) { pf.fills = pf.fills.slice(-1000); pf.fillsTrimmed = true; }
       }
@@ -982,6 +1080,8 @@
   PT.engine = {
     SCHEMA_VERSION, STORAGE_KEY, SLIPPAGE_BPS, MIN_NOTIONAL, OrderError,
     newState, newPortfolio, submitOrder, buildOrder, applyFill, processOpenOrders,
+    accountIds, activeAccount, setActiveAccount, addAccount, removeAccount,
+    renameAccount, resetAccount, MAX_ACCOUNTS,
     cancelOrder, crosses, effectivePrice, valuate, dayPnl, stats,
     audit, repair, reconstruct,
     availableCash, availableQty, committedCash, committedQty, CASH_EPS,

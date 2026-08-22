@@ -435,6 +435,57 @@ describe('persistence', () => {
     near(back.portfolios.user.positions.AAPL.qty, 5, 1e-9);
     eq(back.version, E.SCHEMA_VERSION);
   });
+  it('a save written before accounts existed loads with nothing lost', () => {
+    /*
+     * The exact shape the app wrote before multiple accounts: one book called
+     * `user`, no account list, no active account. Real people have money and
+     * history in this shape, so it has to come back intact and simply become
+     * the first account — not be migrated, copied or renamed.
+     */
+    const legacy = E.newState(25000);
+    E.submitOrder(legacy.portfolios.user, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 5 },
+      ctx(px({ AAPL: 100 })));
+    legacy.portfolios.user.name = 'You';
+    delete legacy.accounts;
+    delete legacy.activeAccount;
+    localStorage.setItem(E.STORAGE_KEY, JSON.stringify(legacy));
+
+    const back = E.load();
+    ok(back, 'a pre-accounts save must still load');
+    eq(E.accountIds(back).length, 1);
+    eq(E.accountIds(back)[0], 'user', 'the original book keeps its identity');
+    eq(E.activeAccount(back).id, 'user');
+    near(back.portfolios.user.cash, 24500, 1e-6, 'cash survived');
+    near(back.portfolios.user.positions.AAPL.qty, 5, 1e-9, 'positions survived');
+    eq(back.portfolios.user.fills.length, 1, 'history survived');
+    E.clear();
+  });
+
+  it('round-trips several accounts', () => {
+    const st = E.newState(10000);
+    const big = E.addAccount(st, 'Big money', 1000000);
+    E.submitOrder(big, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 100 }, ctx(px({ AAPL: 100 })));
+    E.setActiveAccount(st, big.id);
+    eq(E.save(st), true);
+
+    const back = E.load();
+    eq(E.accountIds(back).length, 2);
+    eq(E.activeAccount(back).name, 'Big money', 'the account in use is remembered');
+    near(back.portfolios[big.id].cash, 990000, 1e-6);
+    near(back.portfolios.user.cash, 10000, 1e-6, 'the other account is untouched');
+    E.clear();
+  });
+
+  it('recovers when the stored active account no longer exists', () => {
+    const st = E.newState(10000);
+    st.activeAccount = 'deleted-somehow';
+    localStorage.setItem(E.STORAGE_KEY, JSON.stringify(st));
+    const back = E.load();
+    ok(back, 'must not refuse to load');
+    eq(E.activeAccount(back).id, 'user', 'falls back to a real account');
+    E.clear();
+  });
+
   it('returns null when nothing is stored', () => { E.clear(); eq(E.load(), null); });
   it('survives corrupt stored JSON', () => {
     localStorage.setItem(E.STORAGE_KEY, '{not json');
@@ -450,6 +501,97 @@ describe('persistence', () => {
     const st = E.newState(50000);
     eq(st.portfolios.user.cash, st.portfolios.ai.cash);
     eq(st.portfolios.ai.startingCash, 50000);
+  });
+});
+
+describe('multiple accounts', () => {
+  it('a new state starts with one account', () => {
+    const st = E.newState(10000);
+    eq(E.accountIds(st).length, 1);
+    eq(E.activeAccount(st).id, 'user');
+    eq(E.activeAccount(st).cash, 10000);
+  });
+
+  it('accounts are completely independent books', () => {
+    const st = E.newState(10000);
+    const big = E.addAccount(st, 'Big money', 1000000);
+    eq(E.accountIds(st).length, 2);
+
+    const at100 = px({ AAPL: 100 });
+    E.submitOrder(st.portfolios.user, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 }, ctx(at100));
+    E.submitOrder(big, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 500 }, ctx(at100));
+
+    eq(st.portfolios.user.cash, 9000, 'the small account spent its own money');
+    eq(big.cash, 950000, 'and the big one spent its own');
+    eq(st.portfolios.user.positions.AAPL.qty, 10);
+    eq(big.positions.AAPL.qty, 500);
+    eq(st.portfolios.user.fills.length, 1, 'histories do not mix');
+    eq(big.fills.length, 1);
+  });
+
+  it('switching accounts changes which book trades', () => {
+    const st = E.newState(10000);
+    const big = E.addAccount(st, 'Big', 1000000);
+    ok(E.setActiveAccount(st, big.id));
+    eq(E.activeAccount(st).id, big.id);
+    // The AI's book is never a user account.
+    eq(E.setActiveAccount(st, 'ai'), false);
+    eq(E.activeAccount(st).id, big.id);
+  });
+
+  it('closing an account leaves the others untouched', () => {
+    const st = E.newState(10000);
+    const a = E.addAccount(st, 'A', 5000);
+    const b = E.addAccount(st, 'B', 7000);
+    E.setActiveAccount(st, a.id);
+    ok(E.removeAccount(st, a.id));
+    eq(E.accountIds(st).length, 2);
+    eq(st.portfolios[b.id].cash, 7000);
+    ok(E.activeAccount(st).id !== a.id, 'the active account moved off the closed one');
+  });
+
+  it('refuses to close the last account', () => {
+    const st = E.newState(10000);
+    eq(E.removeAccount(st, 'user'), false);
+    eq(E.accountIds(st).length, 1);
+  });
+
+  it('resetting one account does not touch another', () => {
+    const st = E.newState(10000);
+    const b = E.addAccount(st, 'B', 50000);
+    E.submitOrder(st.portfolios.user, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 },
+      ctx(px({ AAPL: 100 })));
+    E.submitOrder(b, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 },
+      ctx(px({ AAPL: 100 })));
+
+    E.resetAccount(st, 'user', 2000);
+    eq(st.portfolios.user.cash, 2000);
+    eq(st.portfolios.user.fills.length, 0);
+    eq(Object.keys(st.portfolios.user.positions).length, 0);
+    eq(st.portfolios[b.id].fills.length, 1, 'the other account kept its history');
+    eq(st.portfolios[b.id].positions.AAPL.qty, 10);
+  });
+
+  it('an account name is trimmed, defaulted and bounded', () => {
+    const st = E.newState(10000);
+    eq(E.addAccount(st, '   ', 1000).name, 'Account 2');
+    eq(E.addAccount(st, '  Spacey  ', 1000).name, 'Spacey');
+    const long = E.addAccount(st, 'x'.repeat(200), 1000);
+    E.renameAccount(st, long.id, 'y'.repeat(200));
+    ok(st.portfolios[long.id].name.length <= 40, 'a runaway name is bounded');
+  });
+
+  it('will not open an account with no money in it', () => {
+    const st = E.newState(10000);
+    throws(() => E.addAccount(st, 'Broke', 0), 'greater than zero');
+    throws(() => E.addAccount(st, 'Broke', -5), 'greater than zero');
+  });
+
+  it('stops at the account limit rather than growing without bound', () => {
+    const st = E.newState(10000);
+    for (let i = E.accountIds(st).length; i < E.MAX_ACCOUNTS; i++) E.addAccount(st, `A${i}`, 1000);
+    eq(E.accountIds(st).length, E.MAX_ACCOUNTS);
+    throws(() => E.addAccount(st, 'One too many', 1000), 'up to');
   });
 });
 

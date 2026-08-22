@@ -665,6 +665,88 @@ try {
   check('leaving draw mode disarms the tool',
     (await page.evaluate(() => window.PT.app.S.drawTool)) === null);
 
+  /* ------------------------------------------------------------ accounts */
+  section('Multiple accounts');
+
+  await page.evaluate(() => window.PT.app.setView('trade'));
+  await page.waitForTimeout(500);
+  const firstAccount = await page.evaluate(() => {
+    const pf = window.PT.app.pfUser();
+    return { name: pf.name, cash: pf.cash, fills: pf.fills.length };
+  });
+  check('the topbar names the account being traded',
+    (await page.locator('.acctbtn__name').textContent()) === firstAccount.name);
+
+  await page.locator('.acctbtn').click();
+  await page.waitForTimeout(200);
+  check('the switcher lists the accounts', (await page.locator('.acctmenu__row').count()) === 1);
+  await page.locator('.acctmenu__manage').click();
+  await page.waitForTimeout(600);
+  check('Manage opens the accounts view',
+    (await page.evaluate(() => window.PT.app.S.view)) === 'accounts');
+
+  await page.locator('button:text-is("Open an account")').click();
+  await page.waitForTimeout(400);
+  await page.locator('.modal input[type="text"]').fill('Big money');
+  await page.locator('.modal .preset', { hasText: '$1M' }).click();
+  await page.locator('.modal button:text-is("Open account")').click();
+  await page.waitForTimeout(1200);
+
+  const opened = await page.evaluate(() => ({
+    names: window.PT.app.accounts().map((p) => p.name),
+    active: window.PT.app.pfUser().name,
+    cash: window.PT.app.pfUser().cash,
+  }));
+  check('a second account opens with its own balance',
+    opened.names.length === 2 && opened.cash === 1000000, JSON.stringify(opened));
+  check('and becomes the account being traded', opened.active === 'Big money');
+
+  /*
+   * The point of the whole feature: money spent on one account must not move
+   * on another. A $1M account and a small one, side by side, staying separate.
+   */
+  await page.evaluate(() => {
+    const A = window.PT.app, E = window.PT.engine;
+    const id = ['BTC', 'ETH', 'SOL'].find((k) => isFinite((window.PT.feed.prices[k] || {}).price));
+    E.submitOrder(A.pfUser(), { assetId: id, side: 'buy', type: 'market', notional: 250000 }, A.orderCtx(id));
+    A.save();
+  });
+  const isolated = await page.evaluate(() => window.PT.app.accounts().map((p) => ({
+    name: p.name, cash: Math.round(p.cash), fills: p.fills.length,
+  })));
+  check('trading one account leaves the other alone',
+    isolated[0].cash === Math.round(firstAccount.cash) && isolated[0].fills === firstAccount.fills,
+    JSON.stringify(isolated));
+  check('and the account that traded actually paid for it',
+    isolated[1].cash < 1000000 && isolated[1].fills === 1, JSON.stringify(isolated));
+
+  await page.locator('.acctbtn').click();
+  await page.waitForTimeout(200);
+  await page.locator('.acctmenu__row').first().click();
+  await page.waitForTimeout(1000);
+  check('switching back restores the first account',
+    (await page.evaluate(() => window.PT.app.pfUser().name)) === firstAccount.name);
+  check('and the blotter shows that account\'s positions',
+    (await page.evaluate(() => {
+      const pf = window.PT.app.pfUser();
+      return Object.keys(pf.positions).length;
+    })) === (await page.evaluate(() => {
+      const rows = document.querySelectorAll('.blotter tbody tr');
+      return rows.length;
+    })));
+
+  await page.waitForTimeout(900);
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('.terminal', { timeout: 20000 });
+  await page.waitForTimeout(2500);
+  const afterReload = await page.evaluate(() => ({
+    names: window.PT.app.accounts().map((p) => p.name),
+    active: window.PT.app.pfUser().name,
+  }));
+  check('both accounts survive a reload',
+    afterReload.names.length === 2 && afterReload.active === firstAccount.name,
+    JSON.stringify(afterReload));
+
   /* ---------------------------------------------------------- responsive */
   section('Responsive layout');
   await page.setViewportSize({ width: 900, height: 800 });

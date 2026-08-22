@@ -12,6 +12,13 @@
   const icon = UI.icon;
   const A = PT.app;
   const { S, R } = A;
+  /*
+   * 10-views.js has already published PT.views by the time this file runs, and
+   * this module only adds to that same object, so the reference stays valid.
+   * Without the alias every `V.` call here throws — which is exactly what the
+   * settings "Repair account" path had been doing.
+   */
+  const V = PT.views;
 
   const SERIES_COLORS = { user: '#4c82f7', ai: '#9d7bff' };
 
@@ -103,7 +110,7 @@
 
     if (S.equityChart) { S.equityChart.destroy(); S.equityChart = null; }
     S.equityChart = new PT.chart.EquityChart(curveWrap);
-    S.equityChart.setSeries([{ name: 'You', color: SERIES_COLORS.user, points: pf.equity }]);
+    S.equityChart.setSeries([{ name: pf.name, color: SERIES_COLORS.user, points: pf.equity }]);
 
     PT.views.renderPositionsInto(posHost, val);
   }
@@ -131,7 +138,7 @@
 
     view.appendChild(el('div', { class: 'score' }, [
       el('div', { class: 'score__side' }, [
-        el('div', { class: 'score__who' }, [el('span', { class: 'dot', style: `color:${SERIES_COLORS.user}` }), 'You']),
+        el('div', { class: 'score__who' }, [el('span', { class: 'dot', style: `color:${SERIES_COLORS.user}` }), A.pfUser().name]),
         el('div', { class: 'score__val num', text: U.fmtUSD(uv.equity, { fixed2: true }) }),
         el('div', { class: 'score__ret num ' + U.dirClass(uv.totalReturnPct), text: U.fmtPct(uv.totalReturnPct) }),
       ]),
@@ -183,7 +190,14 @@
     view.appendChild(el('div', { class: 'panel__head' }, [
       el('div', { class: 'panel__title', text: 'Equity curves' }),
       el('div', { style: 'flex:1' }),
-      el('span', { class: 'dimmer', style: 'font-size:10px' }, 'both portfolios started at ' + U.fmtUSD(S.st.startingCash, { fixed2: true })),
+      /*
+       * State-level `startingCash` is the balance the app was first opened
+       * with; accounts opened later have their own. Name both, so a comparison
+       * between a $2K account and the AI's $100K is never read as a fair fight.
+       */
+      el('span', { class: 'dimmer', style: 'font-size:10px' },
+        `${A.pfUser().name} started at ${U.fmtUSD(A.pfUser().startingCash, { fixed2: true })}`
+        + ` · AI started at ${U.fmtUSD(A.pfAI().startingCash, { fixed2: true })}`),
     ]));
     const wrap = el('div', { style: 'height:260px;position:relative;background:var(--bg-void)' });
     view.appendChild(wrap);
@@ -205,7 +219,7 @@
     if (S.equityChart) { S.equityChart.destroy(); S.equityChart = null; }
     S.equityChart = new PT.chart.EquityChart(wrap);
     S.equityChart.setSeries([
-      { name: 'You', color: SERIES_COLORS.user, points: user.equity },
+      { name: user.name, color: SERIES_COLORS.user, points: user.equity },
       { name: 'AI Trader', color: SERIES_COLORS.ai, points: ai.equity },
     ]);
 
@@ -653,9 +667,13 @@
     const fix = el('button', { class: 'btn', text: 'Repair account' });
     fix.addEventListener('click', () => {
       const reports = [];
-      for (const id of ['user', 'ai']) {
-        const r = E.repair(S.st.portfolios[id], { force: true });
-        if (r) reports.push({ id, r });
+      // Every account, not just the one on screen: a bricked balance on an
+      // account you are not looking at is exactly the one you will not notice.
+      for (const id of E.accountIds(S.st).concat('ai')) {
+        const pf = S.st.portfolios[id];
+        if (!pf) continue;
+        const r = E.repair(pf, { force: true });
+        if (r) reports.push({ id: pf.name || id, r });
       }
       A.save();
       UI.closeModal();
@@ -694,7 +712,10 @@
   function confirmReset() {
     UI.confirmDialog({
       title: 'Reset everything?',
-      message: 'This wipes both portfolios, every position, all trade history and the AI decision log, then asks you to pick a starting balance again. It cannot be undone.',
+      message: 'This wipes every account you have open, the AI portfolio, all positions, '
+        + 'all trade history and the AI decision log, then asks you to pick a starting balance '
+        + 'again. It cannot be undone. To start over on a single account instead, use Reset on '
+        + 'its card in Accounts.',
       confirmLabel: 'Reset portfolio',
       danger: true,
       onConfirm: () => {
@@ -719,6 +740,270 @@
     { amount: 100000, label: '$100K', note: 'Room to diversify properly' },
     { amount: 1000000, label: '$1M', note: 'Go wild, it is not real' },
   ];
+
+  /* ============================ accounts view ============================ */
+
+  /**
+   * Every account side by side: what it is worth, what it has made, and what
+   * it is holding. Each is a completely separate book — its own cash, positions,
+   * orders, trade history and equity curve — so a $2K account and a $1M account
+   * can run at the same time without either affecting the other.
+   */
+  function renderAccountsView() {
+    const host = R.chartpane;
+    if (S.chart) { S.chart.destroy(); S.chart = null; S.bars = null; }
+    host.innerHTML = '';
+
+    const view = el('div', { class: 'accounts' });
+    const head = el('div', { class: 'panel__head' }, [
+      el('div', { class: 'panel__title', text: 'Accounts' }),
+      el('div', { style: 'flex:1' }),
+    ]);
+    const openBtn = el('button', { class: 'btn btn--primary btn--sm', text: 'Open an account' });
+    openBtn.addEventListener('click', () => promptNewAccount());
+    head.appendChild(openBtn);
+    view.appendChild(head);
+
+    const body = el('div', { class: 'accounts__body scroll' });
+    const px = A.prices();
+    const list = A.accounts();
+
+    for (const pf of list) {
+      const val = E.valuate(pf, px);
+      const st = E.stats(pf, val);
+      const active = pf.id === S.st.activeAccount;
+      const pnl = val.equity - pf.startingCash;
+      const retPct = pf.startingCash > 0 ? (pnl / pf.startingCash) * 100 : 0;
+
+      const card = el('div', { class: 'acctcard' + (active ? ' is-active' : '') });
+
+      const title = el('div', { class: 'acctcard__head' }, [
+        el('div', { class: 'acctcard__name truncate', text: pf.name }),
+        active ? el('span', { class: 'badge badge--accent', text: 'Trading' }) : null,
+        el('div', { style: 'flex:1' }),
+      ]);
+
+      if (!active) {
+        const use = el('button', { class: 'btn btn--sm', text: 'Switch to this' });
+        use.addEventListener('click', () => { A.switchAccount(pf.id); renderAccountsView(); });
+        title.appendChild(use);
+      }
+      const rename = el('button', { class: 'btn btn--ghost btn--sm', text: 'Rename' });
+      rename.addEventListener('click', () => promptRename(pf));
+      title.appendChild(rename);
+
+      const reset = el('button', { class: 'btn btn--ghost btn--sm', text: 'Reset' });
+      reset.addEventListener('click', () => promptResetAccount(pf));
+      title.appendChild(reset);
+
+      if (list.length > 1) {
+        const close = el('button', { class: 'btn btn--ghost btn--sm', text: 'Close' });
+        close.addEventListener('click', () => promptCloseAccount(pf));
+        title.appendChild(close);
+      }
+      card.appendChild(title);
+
+      const stat = (k, v, cls) => el('div', { class: 'acctcard__stat' }, [
+        el('div', { class: 'k', text: k }),
+        el('div', { class: 'v num' + (cls ? ' ' + cls : ''), text: v }),
+      ]);
+      card.appendChild(el('div', { class: 'acctcard__stats' }, [
+        stat('Value', U.fmtUSD(val.equity, { fixed2: true })),
+        stat('Total P&L', U.fmtSigned(pnl), pnl >= 0 ? 'pos' : 'neg'),
+        stat('Return', U.fmtPct(retPct), retPct >= 0 ? 'pos' : 'neg'),
+        stat('Cash free', U.fmtUSD(val.buyingPower, { fixed2: true })),
+        stat('Invested', U.fmtUSD(val.invested, { fixed2: true })),
+        stat('Positions', String(val.positions.length)),
+        stat('Trades', String(pf.fills.length)),
+        stat('Win rate', st && st.closed ? U.fmtPct(st.winRate) : '—'),
+      ]));
+
+      const started = el('div', { class: 'acctcard__foot dimmer' },
+        `Started with ${U.fmtUSD(pf.startingCash, { fixed2: true })}`
+        + (pf.orders.length ? ` · ${pf.orders.length} open order${pf.orders.length === 1 ? '' : 's'}` : ''));
+      card.appendChild(started);
+
+      body.appendChild(card);
+    }
+
+    if (list.length < E.MAX_ACCOUNTS) {
+      const add = el('button', { class: 'acctcard acctcard--add' }, [
+        el('div', { class: 'acctcard__plus', text: '+' }),
+        el('div', { text: 'Open another account' }),
+        el('div', { class: 'dimmer', style: 'font-size:11px' },
+          'A separate book with its own balance — run a $2K account and a $1M account side by side.'),
+      ]);
+      add.addEventListener('click', () => promptNewAccount());
+      body.appendChild(add);
+    }
+
+    view.appendChild(body);
+    host.appendChild(view);
+  }
+
+  /** Shared balance picker: the presets from onboarding, plus a custom box. */
+  function balancePicker(initial) {
+    let selected = initial;
+    const nodes = [];
+    const custom = el('input', {
+      class: 'input num', type: 'number', min: '100', step: '100', placeholder: 'Custom amount',
+    });
+    const paint = () => nodes.forEach((n, i) => n.classList.toggle('is-active', PRESETS[i].amount === selected));
+    const grid = el('div', { class: 'onboard__presets' });
+    PRESETS.forEach((p) => {
+      const node = el('button', { class: 'preset' }, [
+        el('div', { class: 'preset__amt', text: p.label }),
+        el('div', { class: 'preset__note', text: p.note }),
+      ]);
+      node.addEventListener('click', () => { selected = p.amount; custom.value = ''; paint(); });
+      nodes.push(node);
+      grid.appendChild(node);
+    });
+    paint();
+    custom.addEventListener('input', () => {
+      const v = Number(custom.value.trim());
+      if (v >= 100) { selected = v; paint(); }
+    });
+    return {
+      grid,
+      custom,
+      value() {
+        const raw = custom.value.trim();
+        const v = Number(raw);
+        return raw === '' ? selected : v;
+      },
+    };
+  }
+
+  function promptNewAccount() {
+    const name = el('input', { class: 'input', type: 'text', placeholder: `Account ${A.accounts().length + 1}`, maxlength: '40' });
+    const picker = balancePicker(10000);
+    const err = el('div', { class: 'order__err hidden' });
+
+    UI.modal({
+      title: 'Open an account',
+      width: 520,
+      body: el('div', { class: 'stack' }, [
+        el('div', { class: 'dimmer', style: 'font-size:12px' },
+          'A completely separate book: its own cash, positions, orders and history. '
+          + 'Your other accounts are untouched.'),
+        el('div', { class: 'field' }, [el('div', { class: 'field__label' }, 'Name'), name]),
+        el('div', { class: 'field' }, [el('div', { class: 'field__label' }, 'Starting balance'), picker.grid]),
+        el('div', { class: 'field' }, [el('div', { class: 'field__label' }, 'Or set your own'), picker.custom]),
+        err,
+      ]),
+      actions: [
+        { label: 'Cancel' },
+        {
+          label: 'Open account',
+          primary: true,
+          keepOpen: true,
+          onClick: () => {
+            const cash = picker.value();
+            if (!(cash >= 100)) {
+              err.textContent = 'Minimum starting balance is $100.';
+              err.classList.remove('hidden');
+              return;
+            }
+            let pf;
+            try {
+              pf = E.addAccount(S.st, name.value, cash);
+            } catch (e) {
+              err.textContent = e.message;
+              err.classList.remove('hidden');
+              return;
+            }
+            UI.closeModal();
+            A.save();
+            A.switchAccount(pf.id);
+            V.renderAccountsView();
+            UI.toast({
+              title: `Opened ${pf.name}`,
+              message: `${U.fmtUSD(cash, { fixed2: true })} to trade. Your other accounts are untouched.`,
+            });
+          },
+        },
+      ],
+    });
+  }
+
+  function promptRename(pf) {
+    const name = el('input', { class: 'input', type: 'text', value: pf.name, maxlength: '40' });
+    UI.modal({
+      title: 'Rename account',
+      body: el('div', { class: 'field' }, [el('div', { class: 'field__label' }, 'Name'), name]),
+      actions: [
+        { label: 'Cancel' },
+        {
+          label: 'Save',
+          primary: true,
+          onClick: () => {
+            if (E.renameAccount(S.st, pf.id, name.value)) {
+              A.save();
+              V.renderAccountsView();
+              V.renderAll();
+            }
+          },
+        },
+      ],
+    });
+  }
+
+  function promptResetAccount(pf) {
+    const picker = balancePicker(pf.startingCash);
+    UI.modal({
+      title: `Reset ${pf.name}`,
+      width: 520,
+      body: el('div', { class: 'stack' }, [
+        el('div', { class: 'dimmer', style: 'font-size:12px' },
+          `This wipes this account's positions, orders and trade history and starts it over. `
+          + 'Your other accounts are not touched. It cannot be undone.'),
+        el('div', { class: 'field' }, [el('div', { class: 'field__label' }, 'Starting balance'), picker.grid]),
+        el('div', { class: 'field' }, [el('div', { class: 'field__label' }, 'Or set your own'), picker.custom]),
+      ]),
+      actions: [
+        { label: 'Cancel' },
+        {
+          label: 'Reset this account',
+          danger: true,
+          onClick: () => {
+            const cash = picker.value();
+            if (!(cash >= 100)) return;
+            E.resetAccount(S.st, pf.id, cash);
+            A.save();
+            V.renderAccountsView();
+            V.renderAll();
+            UI.toast({ title: `${pf.name} reset`, message: `Back to ${U.fmtUSD(cash, { fixed2: true })}.` });
+          },
+        },
+      ],
+    });
+  }
+
+  function promptCloseAccount(pf) {
+    UI.modal({
+      title: `Close ${pf.name}?`,
+      body: el('div', { class: 'dimmer', style: 'font-size:13px;line-height:1.5' },
+        `This deletes the account and everything in it — ${pf.fills.length} trade`
+        + `${pf.fills.length === 1 ? '' : 's'}, its positions and its equity curve. `
+        + 'Your other accounts are not touched. It cannot be undone.'),
+      actions: [
+        { label: 'Keep it' },
+        {
+          label: 'Close account',
+          danger: true,
+          onClick: () => {
+            if (E.removeAccount(S.st, pf.id)) {
+              A.save();
+              A.switchAccount(S.st.activeAccount);
+              V.renderAccountsView();
+              UI.toast({ title: `Closed ${pf.name}` });
+            }
+          },
+        },
+      ],
+    });
+  }
 
   function showOnboarding(onDone) {
     let selected = 10000;
@@ -831,6 +1116,7 @@
 
   PT.views = Object.assign(PT.views || {}, {
     renderPortfolioView, renderCompareView, renderAIView, renderTradeLog, renderIdeasView,
+    renderAccountsView,
     openSettings, showOnboarding, applyDirectionScheme, renderPositionsInto,
     askCompanion: ask,
   });

@@ -46,10 +46,30 @@ in your browser's `localStorage`.
 
 ## What it does
 
+### Accounts
+Keep up to **12 accounts open at once** — a $2K one to feel the pinch and a $1M
+one to swing at the fences, running side by side.
+
+Each is a genuinely separate book: its own cash, positions, open orders, trade
+history, equity curve and day P&L. Nothing is shared but the watchlist and your
+chart drawings, which are about symbols rather than money. Resting and queued
+orders on an account you are not looking at still fill, and the toast says which
+account it happened on; margin is checked on every account, not just the visible
+one.
+
+- The topbar always names the account being traded and what it is worth — which
+  book a trade lands in should never be ambiguous.
+- Click it to switch, or open **Accounts** for the full board: value, P&L, return,
+  free cash, positions and win rate per account, with rename, reset and close.
+- **Reset** starts one account over at a balance of your choosing and leaves the
+  others alone. **Reset Portfolio** in Settings still wipes everything.
+
+Saves written before accounts existed load unchanged — the single book you had
+simply becomes your first account, keeping its cash, positions and full history.
+
 ### Portfolio
 - Pick a starting balance on first launch — $1K, $10K, $100K, $1M or your own number.
-- Cash, positions, open orders, trade history and both equity curves persist between sessions.
-- **Reset Portfolio** in Settings wipes everything and starts over (with a confirmation step).
+- Cash, positions, open orders, trade history and every equity curve persist between sessions.
 
 ### What you can trade
 The curated list is a starting point, not a limit. **Every US-listed stock and

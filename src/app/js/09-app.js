@@ -46,8 +46,14 @@
   const R = {};   // DOM references
   const priceCells = new Map(); // assetId -> [{node, kind}]
 
-  const pfUser = () => S.st.portfolios.user;
+  /*
+   * "The user's portfolio" is whichever account is active. Everything that
+   * trades, values or renders goes through here, so switching accounts is a
+   * single assignment rather than a hunt through the app for `portfolios.user`.
+   */
+  const pfUser = () => E.activeAccount(S.st);
   const pfAI = () => S.st.portfolios.ai;
+  const accounts = () => E.accountIds(S.st).map((id) => S.st.portfolios[id]);
   const prices = () => PT.feed.prices;
 
   const marketOpenFor = (assetId) =>
@@ -101,6 +107,7 @@
     { id: 'portfolio', icon: 'portfolio', label: 'Portfolio' },
     { id: 'ai', icon: 'ai', label: 'AI companion' },
     { id: 'compare', icon: 'compare', label: 'You vs AI' },
+    { id: 'accounts', icon: 'wallet', label: 'Accounts' },
   ];
 
   function buildRail() {
@@ -171,6 +178,20 @@
 
     bar.appendChild(el('div', { class: 'topbar__spacer' }));
 
+    /*
+     * Account switcher. Always visible, even with one account, because which
+     * book a trade lands in is the last thing that should ever be ambiguous.
+     */
+    R.acctBtn = el('button', { class: 'acctbtn', 'aria-haspopup': 'listbox' });
+    R.acctMenu = el('div', { class: 'acctmenu hidden', role: 'listbox' });
+    R.acctBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const open = R.acctMenu.classList.toggle('hidden');
+      if (!open) renderAccountMenu();
+    });
+    document.addEventListener('click', () => R.acctMenu.classList.add('hidden'));
+    bar.appendChild(el('div', { class: 'acct' }, [R.acctBtn, R.acctMenu]));
+
     R.topEquity = el('div', { class: 'v num' }, '—');
     R.topDay = el('div', { class: 'v num', style: 'font-size:13px' }, '—');
     bar.appendChild(el('div', { class: 'topbar__stat' }, [
@@ -180,6 +201,55 @@
       el('div', { class: 'label', text: 'Day P&L' }), R.topDay,
     ]));
     return bar;
+  }
+
+  /** The button text: which account, and what it is worth right now. */
+  function renderAccountButton() {
+    if (!R.acctBtn) return;
+    const pf = pfUser();
+    const val = E.valuate(pf, prices());
+    const n = E.accountIds(S.st).length;
+    R.acctBtn.innerHTML = '';
+    R.acctBtn.append(
+      el('span', { class: 'acctbtn__name truncate', text: pf.name }),
+      el('span', { class: 'acctbtn__value num', text: U.fmtUSD(val.equity) }),
+      el('span', { class: 'acctbtn__caret', text: n > 1 ? `▾ ${n}` : '▾' }),
+    );
+  }
+
+  function renderAccountMenu() {
+    if (!R.acctMenu) return;
+    R.acctMenu.innerHTML = '';
+    const px = prices();
+    for (const pf of accounts()) {
+      const val = E.valuate(pf, px);
+      const ret = pf.startingCash > 0 ? (val.equity / pf.startingCash - 1) * 100 : 0;
+      const active = pf.id === S.st.activeAccount;
+      const row = el('button', {
+        class: 'acctmenu__row' + (active ? ' is-active' : ''),
+        role: 'option', 'aria-selected': active ? 'true' : 'false',
+      }, [
+        el('span', { class: 'acctmenu__name truncate', text: pf.name }),
+        el('span', { class: 'acctmenu__val num', text: U.fmtUSD(val.equity) }),
+        el('span', {
+          class: 'acctmenu__ret num ' + (ret >= 0 ? 'pos' : 'neg'),
+          text: U.fmtPct(ret),
+        }),
+      ]);
+      row.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        R.acctMenu.classList.add('hidden');
+        if (!active) switchAccount(pf.id);
+      });
+      R.acctMenu.appendChild(row);
+    }
+    const manage = el('button', { class: 'acctmenu__manage', text: 'Manage accounts…' });
+    manage.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      R.acctMenu.classList.add('hidden');
+      setView('accounts');
+    });
+    R.acctMenu.appendChild(manage);
   }
 
   function buildStatusbar() {
@@ -218,6 +288,8 @@
       V.renderCompareView();
     } else if (view === 'ideas') {
       V.renderIdeasView();
+    } else if (view === 'accounts') {
+      V.renderAccountsView();
     }
     V.renderAll();
   }
@@ -364,6 +436,25 @@
     addToWatchlist(asset.id);
     setFocus(asset.id);
     save();
+  }
+
+  /**
+   * Move to another account. The whole shell is rebuilt: positions, orders,
+   * blotter, order ticket and every price cell belong to the account that was
+   * showing, and reusing them would leave one account's numbers on another's
+   * screen.
+   */
+  function switchAccount(id) {
+    if (!E.setActiveAccount(S.st, id)) return false;
+    save();
+    // priceCells is a shared registry pruned on paint — see renderWatchlist.
+    V.buildChartPane();
+    V.buildBlotter();
+    V.buildOrderPane();
+    V.renderAll();
+    const pf = pfUser();
+    UI.toast({ title: `Switched to ${pf.name}`, message: `${U.fmtUSD(pf.cash, { fixed2: true })} cash available.` });
+    return true;
   }
 
   function addToWatchlist(assetId) {
@@ -574,5 +665,6 @@
   }
 
   PT.app = { S, R, mountShell: mount, setView, setFocus, addToWatchlist, removeFromWatchlist, renderWatchlist,
-    save, orderCtx, paintQuote, registerCell, priceCells, pfUser, pfAI, prices, marketOpenFor };
+    save, orderCtx, paintQuote, registerCell, priceCells, pfUser, pfAI, accounts,
+    switchAccount, renderAccountButton, renderAccountMenu, prices, marketOpenFor };
 })(window.PT);

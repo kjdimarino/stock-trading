@@ -68,7 +68,8 @@
   .terminal[data-view="portfolio"],
   .terminal[data-view="ai"],
   .terminal[data-view="compare"],
-  .terminal[data-view="ideas"] {
+  .terminal[data-view="ideas"],
+  .terminal[data-view="accounts"] {
     grid-template-areas: "rail topbar" "rail chart" "status status";
   }
 
