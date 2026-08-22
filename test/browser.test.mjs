@@ -119,6 +119,20 @@ try {
   check('crypto prices are real and positive',
     priced.filter(([k]) => ['BTC', 'ETH', 'SOL', 'DOGE'].includes(k)).every(([, q]) => q.price > 0));
 
+  /*
+   * The majors must come from Coinbase, not from the delayed CoinGecko tier.
+   * They all carry a CoinGecko id for market caps, and routing on that id once
+   * demoted every one of them to snapshot pricing — which read as everything
+   * going stale.
+   */
+  const majors = priced.filter(([k]) => ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE'].includes(k));
+  check('the majors are priced by Coinbase, not the delayed tier',
+    majors.length > 0 && majors.every(([, q]) => q.source !== 'coingecko'),
+    majors.map(([k, q]) => `${k}=${q.source}`).join(' '));
+  check('and none of them is graded stale',
+    majors.every(([, q]) => q.quality !== 'stale'),
+    majors.map(([k, q]) => `${k}=${q.quality}`).join(' '));
+
   const wsUp = await page.evaluate(() => window.PT.feed.status.cryptoLive);
   check(`crypto websocket connected${MOCK_WS ? ' (replaying real recorded frames)' : ' (live Coinbase feed)'}`,
     wsUp === true, `ws=${feed.status.ws}`);
@@ -293,7 +307,11 @@ try {
   await page.evaluate(() => window.PT.app.setView('compare'));
   await page.waitForTimeout(1200);
   const cmpText = await page.locator('.compare').innerText();
-  check('scoreboard shows both portfolios', /you/i.test(cmpText) && /ai trader/i.test(cmpText));
+  // The user's side is named after the account being traded, not a generic
+  // "You" — with several accounts open, which one is being compared matters.
+  const cmpName = await page.evaluate(() => window.PT.app.pfUser().name);
+  check('scoreboard names the account and the AI',
+    cmpText.includes(cmpName) && /ai trader/i.test(cmpText), `${cmpName} | ${cmpText.slice(0, 80)}`);
   check('scoreboard lists comparison metrics', /total return/i.test(cmpText) && /win rate/i.test(cmpText));
   check('scoreboard renders overlaid equity curves', (await page.locator('.compare canvas').count()) > 0);
 

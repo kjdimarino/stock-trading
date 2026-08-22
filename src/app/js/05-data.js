@@ -334,7 +334,10 @@
     for (const id of state.watched) {
       const a = PT.byId[id];
       if (!a || a.kind !== 'crypto') continue;
-      if (a.cg) delayed.push(`${id}:${a.cg}`);
+      // One rule, defined once: a coin is delayed only when Coinbase has no
+      // market for it. Every curated coin carries a CoinGecko id for market
+      // caps, so keying off that alone would demote all of them.
+      if (PT.isDelayedCoin(id)) delayed.push(`${id}:${a.cg}`);
       else live.push(id);
     }
     if (!live.length && !delayed.length) return;
@@ -492,7 +495,7 @@
       + (a.yh ? `&yh=${encodeURIComponent(a.yh)}` : '')
       // Only for coins with no Coinbase product: the curated coins carry a
       // CoinGecko id too, and theirs is for market caps, not candles.
-      + (a.cg && !a.cb ? `&cg=${encodeURIComponent(a.cg)}` : '');
+      + (PT.isDelayedCoin(assetId) ? `&cg=${encodeURIComponent(a.cg)}` : '');
     const j = await api(`/api/candles?asset=${encodeURIComponent(assetId)}&tf=${encodeURIComponent(tf)}${hint}`);
     if (j.error) throw new Error(j.error);
     const entry = {

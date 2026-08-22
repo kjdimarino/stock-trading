@@ -61,8 +61,15 @@ const out = `/* AUTO-GENERATED from src/universe.mjs by tools/gen-universe.mjs �
 
   PT.assetKind = function (id) { var a = PT.byId[id]; return a ? a.kind : 'stock'; };
   PT.isCrypto = function (id) { return PT.assetKind(id) === 'crypto'; };
-  /** A coin priced by CoinGecko snapshots rather than the live Coinbase feed. */
-  PT.isDelayedCoin = function (id) { var a = PT.byId[id]; return !!(a && a.cg); };
+  /**
+   * A coin priced by CoinGecko snapshots rather than the live Coinbase feed.
+   *
+   * The test is the absence of a Coinbase product, NOT the presence of a
+   * CoinGecko id: every curated coin carries a CoinGecko id already — it is what
+   * the market-cap panel looks up — so keying off that demotes BTC and friends
+   * to the delayed tier and stops the live socket from ever pricing them.
+   */
+  PT.isDelayedCoin = function (id) { var a = PT.byId[id]; return !!(a && a.cg && !a.cb); };
 })(window.PT);
 `;
 fs.writeFileSync(path.join(ROOT, 'src/app/js/02-universe.js'), out);

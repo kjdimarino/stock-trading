@@ -151,6 +151,41 @@ describe('sub-minute candles built from the tick buffer', () => {
   });
 });
 
+describe('which tier a coin belongs to', () => {
+  /*
+   * Every curated coin carries a CoinGecko id, because that is what the market
+   * cap panel looks up. Treating that id as the marker of the delayed tier
+   * demotes BTC and every other major to snapshot pricing and stops the live
+   * socket from ever subscribing to them — which is what "everything says
+   * stale" looked like from the outside. The marker is the ABSENCE of a
+   * Coinbase product, and this pins it.
+   */
+  it('a curated coin is live even though it has a CoinGecko id', () => {
+    const btc = PT.byId.BTC;
+    ok(btc, 'BTC must be in the seed universe');
+    ok(btc.cg, 'and it does carry a CoinGecko id');
+    ok(btc.cb, 'and a Coinbase product');
+    eq(PT.isDelayedCoin('BTC'), false, 'so it must NOT be treated as delayed');
+  });
+
+  it('every seed coin with a Coinbase market counts as live', () => {
+    for (const a of PT.assets) {
+      if (a.kind !== 'crypto' || !a.cb) continue;
+      eq(PT.isDelayedCoin(a.id), false, `${a.id} was demoted to the delayed tier`);
+    }
+  });
+
+  it('a coin discovered with only a CoinGecko id is delayed', () => {
+    PT.registerAsset({ id: 'TESTCOIN', name: 'Test Coin', kind: 'crypto', cg: 'test-coin', delayed: true });
+    eq(PT.isDelayedCoin('TESTCOIN'), true);
+    eq(PT.byId.TESTCOIN.cb, null, 'and it must never be handed to the Coinbase socket');
+  });
+
+  it('an unknown symbol is not a delayed coin', () => {
+    eq(PT.isDelayedCoin('NOT_A_THING'), false);
+  });
+});
+
 describe('freshness grading', () => {
   const q = (over) => Object.assign({ assetId: 'AAPL', price: 100, quality: 'live', t: Date.now() }, over);
 
