@@ -262,11 +262,11 @@ live app charges. Nothing can see the future.
 
 | | before | after | buy & hold |
 |---|---|---|---|
-| return | +7.6% | **+20.0%** | +1.6% |
-| max drawdown | -9.7% | **-8.3%** | -19.1% |
-| Sharpe | 0.64 | **1.13** | 0.16 |
-| profit factor | 1.19 | **1.85** | — |
-| avg win : avg loss | 2.8 : 1 | **8.4 : 1** | — |
+| return | +7.6% | **+20.4%** | +1.6% |
+| max drawdown | -9.7% | **-8.1%** | -19.1% |
+| Sharpe | 0.64 | **1.14** | 0.16 |
+| profit factor | 1.19 | **1.89** | — |
+| avg win : avg loss | 2.8 : 1 | **8.6 : 1** | — |
 
 The win rate is 18%. That is expected and fine — it is a trend system, and the
 payoff ratio is what pays for it.
@@ -275,7 +275,8 @@ Every setting was chosen on the first half of the history and then checked on
 the second half, which never influenced it. That discipline mattered: a
 parameter sweep found settings that turned the first half from -1.9% to +1.5%
 and made the second half *worse*, so those settings were discarded rather than
-shipped. `tools/ablate.mjs` turns each rule off in turn, and `test/strategy.test.mjs`
+shipped. `tools/ablate.mjs` turns each rule off in turn (and the ones that ship
+switched off, on), and `test/strategy.test.mjs`
 runs the whole backtest as a regression test on every build.
 
 **This is a demonstration of a rules engine, not investment advice, and 306 days

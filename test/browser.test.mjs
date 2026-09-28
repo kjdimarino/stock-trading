@@ -767,8 +767,18 @@ try {
 
   /* ---------------------------------------------------------- responsive */
   section('Responsive layout');
+  // The region switcher belongs to the trade view; the section above left Accounts open.
+  await page.evaluate(() => window.PT.app.setView('trade'));
   await page.setViewportSize({ width: 900, height: 800 });
   await page.waitForTimeout(900);
+  /*
+   * The terminal clips its own overflow, so a crowded topbar never widens the
+   * page: measure the bar itself.
+   */
+  const topbarFits = () => page.evaluate(() => {
+    const bar = document.querySelector('.topbar');
+    return bar.scrollWidth <= bar.clientWidth + 1 ? true : `${bar.scrollWidth} > ${bar.clientWidth}`;
+  });
   const narrow = await page.evaluate(() => {
     const t = document.querySelector('.terminal');
     return {
@@ -778,21 +788,36 @@ try {
     };
   });
   check('no horizontal overflow at 900px', !narrow.overflowX);
+  const fits900 = await topbarFits();
+  check('the topbar fits at 900px', fits900 === true, fits900);
   check('the chart survives a narrow viewport', narrow.chartVisible);
   check('the grid collapses to fewer columns', narrow.cols <= 2, `${narrow.cols} columns`);
+
+  /*
+   * Press the switcher where a finger would. A locator click scrolls the
+   * clipped terminal to reach a button pushed off-screen, which is exactly the
+   * failure this has to catch.
+   */
+  const tapRegion = async (label) => {
+    const b = await page.locator('.mobile-only .seg__item', { hasText: label }).boundingBox();
+    const vw = page.viewportSize().width;
+    if (!b || b.x < 0 || b.x + b.width > vw) return false;
+    await page.mouse.click(b.x + b.width / 2, b.y + b.height / 2);
+    return true;
+  };
 
   // The side panels become switchable rather than simply vanishing.
   check('a region switcher appears on narrow screens',
     await page.locator('.mobile-only').first().isVisible());
-  await page.locator('.mobile-only .seg__item', { hasText: 'List' }).click();
+  check('the switcher is on screen', await tapRegion('List'));
   await page.waitForTimeout(500);
   check('the watchlist can be switched in on a narrow screen',
     await page.locator('.watchlist').isVisible());
-  await page.locator('.mobile-only .seg__item', { hasText: 'Trade' }).click();
+  await tapRegion('Trade');
   await page.waitForTimeout(500);
   check('the order ticket can be switched in on a narrow screen',
     await page.locator('.orderpane').isVisible());
-  await page.locator('.mobile-only .seg__item', { hasText: 'Chart' }).click();
+  await tapRegion('Chart');
   await page.waitForTimeout(400);
 
   await page.setViewportSize({ width: 430, height: 900 });
@@ -800,6 +825,13 @@ try {
   check('no horizontal overflow at phone width',
     !(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1)),
     await page.evaluate(() => `${document.documentElement.scrollWidth} > ${window.innerWidth}`));
+  const fits430 = await topbarFits();
+  check('the topbar fits at phone width', fits430 === true, fits430);
+  check('the order ticket is reachable at phone width', await tapRegion('Trade'));
+  await page.waitForTimeout(400);
+  check('and opens', await page.locator('.orderpane').isVisible());
+  await tapRegion('Chart');
+  await page.waitForTimeout(300);
 
   await page.setViewportSize({ width: 1600, height: 950 });
   await page.waitForTimeout(900);

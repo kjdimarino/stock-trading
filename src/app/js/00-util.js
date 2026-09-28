@@ -12,8 +12,14 @@ window.PT = window.PT || {};
   function round(value, dp) {
     if (!isFinite(value)) return 0;
     const f = Math.pow(10, dp);
-    // Nudge by Number.EPSILON so 1.005 -> 1.01 rather than 1.00.
-    return Math.round((value + Number.EPSILON * Math.sign(value) * Math.abs(value)) * f) / f;
+    const a = Math.abs(value);
+    // From 2^50 scaled units up a double resolves no finer than a quarter
+    // unit, so there is no float noise left to clean, and the nudge below
+    // would push the value up a unit on every call (30M coins at 8dp).
+    if (a * f >= 2 ** 50) return value;
+    // Nudge by Number.EPSILON so 1.005 -> 1.01 rather than 1.00. Rounding the
+    // magnitude keeps ties away from zero for negatives too.
+    return Math.sign(value) * Math.round((a + Number.EPSILON * a) * f) / f;
   }
 
   const money = (v) => round(v, 2);
@@ -38,13 +44,14 @@ window.PT = window.PT || {};
 
   /* ------------------------------------------------------------ formatting */
 
-  const nf = (min, max) => new Intl.NumberFormat('en-US', {
-    minimumFractionDigits: min, maximumFractionDigits: max,
+  const nf = (min, max, mode) => new Intl.NumberFormat('en-US', {
+    minimumFractionDigits: min, maximumFractionDigits: max, roundingMode: mode,
   });
   const cache = new Map();
-  function fmtNum(v, min, max) {
-    const key = min + ':' + max;
-    if (!cache.has(key)) cache.set(key, nf(min, max));
+  /** `mode` is an Intl roundingMode ('trunc' etc.); the default rounds halves away from zero. */
+  function fmtNum(v, min, max, mode) {
+    const key = min + ':' + max + ':' + (mode || '');
+    if (!cache.has(key)) cache.set(key, nf(min, max, mode));
     return cache.get(key).format(v);
   }
 
@@ -53,8 +60,9 @@ window.PT = window.PT || {};
     if (v == null || !isFinite(v)) return '—';
     const a = Math.abs(v);
     let dp = 2;
-    if (!opts.fixed2) {
-      if (a > 0 && a < 0.0001) dp = 8;
+    if (!opts.fixed2 && a > 0) {
+      // Under $0.0001, keep ~4 significant digits however many zeros that takes.
+      if (a < 0.0001) dp = Math.min(20, Math.max(8, Math.ceil(-Math.log10(a)) + 3));
       else if (a < 0.01) dp = 6;
       else if (a < 1) dp = 4;
     }
@@ -79,27 +87,35 @@ window.PT = window.PT || {};
     return fmtNum(Math.abs(v), dp, dp) + '%';
   }
 
-  /** Compact quantity: hide trailing zeros but keep small coin amounts readable. */
+  /**
+   * Compact quantity: hide trailing zeros but keep small coin amounts readable.
+   * Extra digits are cut, never rounded up: a holding of 2.99849475 must not
+   * read as 2.9985, or selling the amount shown asks for more than is held.
+   */
   function fmtQty(v) {
     if (v == null || !isFinite(v)) return '—';
     const a = Math.abs(v);
     if (a === 0) return '0';
-    if (a >= 1000) return fmtNum(v, 0, 2);
-    if (a >= 1) return fmtNum(v, 0, 4);
-    if (a >= 0.0001) return fmtNum(v, 0, 6);
-    return fmtNum(v, 0, 8);
+    if (a >= 1000) return fmtNum(v, 0, 2, 'trunc');
+    if (a >= 1) return fmtNum(v, 0, 4, 'trunc');
+    if (a >= 0.0001) return fmtNum(v, 0, 6, 'trunc');
+    return fmtNum(v, 0, 8, 'trunc');
   }
+
+  // [unit, suffix, min decimals, max decimals], smallest first.
+  const COMPACT = [[1, '', 0, 2], [1e3, 'K', 1, 1], [1e6, 'M', 2, 2], [1e9, 'B', 2, 2], [1e12, 'T', 2, 2]];
 
   /** 1_234_567 -> "1.23M" for market caps and volume. */
   function fmtCompact(v) {
     if (v == null || !isFinite(v)) return '—';
     const a = Math.abs(v);
     const s = v < 0 ? '-' : '';
-    if (a >= 1e12) return s + fmtNum(a / 1e12, 2, 2) + 'T';
-    if (a >= 1e9) return s + fmtNum(a / 1e9, 2, 2) + 'B';
-    if (a >= 1e6) return s + fmtNum(a / 1e6, 2, 2) + 'M';
-    if (a >= 1e3) return s + fmtNum(a / 1e3, 1, 1) + 'K';
-    return s + fmtNum(a, 0, 2);
+    // Step up a unit whenever the rounded figure would reach 1,000 of this one,
+    // so 999,999 reads "1.00M" rather than "1,000.0K".
+    let i = 0;
+    while (i < COMPACT.length - 1 && round(a / COMPACT[i][0], COMPACT[i][3]) >= 1000) i++;
+    const [unit, suffix, min, max] = COMPACT[i];
+    return s + fmtNum(a / unit, min, max) + suffix;
   }
 
   const timeFmt = new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' });

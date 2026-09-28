@@ -30,10 +30,12 @@
     wsAttempts: 0,
     openedAt: 0,
     wsSubscribed: new Set(),
+    lastWsMsgAt: 0,               // last frame of any kind, for the liveness check
     lastStockPoll: 0,
     stockPollInFlight: false,
     lastFocusPoll: 0,
     focusPollInFlight: false,
+    cryptoPollInFlight: false,
     serverUp: true,
     counters: { ticks: 0, polls: 0, wsReconnects: 0 },
     // Rolling per-asset tick history, the source for sub-minute candles.
@@ -45,9 +47,30 @@
 
   /* --------------------------------------------------------------- quotes */
 
+  const older = (a, b) => Number.isFinite(a) && Number.isFinite(b) && a < b;
+
   function applyQuote(assetId, patch) {
     const prev = state.prices[assetId];
-    const next = Object.assign({}, prev, patch, { assetId, t: patch.t || Date.now() });
+    /*
+     * Two lanes poll the same symbol, and a slow reply can land after a newer
+     * one: the sweep waits on its slowest symbol, and its value may come from
+     * a cache entry or a fetch begun seconds earlier. A patch observed before
+     * the quote on screen is dropped rather than let the price, and every
+     * order crossing it, step back in time. `quoteTime` is the exchange's
+     * stamp; `fetchedAt`, where the server sends one, is when it observed the
+     * value, and is all there is to go on for a Nasdaq quote.
+     */
+    if (prev && (older(patch.quoteTime, prev.quoteTime) || older(patch.fetchedAt, prev.fetchedAt))) return prev;
+    // A missing or zero price must not overwrite the last good one.
+    if ('price' in patch && !(Number.isFinite(patch.price) && patch.price > 0)) {
+      patch = Object.assign({}, patch);
+      delete patch.price;
+    }
+    // Stamps belong to the source that sent them. Carried onto a later update
+    // that has none (a socket tick, a bulk snapshot), a REST quoteTime would
+    // grade a live stream stale.
+    const next = Object.assign({}, prev, { quoteTime: null, fetchedAt: null }, patch,
+      { assetId, t: patch.t || Date.now() });
 
     // Direction of the last print, used by the UI for the tick flash.
     if (prev && isFinite(prev.price) && isFinite(next.price)) {
@@ -68,14 +91,26 @@
 
   function recordTick(assetId, price, t) {
     if (!isFinite(price)) return;
+    /*
+     * Two clocks feed this buffer: REST top-ups are stamped here, socket
+     * prints with the exchange's time. When they disagree, a print can arrive
+     * stamped before the last one, or after "now". candlesFromTicks walks the
+     * buffer in time order, so each print is inserted where it belongs (one
+     * appended out of place froze the chart until it scrolled away), and a
+     * future stamp is held at now so the newest bar does not leave it out.
+     */
+    t = Math.min(t, Date.now());
     const buf = state.ticks[assetId] || (state.ticks[assetId] = []);
-    const last = buf[buf.length - 1];
+    let at = buf.length;
+    while (at > 0 && buf[at - 1].t > t) at--;
+    const before = buf[at - 1];
     // Collapse repeat prints at the same instant.
-    if (last && last.t === t && last.p === price) return;
-    buf.push({ t, p: price });
+    if (before && before.t === t && before.p === price) return;
+    buf.splice(at, 0, { t, p: price });
     if (buf.length > TICK_HISTORY_MAX) buf.splice(0, buf.length - TICK_HISTORY_MAX);
-    if (buf.length > 64 && t - buf[0].t > TICK_HISTORY_MS) {
-      const cutoff = t - TICK_HISTORY_MS;
+    const newest = buf[buf.length - 1].t;
+    if (buf.length > 64 && newest - buf[0].t > TICK_HISTORY_MS) {
+      const cutoff = newest - TICK_HISTORY_MS;
       let i = 0;
       while (i < buf.length && buf[i].t < cutoff) i++;
       if (i > 0) buf.splice(0, i);
@@ -151,7 +186,8 @@
       const kind = PT.assetKind(assetId);
       return state.ready[kind === 'crypto' ? 'crypto' : 'stock'] ? 'none' : 'loading';
     }
-    if (!isFinite(q.price)) return 'none';
+    // isFinite(null) is true, so test the number itself.
+    if (!(Number.isFinite(q.price) && q.price > 0)) return 'none';
     if (q.quality === 'delayed') return 'delayed';
     if (q.quality === 'cached') return 'cached';
     const kind = PT.assetKind(q.assetId);
@@ -165,9 +201,28 @@
 
   /* ----------------------------------------------------- coinbase socket */
 
+  /*
+   * What the crypto feed keeps priced: the watchlist, plus the focused symbol.
+   * The chart and order ticket trade against the focused quote, so removing
+   * its watchlist row must not unsubscribe it.
+   */
+  const feedIds = () => (state.focus && !state.watched.has(state.focus)
+    ? [...state.watched, state.focus] : state.watched);
+
+  const CHANNELS = ['ticker', 'heartbeat'];
+
+  /*
+   * A socket can stay 'open' long after it stops carrying anything: a laptop
+   * wakes on the same network, a NAT mapping expires, a proxy drops the
+   * stream. The browser may take minutes to notice. Heartbeats arrive every
+   * second for every product, so this much silence means the line is dead.
+   */
+  const WS_SILENT_MS = 15000;
+  const wsLive = () => state.wsState === 'open' && Date.now() - state.lastWsMsgAt < WS_SILENT_MS;
+
   const cryptoProducts = () => {
     const ids = [];
-    for (const id of state.watched) {
+    for (const id of feedIds()) {
       const a = PT.byId[id];
       if (a && a.kind === 'crypto' && a.cb) ids.push(a.cb);
     }
@@ -230,16 +285,17 @@
 
     ws.onopen = () => {
       state.wsState = 'open';
-      state.openedAt = Date.now();
+      state.openedAt = state.lastWsMsgAt = Date.now();
       state.ready.crypto = true;
       // Re-read the watched set: it may have changed during the handshake.
       const current = cryptoProducts();
       state.wsSubscribed = new Set(current);
-      ws.send(JSON.stringify({ type: 'subscribe', product_ids: current, channels: ['ticker'] }));
+      ws.send(JSON.stringify({ type: 'subscribe', product_ids: current, channels: CHANNELS }));
       bus.emit('status', snapshotStatus());
     };
 
     ws.onmessage = (ev) => {
+      state.lastWsMsgAt = Date.now();
       let m;
       try { m = JSON.parse(ev.data); } catch { return; }
       if (m.type === 'error') {
@@ -262,6 +318,22 @@
     };
 
     ws.onerror = () => { try { ws.close(); } catch { /* already gone */ } };
+  }
+
+  /** Drop a socket that has gone quiet without closing, and fall back to REST. */
+  function checkSocket() {
+    if (state.wsState !== 'open' || wsLive()) return;
+    const ws = state.ws;
+    state.ws = null;
+    state.wsState = 'closed';
+    if (ws) {
+      // Its close event may never come, and if it did it would clear the
+      // socket that replaces this one.
+      ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+      try { ws.close(); } catch { /* already gone */ }
+    }
+    bus.emit('status', snapshotStatus());
+    scheduleReconnect();
   }
 
   function scheduleReconnect() {
@@ -305,8 +377,8 @@
     const remove = [...state.wsSubscribed].filter((p) => !want.has(p));
     if (!add.length && !remove.length) return;
     try {
-      if (add.length) state.ws.send(JSON.stringify({ type: 'subscribe', product_ids: add, channels: ['ticker'] }));
-      if (remove.length) state.ws.send(JSON.stringify({ type: 'unsubscribe', product_ids: remove, channels: ['ticker'] }));
+      if (add.length) state.ws.send(JSON.stringify({ type: 'subscribe', product_ids: add, channels: CHANNELS }));
+      if (remove.length) state.ws.send(JSON.stringify({ type: 'unsubscribe', product_ids: remove, channels: CHANNELS }));
     } catch { return; }
     state.wsSubscribed = want;
   }
@@ -331,7 +403,7 @@
    */
   async function pollCrypto() {
     const live = [], delayed = [];
-    for (const id of state.watched) {
+    for (const id of feedIds()) {
       const a = PT.byId[id];
       if (!a || a.kind !== 'crypto') continue;
       // One rule, defined once: a coin is delayed only when Coinbase has no
@@ -341,6 +413,10 @@
       else live.push(id);
     }
     if (!live.length && !delayed.length) return;
+    // One at a time, like the stock lanes: a slow server would otherwise
+    // collect a request a second and starve every other call to this host.
+    if (state.cryptoPollInFlight) return;
+    state.cryptoPollInFlight = true;
     const params = [];
     if (live.length) params.push(`crypto=${encodeURIComponent(live.join(','))}`);
     if (delayed.length) params.push(`gecko=${encodeURIComponent(delayed.join(','))}`);
@@ -350,18 +426,19 @@
       for (const id in j.quotes) {
         const q = j.quotes[id];
         /*
-         * Coinbase's ticker channel only emits on trades, so a quiet product
-         * can sit blank for minutes after subscribing. Fill it from REST, but
-         * never overwrite a price the socket has already delivered.
+         * Fill gaps from REST, but never overwrite a price a live socket has
+         * already delivered. A socket gone silent does not count.
          */
         const existing = state.prices[id];
-        if (state.wsState === 'open' && existing && existing.source === 'coinbase-ws') continue;
+        if (wsLive() && existing && existing.source === 'coinbase-ws') continue;
         applyQuote(id, { ...q, t: Date.now() });
       }
       state.serverUp = true;
     } catch (e) {
       state.serverUp = false;
       bus.emit('status', snapshotStatus());
+    } finally {
+      state.cryptoPollInFlight = false;
     }
   }
 
@@ -371,7 +448,7 @@
    */
   /** True when a watched coin still has no price at all. */
   function cryptoAwaitingPrice() {
-    for (const id of state.watched) {
+    for (const id of feedIds()) {
       // Delayed coins are never expected to arrive over the socket.
       if (!PT.isCrypto(id) || PT.isDelayedCoin(id)) continue;
       const q = state.prices[id];
@@ -557,7 +634,7 @@
       serverUp: state.serverUp,
       counters: { ...state.counters },
       ready: { ...state.ready },
-      cryptoLive: state.wsState === 'open',
+      cryptoLive: wsLive(),
     };
   }
 
@@ -574,6 +651,7 @@
     timer = setInterval(() => {
       pollStocks(false);
       pollFocused();
+      checkSocket();
       // Repair any subscription drift (e.g. a change made mid-handshake).
       if (state.wsState === 'open') syncSubscriptions();
       // Top up over REST while the socket is down, or for coins it has not
@@ -585,11 +663,13 @@
     // Reconnect promptly when the tab comes back or the network returns.
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
+        // Timers are throttled in a background tab, so check here too.
+        checkSocket();
         if (state.wsState !== 'open') connectWS();
         pollStocks(true);
       }
     });
-    window.addEventListener('online', () => { connectWS(); pollStocks(true); });
+    window.addEventListener('online', () => { checkSocket(); connectWS(); pollStocks(true); });
   }
 
   function stop() {
@@ -617,11 +697,16 @@
   }
 
   const setFocus = (id) => {
+    const prev = state.focus;
     state.focus = id;
     // Refresh the newly focused symbol immediately rather than waiting for the
     // next sweep — this is the quote the user is about to trade against.
     state.lastFocusPoll = 0;
-    if (state.started) pollFocused();
+    if (!state.started) return;
+    pollFocused();
+    // A coin is fed while watched or focused, so the socket follows focus.
+    if (PT.isCrypto(id) || PT.isCrypto(prev)) syncSubscriptions();
+    if (PT.isCrypto(id) && !state.watched.has(id)) pollCrypto();
   };
 
   /** Resolves once the first quote cycle has completed (or after `timeout`). */

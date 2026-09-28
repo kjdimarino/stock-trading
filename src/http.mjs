@@ -32,13 +32,18 @@ function connect(hostname, port, cb) {
     return cb(null, null); // caller uses a direct request
   }
   const p = new URL(PROXY);
+  const headers = { Host: `${hostname}:${port}` };
+  if (p.username) {
+    // URL keeps userinfo percent-encoded ('p%40ss'); the proxy wants 'p@ss'.
+    const dec = (s) => { try { return decodeURIComponent(s); } catch { return s; } }; // malformed: as written
+    headers['Proxy-Authorization'] = 'Basic ' + Buffer.from(`${dec(p.username)}:${dec(p.password)}`).toString('base64');
+  }
   const req = http.request({
     host: p.hostname,
     port: p.port || 80,
     method: 'CONNECT',
     path: `${hostname}:${port}`,
-    headers: { Host: `${hostname}:${port}` },
-    ...(p.username ? { headers: { Host: `${hostname}:${port}`, 'Proxy-Authorization': 'Basic ' + Buffer.from(`${p.username}:${p.password}`).toString('base64') } } : {}),
+    headers,
   });
   req.on('connect', (res, socket) => {
     if (res.statusCode !== 200) {

@@ -69,13 +69,118 @@
     };
   }
 
-  const persist = U.debounce(() => { if (!S.resetting) E.save(S.st); }, 600);
+  /*
+   * One saved book, possibly several open tabs. Every save writes the whole
+   * book, so two tabs saving on their own clocks would each keep putting back
+   * the copy they loaded and revert the other's trades. So one tab writes at a
+   * time — whichever was last opened, looked at or used — and the others follow
+   * what it saves until they are used themselves. `rev` numbers the saves, so a
+   * tab can tell a newer book from the one it holds.
+   */
+  const TAB_ID = U.uid('tab');
+  const WRITER_KEY = E.STORAGE_KEY + '.writer';
+  let writer = false;
+
+  const writerKey = () => { try { return localStorage.getItem(WRITER_KEY); } catch { return null; } };
+
+  const persist = U.debounce(() => {
+    if (S.resetting || !writer) return;
+    S.st.rev = (S.st.rev || 0) + 1;
+    E.save(S.st);
+  }, 600);
   /** Debounced persistence. No-ops once a reset is under way. */
-  const save = (...a) => { if (!S.resetting) persist(...a); };
+  const save = (...a) => {
+    if (S.resetting) return;
+    // Something changed in this tab, so this is the tab in use.
+    claimWriter();
+    persist(...a);
+  };
   save.cancel = () => persist.cancel();
   /** Write a pending save immediately — used when the page is going away. */
   save.flush = () => { if (!S.resetting) persist.flush(); };
   save.pending = () => persist.pending();
+
+  const isWriter = () => writer;
+
+  /**
+   * Become the tab that saves. `catchUp` first takes anything newer another
+   * tab saved; a claim made by saving skips that, since it would throw away
+   * the change being saved.
+   */
+  function claimWriter(catchUp) {
+    if (writer || !S.st) return;
+    if (catchUp) {
+      const stored = E.load();
+      if (stored && (stored.rev || 0) > (S.st.rev || 0)) adoptBook(stored);
+    }
+    writer = true;
+    try { localStorage.setItem(WRITER_KEY, TAB_ID); } catch { /* no storage: the only tab */ }
+  }
+
+  /** Another tab has taken over: hand it anything unsaved, then follow. */
+  function yieldWriter() {
+    if (!writer) return;
+    persist.flush();
+    writer = false;
+  }
+
+  /** This page is going away: save, and let a tab that remains take over. */
+  function releaseWriter() {
+    if (!writer) return;
+    yieldWriter();
+    try { if (writerKey() === TAB_ID) localStorage.removeItem(WRITER_KEY); } catch { /* ignore */ }
+  }
+
+  /** Two claims that crossed can leave nobody writing; the named tab resumes. */
+  function checkWriter() {
+    if (!writer && S.st && writerKey() === TAB_ID) claimWriter(true);
+  }
+
+  /** A `storage` event: another tab saved the book or took over writing it. */
+  function onStorage(e) {
+    if (!S.st) return;
+    if (e.key === WRITER_KEY) {
+      // The writing tab closed. Someone has to keep resting orders working.
+      if (e.newValue == null) claimWriter(true);
+      else if (e.newValue !== TAB_ID) yieldWriter();
+      return;
+    }
+    if (e.key !== null && e.key !== E.STORAGE_KEY) return;
+    if (e.newValue == null) {
+      // Reset in another tab. Saving this copy would undo it, so start over too.
+      S.resetting = true;
+      persist.cancel();
+      location.reload();
+      return;
+    }
+    const stored = E.load();
+    if (!stored) return;
+    if (!writer || ((stored.rev || 0) > (S.st.rev || 0) && !persist.pending())) {
+      adoptBook(stored);
+      return;
+    }
+    // Saved by a tab that had not yet seen this one take over. This tab is the
+    // one in use, so its book goes back on top.
+    S.st.rev = Math.max(S.st.rev || 0, stored.rev || 0);
+    persist();
+    persist.flush();
+  }
+
+  /** Put a book saved by another tab on screen in place of this one. */
+  function adoptBook(next) {
+    persist.cancel();
+    delete next.repairs;   // the tab that loaded it has already said so
+    S.st = next;
+    for (const id in (S.st.discovered || {})) PT.registerAsset(S.st.discovered[id]);
+    if (!R.terminal) return;
+    // Every pane that shows the book is rebuilt: they close over its objects.
+    renderWatchlist();
+    V.bindDrawings(S.focus);
+    V.buildBlotter();
+    V.buildOrderPane();
+    if (S.view === 'accounts') V.renderAccountsView();
+    V.renderAll();
+  }
 
   /* --------------------------------------------------------------- shell */
 
@@ -448,10 +553,13 @@
     if (!E.setActiveAccount(S.st, id)) return false;
     save();
     // priceCells is a shared registry pruned on paint — see renderWatchlist.
-    V.buildChartPane();
+    // Only the trade view shows the chart; building it on any other view would
+    // replace that view while the rail still names it.
+    if (S.view === 'trade') V.buildChartPane();
     V.buildBlotter();
     V.buildOrderPane();
-    V.renderAll();
+    if (S.view === 'trade') V.renderAll();
+    else setView(S.view);
     const pf = pfUser();
     UI.toast({ title: `Switched to ${pf.name}`, message: `${U.fmtUSD(pf.cash, { fixed2: true })} cash available.` });
     return true;
@@ -469,10 +577,27 @@
 
   function removeFromWatchlist(assetId) {
     S.st.watchlist = S.st.watchlist.filter((x) => x !== assetId);
-    // Keep streaming anything we still hold, even if it left the list.
-    if (!pfUser().positions[assetId] && !pfAI().positions[assetId]) PT.feed.unwatch(assetId);
+    // Keep streaming anything still needed, even if it left the list.
+    if (!neededSymbols().has(assetId)) PT.feed.unwatch(assetId);
     save();
     renderWatchlist();
+  }
+
+  /**
+   * Every symbol something depends on a price for: the watchlist, the chart,
+   * and each position and live order on every account and the AI's. One left
+   * out is never priced, so its orders never fill and its holdings sit at cost.
+   */
+  function neededSymbols() {
+    const ids = new Set(S.st.watchlist);
+    if (S.focus) ids.add(S.focus);
+    for (const id of E.accountIds(S.st).concat('ai')) {
+      const pf = S.st.portfolios[id];
+      if (!pf) continue;
+      for (const assetId in pf.positions) ids.add(assetId);
+      for (const o of pf.orders) ids.add(o.assetId);
+    }
+    return ids;
   }
 
   function renderWatchlist() {
@@ -666,5 +791,6 @@
 
   PT.app = { S, R, mountShell: mount, setView, setFocus, addToWatchlist, removeFromWatchlist, renderWatchlist,
     save, orderCtx, paintQuote, registerCell, priceCells, pfUser, pfAI, accounts,
-    switchAccount, renderAccountButton, renderAccountMenu, prices, marketOpenFor };
+    switchAccount, renderAccountButton, renderAccountMenu, prices, marketOpenFor, neededSymbols,
+    isWriter, claimWriter, releaseWriter, checkWriter, onStorage };
 })(window.PT);

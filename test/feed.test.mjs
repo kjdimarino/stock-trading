@@ -4,11 +4,56 @@
  */
 import { loadPT, describe, it, eq, ok, near, report } from './harness.mjs';
 
-const { PT } = loadPT([
+const FILES = [
   'src/app/js/00-util.js', 'src/app/js/01-calendar.js',
   'src/app/js/02-universe.js', 'src/app/js/05-data.js',
-]);
+];
+const { PT } = loadPT(FILES);
 const F = PT.feed;
+
+/*
+ * A fresh feed with the socket, the server, the timers and the clock all in
+ * the test's hands, for the lifecycle paths a pure call cannot reach. The
+ * default clock is Tue 2026-09-29 10:00 ET, inside a regular session.
+ */
+function rig(startAt = Date.UTC(2026, 8, 29, 14, 0)) {
+  const { PT: P, sandbox } = loadPT(FILES);
+  const clock = { now: startAt };
+  const RealDate = Date;
+  sandbox.Date = class extends RealDate {
+    constructor(...a) { super(...(a.length ? a : [clock.now])); }
+    static now() { return clock.now; }
+  };
+  const every = [];
+  sandbox.setInterval = (fn) => { every.push(fn); return every.length; };
+  sandbox.clearInterval = () => {};
+  sandbox.setTimeout = () => 0;              // reconnect backoff: never fires on its own
+  const listeners = {};
+  sandbox.document = { hidden: false, addEventListener: (ev, fn) => { listeners[ev] = fn; } };
+  sandbox.addEventListener = (ev, fn) => { listeners[ev] = fn; };
+  const sockets = [];
+  sandbox.WebSocket = class {
+    constructor() { this.sent = []; this.closed = false; sockets.push(this); }
+    send(m) { this.sent.push(JSON.parse(m)); }
+    close() { this.closed = true; }
+  };
+  // Every request waits until the test answers it.
+  const requests = [];
+  sandbox.fetch = (url) => new Promise((resolve) => {
+    const req = { url: decodeURIComponent(url), done: false };
+    req.reply = (body) => { req.done = true; resolve({ ok: true, status: 200, json: async () => body }); };
+    requests.push(req);
+  });
+  return {
+    F: P.feed, clock, sockets, requests, listeners,
+    get ws() { return sockets[sockets.length - 1]; },
+    cryptoPolls: () => requests.filter((r) => r.url.includes('crypto=')),
+    /** Advance the clock one second and run the feed's timer. */
+    second() { clock.now += 1000; for (const fn of every) fn(); },
+    frame(ws, m) { ws.onmessage({ data: JSON.stringify(m) }); },
+    settle: () => new Promise((r) => setImmediate(r)),
+  };
+}
 
 const HOUR = 3600e3;
 /* A real Yahoo 60m equity series: bars are anchored on the 09:30 ET open, so
@@ -148,6 +193,172 @@ describe('sub-minute candles built from the tick buffer', () => {
 
   it('returns nothing at all when no print has ever arrived', () => {
     eq(F.candlesFromTicks('NEVER_SEEN', '1s').length, 0);
+  });
+
+  it('one print from an earlier bucket does not freeze the series', () => {
+    /*
+     * REST top-ups are stamped with the local clock and socket prints with
+     * the exchange's. With the two a couple of seconds apart, the first socket
+     * print lands before the last REST one. Appending it blindly used to stall
+     * the bucket scan there, so every later print was ignored for minutes.
+     */
+    const later = Array.from({ length: 25 }, (_, k) => [base - 29000 + k * 1000, 225 - k]);
+    const id = feed([[base - 60000, 100], [base - 30000, 101], [base - 32000, 99], ...later]);
+    const one = F.candlesFromTicks(id, '1s');
+    eq(one[one.length - 1].c, 201, 'the 1s chart follows the tape');
+    eq(one.find((b) => b.t === base - 32000).c, 99, 'the late print sits where it belongs');
+    const five = F.candlesFromTicks(id, '5s');
+    eq(five[five.length - 1].c, 201, 'and so does the 5s chart');
+  });
+
+  it('a print stamped ahead of the local clock still reaches the newest bar', () => {
+    const id = feed([[base - 3000, 50], [Date.now() + 3000, 55]]);
+    const bars = F.candlesFromTicks(id, '1s');
+    eq(bars[bars.length - 1].c, 55);
+  });
+});
+
+describe('merging and ordering quotes', () => {
+  it('an exchange stamp does not outlive the source that sent it', () => {
+    // Per-product REST sets quoteTime; socket ticks do not. Carried forward,
+    // that one stamp graded a live stream STALE 25s later, for the session.
+    F.applyQuote('BTC', { price: 64000, source: 'coinbase', quality: 'live', quoteTime: Date.now() - 60000 });
+    F.applyQuote('BTC', { price: 64010, source: 'coinbase-ws', quality: 'live', t: Date.now() - 200 });
+    eq(F.quote('BTC').quoteTime, null);
+    eq(F.grade(F.quote('BTC')), 'live');
+  });
+
+  it('drops a quote the exchange stamped before the one on screen', () => {
+    const now = Date.now();
+    F.applyQuote('ORDER1', { price: 108.66, quoteTime: now - 1000 });
+    F.applyQuote('ORDER1', { price: 106.40, quoteTime: now - 6000 });
+    eq(F.price('ORDER1'), 108.66);
+    F.applyQuote('ORDER1', { price: 109, quoteTime: now });
+    eq(F.price('ORDER1'), 109, 'a newer stamp still lands');
+  });
+
+  it('drops a quote the server observed before the one on screen', () => {
+    // Nasdaq quotes carry no exchange stamp; the server's own is all there is.
+    F.applyQuote('ORDER2', { price: 50, quoteTime: null, fetchedAt: 2000 });
+    F.applyQuote('ORDER2', { price: 49, quoteTime: null, fetchedAt: 1000 });
+    eq(F.price('ORDER2'), 50);
+  });
+
+  it('a slow watchlist sweep cannot roll back the focus lane', async () => {
+    const r = rig();
+    r.F.watch(['AAPL', 'MSFT']);
+    r.F.start();
+    r.F.setFocus('AAPL');
+    const sweep = r.requests.find((q) => q.url.includes('AAPL,MSFT'));
+    const focus = r.requests.find((q) => /stocks=AAPL&/.test(q.url));
+    ok(sweep && focus, 'both lanes asked');
+    const T = r.clock.now;
+    const yq = (price, quoteTime) => ({ price, quoteTime, marketState: 'REGULAR', quality: 'live', source: 'yahoo' });
+    focus.reply({ quotes: { AAPL: yq(108.66, T - 1000) } });
+    await r.settle();
+    // The sweep's AAPL came from a cache entry filled seconds earlier.
+    sweep.reply({ quotes: { AAPL: yq(106.40, T - 6000), MSFT: yq(400, T - 900) } });
+    await r.settle();
+    eq(r.F.price('AAPL'), 108.66, 'the older price must not replace the newer one');
+    eq(r.F.quote('AAPL').tickDir, 0);
+    eq(r.F.price('MSFT'), 400, 'the rest of the sweep still lands');
+  });
+});
+
+describe('crypto feed lifecycle', () => {
+  const ticker = (r, price) => ({
+    type: 'ticker', product_id: 'BTC-USD', price: String(price), time: new Date(r.clock.now).toISOString(),
+  });
+
+  it('a socket that goes silent without closing is replaced, and REST takes over', async () => {
+    const r = rig();
+    r.F.watch(['BTC']);
+    r.F.start();
+    r.cryptoPolls()[0].reply({ quotes: {} });
+    await r.settle();
+    const ws = r.ws;
+    ws.onopen();
+    ok(ws.sent[0].channels.includes('heartbeat'), 'heartbeats prove a quiet socket is alive');
+    r.frame(ws, ticker(r, 64000));
+    eq(r.F.price('BTC'), 64000);
+
+    // Half-open TCP after a laptop wakes: still 'open', never another frame.
+    for (let i = 0; i < 16; i++) r.second();
+    ok(ws.closed, 'the dead socket is torn down');
+    ok(r.F.status.ws !== 'open', `status still says ${r.F.status.ws}`);
+    eq(r.F.status.cryptoLive, false, 'the top bar must not say Live feed');
+    const poll = r.cryptoPolls().find((q) => !q.done);
+    ok(poll, 'REST picks the coin up');
+    poll.reply({ quotes: { BTC: { price: 61000, source: 'coinbase', quality: 'live' } } });
+    await r.settle();
+    eq(r.F.price('BTC'), 61000, 'and replaces the frozen socket price');
+  });
+
+  it('heartbeats keep a socket on a quiet market alive', () => {
+    const r = rig();
+    r.F.watch(['BTC']);
+    r.F.start();
+    const ws = r.ws;
+    ws.onopen();
+    for (let i = 0; i < 40; i++) {
+      r.second();
+      r.frame(ws, { type: 'heartbeat', product_id: 'BTC-USD', time: new Date(r.clock.now).toISOString() });
+    }
+    eq(ws.closed, false);
+    eq(r.F.status.ws, 'open');
+    eq(r.sockets.length, 1);
+  });
+
+  it('coming back to the tab replaces a socket that died in the background', () => {
+    const r = rig();
+    r.F.watch(['BTC']);
+    r.F.start();
+    r.ws.onopen();
+    r.clock.now += 10 * 60e3;                // timers are throttled while hidden
+    r.listeners.visibilitychange();
+    eq(r.sockets.length, 2, 'a new socket is opened at once');
+    ok(r.sockets[0].closed);
+  });
+
+  it('never stacks crypto polls while one is still out', async () => {
+    const r = rig();
+    r.F.watch(['BTC']);
+    r.F.start();                             // the socket never opens
+    for (let i = 0; i < 6; i++) r.second();
+    eq(r.cryptoPolls().length, 1, 'one request at a time, however slow the server');
+    r.cryptoPolls()[0].reply({ quotes: { BTC: { price: 1, source: 'coinbase', quality: 'live' } } });
+    await r.settle();
+    r.second();
+    eq(r.cryptoPolls().length, 2, 'the next one goes once it has answered');
+  });
+
+  it('unwatching the focused coin keeps feeding the quote being traded', async () => {
+    const r = rig();
+    r.F.watch(['BTC', 'ADA']);
+    r.F.setFocus('ADA');
+    r.F.start();
+    r.cryptoPolls()[0].reply({ quotes: {} });
+    await r.settle();
+    const ws = r.ws;
+    ws.onopen();
+    r.F.unwatch('ADA');
+    ok(!ws.sent.some((m) => m.type === 'unsubscribe' && m.product_ids.includes('ADA-USD')),
+      'the socket must keep the focused coin');
+    // And with the socket down, REST keeps it priced.
+    ws.onclose();
+    ok(/crypto=[^&]*ADA/.test(r.cryptoPolls().pop().url), 'the REST top-up covers it');
+  });
+
+  it('the socket follows focus onto an unwatched coin and off it again', () => {
+    const r = rig();
+    r.F.watch(['BTC']);
+    r.F.start();
+    const ws = r.ws;
+    ws.onopen();
+    r.F.setFocus('LINK');
+    ok(ws.sent.some((m) => m.type === 'subscribe' && m.product_ids.includes('LINK-USD')), 'subscribed on focus');
+    r.F.setFocus('BTC');
+    ok(ws.sent.some((m) => m.type === 'unsubscribe' && m.product_ids.includes('LINK-USD')), 'released on leaving');
   });
 });
 

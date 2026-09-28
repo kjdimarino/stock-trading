@@ -69,6 +69,14 @@ describe('session phases (America/New_York)', () => {
   it('early-close day is open at 12:59', () => {
     eq(C.stockStatus(C.fromET(2026, 11, 27, 12, 59)).phase, 'open');
   });
+  it('early-close day after-hours runs to 17:00, not 20:00', () => {
+    eq(C.stockStatus(C.fromET(2026, 11, 27, 16, 59)).phase, 'after');
+    const s = C.stockStatus(C.fromET(2026, 11, 27, 17, 0));
+    eq(s.phase, 'closed'); eq(s.label, 'Market closed');
+    eq(C.stockStatus(C.fromET(2026, 11, 27, 18, 30)).phase, 'closed');
+    eq(C.stockStatus(C.fromET(2026, 12, 24, 19, 0)).phase, 'closed');
+    eq(C.stockStatus(C.fromET(2025, 7, 3, 18, 0)).phase, 'closed');
+  });
   it('crypto is always open', () => eq(C.cryptoStatus().isOpen, true));
 });
 

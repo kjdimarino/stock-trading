@@ -128,6 +128,42 @@ describe('rate of change and volume', () => {
   });
 });
 
+describe('volume ratio skips a bar that is still forming', () => {
+  // 15m bars at a steady 1000; the feed has just rolled over to a v:0 bar.
+  const W = 900e3, t0 = Date.UTC(2026, 8, 28, 13, 30);
+  const flat = Array.from({ length: 30 }, (_, i) => ({ t: t0 + i * W, o: 1, h: 1, l: 1, c: 1, v: 1000 }));
+  const rolled = [...flat, { t: t0 + 30 * W, o: 1, h: 1, l: 1, c: 1, v: 0 }];
+  const born = t0 + 30 * W + 1000;
+  it('measures the last complete bar while the newest is forming', () => {
+    near(TA.volumeRatio(rolled, 20, born), 1, 1e-9);
+    near(TA.volumeRatio(rolled, 20, t0 + 31 * W - 1), 1, 1e-9);
+  });
+  it('measures the newest bar once its interval has closed', () => {
+    near(TA.volumeRatio(rolled, 20, t0 + 31 * W), 0, 1e-9);
+  });
+  it('a session break does not stretch the bar width', () => {
+    // The overnight gap before a session's first bar is not its width.
+    const open = [...flat, { t: t0 + 30 * W + 17 * 3600e3, o: 1, h: 1, l: 1, c: 1, v: 250 }];
+    near(TA.volumeRatio(open, 20, open[30].t + W + 1), 0.25, 1e-9);
+  });
+  it('defaults to the real clock', () => {
+    const now = Date.now();
+    const live = rolled.map((b, i) => ({ ...b, t: now - 1000 - (30 - i) * W }));
+    near(TA.volumeRatio(live, 20), 1, 1e-9);
+  });
+  it('does not turn a young bar into a vote against the trend', () => {
+    const up = Array.from({ length: 80 }, (_, i) => {
+      const c = 100 * Math.pow(1.0005, i);
+      return { t: t0 + i * W, o: c, h: c * 1.001, l: c * 0.999, c, v: 1000 };
+    });
+    up.push({ t: t0 + 80 * W, o: up[79].c, h: up[79].c, l: up[79].c, c: up[79].c, v: 0 });
+    const ind = TA.analyze(up, 252 * 26, t0 + 80 * W + 1000);
+    near(ind.volumeRatio, 1, 1e-9);
+    const vol = TA.score(ind).factors.find((f) => f.key === 'volume');
+    ok(vol && vol.value >= 0, `volume factor ${vol && vol.value} (${vol && vol.detail})`);
+  });
+});
+
 describe('realised volatility', () => {
   it('is 0 for a flat series', () => near(TA.realizedVol(new Array(40).fill(10)), 0, 1e-9));
   it('is positive and finite for a noisy series', () => {

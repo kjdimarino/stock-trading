@@ -12,7 +12,7 @@
  * works on the half it was designed against has proved nothing.
  */
 import fs from 'node:fs';
-import { describe, it, ok, report } from './harness.mjs';
+import { describe, it, ok, throws, report } from './harness.mjs';
 
 const FIXTURE = 'test/fixtures/backtest-daily.json';
 const haveFixture = fs.existsSync(FIXTURE);
@@ -69,6 +69,31 @@ describe('autonomous trader, walked forward over real history', () => {
     it('never blows up the account', () => {
       ok(all.finalEquity > 0 && isFinite(all.finalEquity), `final equity ${all.finalEquity}`);
       for (const p of all.equityCurve) ok(isFinite(p.equity) && p.equity > 0, `equity went to ${p.equity}`);
+    });
+  }
+});
+
+describe('the tuning and ablation tools measure what they claim', () => {
+  if (!haveFixture) {
+    it('skipped: no backtest fixture in this checkout', () => ok(true));
+  } else {
+    const key = (r) => `${r.returnPct.toFixed(6)}/${r.maxDrawdownPct.toFixed(6)}/${r.trades}`;
+    const full = backtest({ split: 'train' });
+
+    it('rejects a rule that does not exist instead of scoring it', () => {
+      throws(() => backtest({ split: 'train', rules: { minHoldMs: 0 } }), 'unknown rule');
+    });
+
+    it('the flat-stop variant trades, and differs from the ATR stop', () => {
+      const flat = backtest({ split: 'train', rules: { flatStopPct: 0.08 } });
+      ok(flat.trades > 0, 'a flat 8% stop made no trades at all');
+      ok(key(flat) !== key(full), 'the flat stop changed nothing');
+    });
+
+    it('the breakeven floor changes the outcome once the trail is on', () => {
+      const trail = backtest({ split: 'all', rules: { useTrailingStop: true } });
+      const noFloor = backtest({ split: 'all', rules: { useTrailingStop: true, breakevenAfterAtr: 1e9 } });
+      ok(key(trail) !== key(noFloor), 'breakeven floor is a no-op');
     });
   }
 });

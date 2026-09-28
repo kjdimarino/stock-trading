@@ -56,6 +56,8 @@ const DEFAULT_RULES = { ...T.RULES };
  * cannot leak one variant's settings into the next.
  */
 export function backtest({ split = 'all', warmup = 80, cash = 100000, seed = null, rules = null } = {}) {
+  // A misspelt or renamed rule would otherwise be added, ignored, and scored.
+  for (const k in rules || {}) if (!(k in DEFAULT_RULES)) throw new Error(`unknown rule "${k}"`);
   Object.assign(T.RULES, DEFAULT_RULES, rules || {});
   const timeline = buildTimeline();
   const start = Math.floor(timeline.length * (split === 'test' ? 0.5 : 0));

@@ -1,5 +1,7 @@
 /**
  * Ablation: turn each structural change off in turn and see what it was worth.
+ * Rules that ship switched off (the trailing stop and its breakeven floor) are
+ * turned *on* instead, since removing them would change nothing.
  * Reported on both halves, because a change that only helps the half it was
  * designed against is not a change worth keeping.
  */
@@ -8,11 +10,11 @@ import { backtest, DEFAULT_RULES } from './backtest.mjs';
 const VARIANTS = [
   ['full strategy', {}],
   ['no trend filter', { requireTrend: false }],
-  ['no trailing stop (fixed ATR stop)', { useTrailingStop: false }],
-  ['no breakeven floor', { breakevenAfterAtr: 1e9 }],
+  ['with trailing stop', { useTrailingStop: true }],
+  ['trailing stop, no breakeven floor', { useTrailingStop: true, breakevenAfterAtr: 1e9 }],
   ['one entry per cycle', { maxEntriesPerCycle: 1 }],
   ['no group cap', { maxGroupWeight: 1 }],
-  ['flat 8% stop (no ATR)', { stopAtrMult: 0, useTrailingStop: false }],
+  ['flat 8% stop (no ATR)', { flatStopPct: 0.08 }],
 ];
 
 const row = (label, r) => `${label.padEnd(34)} ret ${r.returnPct.toFixed(2).padStart(7)}%  `

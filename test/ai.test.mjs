@@ -419,7 +419,7 @@ describe('autonomous trader — risk discipline', () => {
     const up = series(UP);
     const now = Date.UTC(2026, 7, 19, 14, 0);
     T.runTraderCycle(p, ctx({ candles: { BTC: up }, now }));
-    // Same bar spacing as the series (60s): one bar later is inside the gate.
+    // No bar of the series opened after the entry, so this is inside the gate.
     const r = T.runTraderCycle(p, ctx({
       candles: { BTC: series(FLAT, 200, up[up.length - 1].c) },
       prices: { BTC: { price: p.positions.BTC.avgCost, changePct: 0 } },
@@ -582,6 +582,211 @@ describe('review regressions', () => {
     const range = sig.factors.find((f) => f.key === 'range');
     ok(range, 'range factor present');
     ok(/120-bar range/.test(range.detail), `label was "${range.detail}" for a 120-bar series`);
+  });
+});
+
+describe('debug-pass regressions', () => {
+  const NOW = Date.UTC(2026, 7, 19, 14, 0);
+  // The user's own account may short; the helper ctx() above never asks to.
+  const shortCtx = (prices) => ({ prices, marketOpen: true, shortingEnabled: true, slippageEnabled: false, now: NOW });
+
+  /* ------------------------------------------------------ glossary lookup */
+  it('the glossary finds diversification, not the "rsi" inside it', () => {
+    eq(C.explainConcept('what is diversification?').term, 'diversification');
+    eq(C.explainConcept('explain diversification').term, 'diversification');
+  });
+  it('every glossary term is reachable as a question', () => {
+    for (const k in C.CONCEPTS) {
+      const hit = C.explainConcept(`what is ${k}?`);
+      eq(hit && hit.term, k, `"what is ${k}?" resolved to ${hit && hit.term}`);
+    }
+  });
+  it('ordinary questions are not hijacked by a word inside a glossary term', () => {
+    for (const q of ['What is moving on my watchlist?', 'what is my position in TSLA?',
+      'what is AAPL and NVDA doing', 'what is my p&l', 'Explain my risk']) {
+      const hit = C.explainConcept(q);
+      eq(hit, null, `"${q}" was answered from the glossary with "${hit && hit.term}"`);
+    }
+  });
+  it('the app\'s own glossary chips still resolve, plurals included', () => {
+    eq(C.explainConcept('Explain limit orders').term, 'limit order');
+    eq(C.explainConcept('What is a stop loss?').term, 'stop loss');
+    eq(C.explainConcept('what is unrealized p&l?').term, 'unrealized p&l');
+  });
+  it('the glossary does not claim the app is long-only', () => {
+    ok(!/long-only/.test(C.CONCEPTS['short selling'].replace(/AI trader stays long-only/, '')),
+      C.CONCEPTS['short selling']);
+  });
+
+  /* --------------------------------------------- portfolio with shorts */
+  it('a short-only book is not read as idle cash', () => {
+    const p = pf(10000);
+    E.submitOrder(p, { assetId: 'TSLA', side: 'sell', type: 'market', qty: 60 }, shortCtx({ TSLA: { price: 100 } }));
+    const val = E.valuate(p, { TSLA: { price: 100, changePct: 0 } });
+    const pa = C.analyzePortfolio(val, null, E.stats(p, val));
+    ok(pa.cashWeight >= 0 && pa.cashWeight <= 1, `cash weight ${pa.cashWeight}`);
+    eq(pa.concentration.top, 'TSLA');
+    near(pa.concentration.topWeight, 0.6, 1e-9);
+    eq(pa.risk, 'highly concentrated');
+    const text = C.briefPortfolio(pa, val).body.join(' ');
+    ok(!/\d{3,}% cash/.test(text), text);
+    ok(/concentration/i.test(text) && /TSLA/.test(text), `no concentration warning: ${text}`);
+  });
+  it('a mixed long/short book gets a bounded concentration index', () => {
+    const p = pf(10000);
+    const c = shortCtx({ AAPL: { price: 100 }, TSLA: { price: 100 } });
+    E.submitOrder(p, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 }, c);
+    E.submitOrder(p, { assetId: 'TSLA', side: 'sell', type: 'market', qty: 70 }, c);
+    const val = E.valuate(p, { AAPL: { price: 100, changePct: 0 }, TSLA: { price: 100, changePct: 0 } });
+    const pa = C.analyzePortfolio(val, null, E.stats(p, val));
+    ok(pa.concentration.hhi > 0 && pa.concentration.hhi <= 1, `hhi ${pa.concentration.hhi}`);
+    near(pa.concentration.hhi, 0.125 ** 2 + 0.875 ** 2, 1e-9);
+    eq(pa.concentration.top, 'TSLA');
+    ok(pa.diversification > 0, `diversification ${pa.diversification}`);
+    ok(pa.cashWeight <= 1, `cash weight ${pa.cashWeight}`);
+  });
+  it('counts closed trades, not sells, once shorts are involved', () => {
+    const p = pf(10000);
+    for (let i = 0; i < 5; i++) E.submitOrder(p, { assetId: 'TSLA', side: 'sell', type: 'market', qty: 10 }, shortCtx({ TSLA: { price: 100 } }));
+    E.submitOrder(p, { assetId: 'TSLA', side: 'buy', type: 'market', qty: 10 }, shortCtx({ TSLA: { price: 90 } }));
+    const val = E.valuate(p, { TSLA: { price: 120, changePct: 0 } });
+    const text = C.briefPortfolio(C.analyzePortfolio(val, null, E.stats(p, val)), val).body.join(' ');
+    ok(/Across 1 closed trade /.test(text), text);
+  });
+  it('a long-only book reads exactly as before', () => {
+    const p = pf(10000);
+    E.submitOrder(p, { assetId: 'AAPL', side: 'buy', type: 'market', notional: 2000 }, ctx({ prices: { AAPL: { price: 100 } } }));
+    const val = E.valuate(p, { AAPL: { price: 100, changePct: 0 } });
+    const pa = C.analyzePortfolio(val, null, E.stats(p, val));
+    near(pa.cashWeight, 0.8, 1e-9);
+    near(pa.concentration.hhi, 1, 1e-9);
+    near(pa.concentration.topWeight, 0.2, 1e-9);
+  });
+
+  /* ------------------------------------------------ annualised volatility */
+  it('annualises crypto on the calendar and second bars as seconds', () => {
+    // Alternating ±3% log returns: the same per-bar volatility on every call.
+    const bars = series((i, b) => b * Math.exp(i % 2 ? 0.03 : 0), 200);
+    const vol = (id, tf) => C.briefAsset(id, bars, null, tf).indicators.realizedVol;
+    near(vol('BTC', '1D') / vol('AAPL', '1D'), Math.sqrt(365 / 252), 1e-9, 'crypto daily bars run 365 a year');
+    near(vol('BTC', '1h') / vol('BTC', '1D'), Math.sqrt(24), 1e-9, 'crypto hourly is 24 a day');
+    near(vol('BTC', '5m') / vol('BTC', '1D'), Math.sqrt(288), 1e-9);
+    near(vol('BTC', '1s') / vol('BTC', '1D'), Math.sqrt(86400), 1e-9, '1s crypto is not daily');
+    near(vol('AAPL', '1s') / vol('AAPL', '1D'), Math.sqrt(23400), 1e-9, '1s equity is not daily');
+    near(vol('AAPL', '15s') / vol('AAPL', '1m'), 2, 1e-9);
+    near(vol('AAPL', '5m') / vol('AAPL', '1D'), Math.sqrt(78), 1e-9);
+  });
+
+  /* ------------------------------------------------ trader: entry loop */
+  it('a candidate too small to size does not block the names ranked behind it', () => {
+    // $1K book with crypto at 43.95%: DOGE ranks first but only $10.50 of group
+    // room is left; AAPL is in an empty group and fits on its own.
+    const p = pf(1000);
+    for (const id of ['BTC', 'ETH', 'SOL']) {
+      E.submitOrder(p, { assetId: id, side: 'buy', type: 'market', notional: 146.5 }, ctx({ prices: { [id]: { price: 100 } }, now: NOW }));
+    }
+    const candles = {
+      BTC: series(FLAT), ETH: series(FLAT), SOL: series(FLAT),
+      DOGE: series(UP, 200, 1),
+      AAPL: series((i, b) => b * Math.pow(1.004, i)),
+    };
+    const c = ctx({ candles, candidates: ['DOGE', 'AAPL'], now: NOW });
+    const score = (id) => PT.ta.score(PT.ta.analyze(candles[id])).score;
+    ok(score('DOGE') > score('AAPL'), 'DOGE must rank ahead of AAPL for this to test anything');
+    const r = T.runTraderCycle(p, c);
+    ok(r.decisions.some((d) => d.assetId === 'DOGE' && /below the \$25\.00 minimum/.test(d.why)),
+      'DOGE should be skipped as too small');
+    ok(p.positions.AAPL && p.positions.AAPL.qty > 0,
+      `AAPL was never bought: ${r.decisions.map((d) => `${d.action} ${d.assetId}: ${d.why}`).join(' | ')}`);
+  });
+
+  /* --------------------------------------------- trader: trailing stop */
+  function withTrail(fn) {
+    const was = T.RULES.useTrailingStop;
+    T.RULES.useTrailingStop = true;
+    try { return fn(); } finally { T.RULES.useTrailingStop = was; }
+  }
+  // A recent cooldown keeps the add pass out of it, so avgCost stays put.
+  const trailStep = (p, up, price, k) => T.runTraderCycle(p, ctx({
+    candles: { BTC: up }, prices: { BTC: { price, changePct: 0 } },
+    cooldowns: { BTC: NOW + k * 60000 }, now: NOW + k * 60000,
+  }));
+
+  it('with the trail on, a trade that reached +2 ATR may not become a loser', () => withTrail(() => {
+    const p = pf(100000);
+    const up = series(UP);
+    const atr = PT.ta.analyze(up).atr14;
+    T.runTraderCycle(p, ctx({ candles: { BTC: up }, now: NOW }));
+    const entry = p.positions.BTC.avgCost;
+    ok(!trailStep(p, up, entry, 1).decisions.some((d) => d.action === 'sell'), 'a fresh entry must not be armed');
+    ok(!trailStep(p, up, entry + 2 * atr, 2).decisions.some((d) => d.action === 'sell'), 'sold into strength');
+    const r = trailStep(p, up, entry - 0.2 * atr, 3);
+    const sell = r.decisions.find((d) => d.action === 'sell');
+    ok(sell && /trailing/i.test(sell.why), `breakeven floor did not fire: ${r.decisions.map((d) => d.why).join(' | ')}`);
+  }));
+
+  it('with the trail on, a gap far below the trail still fires it', () => withTrail(() => {
+    const p = pf(100000);
+    const up = series(UP);
+    const atr = PT.ta.analyze(up).atr14;
+    T.runTraderCycle(p, ctx({ candles: { BTC: up }, now: NOW }));
+    const entry = p.positions.BTC.avgCost;
+    ok(!trailStep(p, up, entry + 10 * atr, 1).decisions.some((d) => d.action === 'sell'), 'sold into strength');
+    const r = trailStep(p, up, entry + 0.8 * atr, 2);
+    const sell = r.decisions.find((d) => d.action === 'sell');
+    ok(sell && /trailing/i.test(sell.why), `trail at +7 ATR did not fire on a gap to +0.8: ${r.decisions.map((d) => d.why).join(' | ')}`);
+    ok(sell.realized > 0, 'the gain it had is locked in');
+  }));
+
+  /* ----------------------------------------- trader: soft-exit hold gate */
+  const Q = 15 * 60000;
+  /** Regular-session 15m bar opens (09:30–15:45 ET, EDT), weekdays of Sep 2026. */
+  const sessionOpens = () => {
+    const out = [];
+    for (let d = 1; d <= 30; d++) {
+      const dow = new Date(Date.UTC(2026, 8, d)).getUTCDay();
+      if (dow === 0 || dow === 6) continue;
+      for (let k = 0; k < 26; k++) out.push(Date.UTC(2026, 8, d, 13, 30) + k * Q);
+    }
+    return out;
+  };
+  /** Buy at `buyT`, then look again one minute into the session at `openT`, below trend. */
+  function firstBarOfSession(buyT, openT) {
+    const all = sessionOpens();
+    const hist = all.filter((t) => t <= buyT).slice(-199).map((t, i) => {
+      const c = 100 * Math.pow(1.003, i);
+      return { t, o: c, h: c * 1.02, l: c * 0.98, c, v: 1e6 };
+    });
+    const lastC = hist[hist.length - 1].c;
+    const base = hist.concat(all.filter((t) => t > buyT && t < openT)
+      .map((t) => ({ t, o: lastC, h: lastC * 1.02, l: lastC * 0.98, c: lastC, v: 1e6 })));
+    const p = pf(100000);
+    E.submitOrder(p, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 10 },
+      ctx({ prices: { AAPL: { price: lastC } }, now: buyT + 60000 }));
+    const sma50 = PT.ta.sma(base.map((b) => b.c), 50);
+    // Under the 50-bar average, well above the ATR stop and the hard stop.
+    const px = Math.min(sma50, p.positions.AAPL.avgCost) * 0.99;
+    const bars = base.concat([{ t: openT, o: px, h: px, l: px, c: px, v: 1e6 }]);
+    return T.runTraderCycle(p, ctx({
+      candles: { AAPL: bars }, prices: { AAPL: { price: px, changePct: 0 } }, candidates: [], now: openT + 60000,
+    }));
+  }
+  it('the overnight gap is one bar, not the bar width, for the hold gate', () => {
+    // Bought Thu 15:00 ET, four bars held by Fri 09:31 ET.
+    const r = firstBarOfSession(Date.UTC(2026, 8, 17, 19, 0), Date.UTC(2026, 8, 18, 13, 30));
+    ok(r.decisions.some((d) => d.action === 'sell' && /trend|thesis/i.test(d.why)),
+      `held through a broken trend on the open: ${r.decisions.map((d) => d.why).join(' | ')}`);
+  });
+  it('the weekend gap is one bar, not the bar width, for the hold gate', () => {
+    const r = firstBarOfSession(Date.UTC(2026, 8, 16, 19, 0), Date.UTC(2026, 8, 21, 13, 30));
+    ok(r.decisions.some((d) => d.action === 'sell' && /trend|thesis/i.test(d.why)),
+      `held through a broken trend on Monday's open: ${r.decisions.map((d) => d.why).join(' | ')}`);
+  });
+  it('a position one bar old is still inside the hold gate after a gap', () => {
+    // Bought in the last bar on Friday: Monday's open is only its first bar since.
+    const r = firstBarOfSession(Date.UTC(2026, 8, 18, 19, 45), Date.UTC(2026, 8, 21, 13, 30));
+    ok(!r.decisions.some((d) => d.action === 'sell' && /trend|thesis/i.test(d.why)),
+      'a one-bar-old position was soft-exited');
   });
 });
 

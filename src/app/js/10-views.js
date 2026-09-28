@@ -454,10 +454,15 @@
           const r = E.submitOrder(A.pfUser(), {
             assetId: p.assetId, side, type: 'market', qty: Math.abs(p.qty),
           }, A.orderCtx(p.assetId));
-          UI.toast({
-            kind: 'sell', title: `Sold ${U.fmtQty(r.fill.qty)} ${p.assetId}`,
-            message: `at ${U.fmtUSD(r.fill.price)} · realized ${U.fmtSigned(r.fill.realized)}`,
-          });
+          if (r.fill) {
+            UI.toast({
+              kind: side, title: `${p.isShort ? 'Covered' : 'Sold'} ${U.fmtQty(r.fill.qty)} ${p.assetId}`,
+              message: `at ${U.fmtUSD(r.fill.price)} · realized ${U.fmtSigned(r.fill.realized)}`,
+            });
+          } else if (r.queued) {
+            // The stock market is shut: the order is taken and waits for the bell.
+            queuedToast(r.order);
+          }
           A.save();
           renderAll();
         } catch (e) {
@@ -578,6 +583,9 @@
     }
     const { t, tbody } = table(['Time', 'Symbol', 'Side', 'Qty', 'Price', 'Value', 'Realized']);
     for (const f of pf.fills.slice().reverse().slice(0, 400)) {
+      // P&L is realized by whichever fill reduced exposure — selling a long or
+      // buying back a short. Fills saved before `closed` existed go by side.
+      const closes = f.closed != null ? f.closed : f.side === 'sell';
       tbody.appendChild(el('tr', {}, [
         el('td', { class: 'table__sub', text: U.fmtDateTime(f.t) }),
         el('td', {}, el('span', { class: 'table__sym', text: f.assetId })),
@@ -585,7 +593,7 @@
         el('td', { class: 'num', text: U.fmtQty(f.qty) }),
         el('td', { class: 'num', text: U.fmtUSD(f.price) }),
         el('td', { class: 'num', text: U.fmtUSD(f.notional, { fixed2: true }) }),
-        el('td', { class: 'num ' + (f.side === 'sell' ? U.dirClass(f.realized) : 'dimmer'), text: f.side === 'sell' ? U.fmtSigned(f.realized) : '—' }),
+        el('td', { class: 'num ' + (closes ? U.dirClass(f.realized) : 'dimmer'), text: closes ? U.fmtSigned(f.realized) : '—' }),
       ]));
     }
     host.appendChild(t);
@@ -606,6 +614,8 @@
     ]));
 
     const form = el('div', { class: 'order__form' });
+    // A limit typed for another symbol means nothing here.
+    if (S.order.limitDraft && S.order.limitDraft.assetId !== assetId) S.order.limitDraft = null;
 
     /* side */
     const sideSeg = el('div', { class: `seg seg--full seg--${S.order.side}` });
@@ -613,6 +623,7 @@
     for (const side of ['buy', 'sell']) {
       const b = el('button', {
         class: 'seg__item' + (S.order.side === side ? ' is-active' : ''),
+        'aria-pressed': String(S.order.side === side),
         text: side === 'buy' ? 'Buy' : 'Sell',
       });
       b.addEventListener('click', () => { S.order.side = side; buildOrderPane(); });
@@ -626,6 +637,7 @@
     for (const type of ['market', 'limit']) {
       const b = el('button', {
         class: 'seg__item' + (S.order.type === type ? ' is-active' : ''),
+        'aria-pressed': String(S.order.type === type),
         text: type === 'market' ? 'Market' : 'Limit',
       });
       b.addEventListener('click', () => { S.order.type = type; buildOrderPane(); });
@@ -636,12 +648,26 @@
     /* limit price */
     if (S.order.type === 'limit') {
       const q = A.prices()[assetId];
-      R.limitInput = el('input', {
+      // Enough decimals to keep ~4 significant digits on sub-penny coins.
+      const dp = q && q.price > 0 && q.price < 1
+        ? Math.min(20, Math.max(6, Math.ceil(-Math.log10(q.price)) + 3)) : 2;
+      const quote = q ? String(U.round(q.price, dp)) : '';
+      /*
+       * The typed limit is kept in state, not only in the input: the side,
+       * size-mode and Max buttons all rebuild this ticket, and refilling it
+       * from the quote would quietly turn a resting limit into a marketable one.
+       */
+      const draft = S.order.limitDraft;
+      const input = R.limitInput = el('input', {
         class: 'input num', type: 'number', step: 'any', min: '0',
-        placeholder: q ? String(U.round(q.price, q.price < 1 ? 6 : 2)) : '0.00',
-        value: q ? String(U.round(q.price, q.price < 1 ? 6 : 2)) : '',
+        placeholder: quote || '0.00',
+        value: draft && draft.value !== '' ? draft.value : quote,
+        'aria-label': 'Limit price (USD)',
       });
-      R.limitInput.addEventListener('input', updateEstimate);
+      input.addEventListener('input', () => {
+        S.order.limitDraft = { assetId, value: input.value };
+        updateEstimate();
+      });
       form.appendChild(el('div', { class: 'field' }, [
         el('div', { class: 'field__label' }, ['Limit price', el('span', { class: 'dimmer', text: 'USD' })]),
         R.limitInput,
@@ -654,7 +680,8 @@
     const sizeSeg = el('div', { class: 'seg seg--full' });
     for (const [mode, label] of [['notional', 'Dollars'], ['qty', asset.kind === 'crypto' ? 'Coins' : 'Shares']]) {
       const b = el('button', {
-        class: 'seg__item' + (S.order.sizeMode === mode ? ' is-active' : ''), text: label,
+        class: 'seg__item' + (S.order.sizeMode === mode ? ' is-active' : ''),
+        'aria-pressed': String(S.order.sizeMode === mode), text: label,
       });
       b.addEventListener('click', () => { S.order.sizeMode = mode; buildOrderPane(); });
       sizeSeg.appendChild(b);
@@ -667,6 +694,7 @@
     R.amountInput = el('input', {
       class: 'input num', type: 'number', step: 'any', min: '0',
       placeholder: S.order.sizeMode === 'notional' ? '0.00' : '0',
+      'aria-label': S.order.sizeMode === 'notional' ? 'Amount in USD' : `Quantity in ${assetId}`,
     });
     R.amountInput.addEventListener('input', updateEstimate);
     R.amountInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitOrder(); });
@@ -885,26 +913,11 @@
           kind: S.order.side,
           title: `${S.order.side === 'buy' ? 'Bought' : 'Sold'} ${U.fmtQty(r.fill.qty)} ${assetId}`,
           message: `at ${U.fmtUSD(r.fill.price)} · ${U.fmtUSD(r.fill.notional, { fixed2: true })}`
-            + (r.fill.side === 'sell' ? ` · realized ${U.fmtSigned(r.fill.realized)}` : ''),
+            // A buy that covers a short realizes P&L just as a sell does.
+            + (r.fill.closed ? ` · realized ${U.fmtSigned(r.fill.realized)}` : ''),
         });
       } else if (r.queued) {
-        const openAt = PT.calendar.stockStatus().nextChange;
-        const when = openAt
-          ? `${U.fmtDateTime(openAt)} (in ${PT.calendar.untilText(openAt)})`
-          : 'the next open';
-        const size = r.order.notional != null
-          ? U.fmtUSD(r.order.notional, { fixed2: true }) + ' of'
-          : U.fmtQty(r.order.qty);
-        UI.toast({
-          kind: 'warn',
-          title: 'Queued for the opening bell',
-          message: `${r.order.side.toUpperCase()} ${size} ${assetId} `
-            + (r.order.type === 'limit'
-              ? `will join the book at ${when} and fill at ${U.fmtUSD(r.order.limitPrice)} or better.`
-              : `will fill at the opening price on ${when}.`)
-            + ' Cancel it any time from Open orders.',
-          timeout: 9000,
-        });
+        queuedToast(r.order);
       } else {
         UI.toast({
           title: 'Limit order placed',
@@ -920,6 +933,27 @@
       R.orderError.textContent = e.message;
       R.orderError.classList.remove('hidden');
     }
+  }
+
+  /** An order taken while the stock market is shut, held for the bell. */
+  function queuedToast(order) {
+    const openAt = PT.calendar.stockStatus().nextChange;
+    const when = openAt
+      ? `${U.fmtDateTime(openAt)} (in ${PT.calendar.untilText(openAt)})`
+      : 'the next open';
+    const size = order.notional != null
+      ? U.fmtUSD(order.notional, { fixed2: true }) + ' of'
+      : U.fmtQty(order.qty);
+    UI.toast({
+      kind: 'warn',
+      title: 'Queued for the opening bell',
+      message: `${order.side.toUpperCase()} ${size} ${order.assetId} `
+        + (order.type === 'limit'
+          ? `will join the book at ${when} and fill at ${U.fmtUSD(order.limitPrice)} or better.`
+          : `will fill at the opening price on ${when}.`)
+        + ' Cancel it any time from Open orders.',
+      timeout: 9000,
+    });
   }
 
   /* ================================ render =============================== */

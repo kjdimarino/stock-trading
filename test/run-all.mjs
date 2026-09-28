@@ -5,7 +5,8 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 
-const UNIT = ['calendar', 'engine', 'indicators', 'chart', 'feed', 'ai', 'strategy'];
+const UNIT = ['calendar', 'calendar-regress', 'engine', 'indicators', 'chart', 'feed', 'ai', 'strategy',
+  'server-regress', 'app-regress'];
 const LIVE = ['live-feed', 'providers'];
 
 let failed = 0;
@@ -27,6 +28,8 @@ if (process.env.PT_SKIP_BROWSER !== '1' && fs.existsSync('node_modules/playwrigh
   console.log('\n\x1b[1m── browser end-to-end ──\x1b[0m');
   spawnSync('bash', ['tools/serve.sh', 'start'], { stdio: 'inherit' });
   run('test/browser.test.mjs');
+  // Self-contained pages with a scripted feed: layout, ticket and a11y regressions.
+  run('test/ui-regress.test.mjs');
   // Equities are shut most of the time, so this suite pins the clock open and
   // exercises the stock path that would otherwise never be covered.
   run('test/market-open.test.mjs');

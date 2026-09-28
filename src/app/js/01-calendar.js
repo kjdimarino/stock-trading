@@ -153,6 +153,7 @@
   const REG_CLOSE = 16 * 60;      // 16:00 ET
   const EARLY_CLOSE = 13 * 60;    // 13:00 ET
   const POST_CLOSE = 20 * 60;     // 20:00 ET
+  const EARLY_POST_CLOSE = 17 * 60; // 17:00 ET — post-market ends early on half-days
 
   const isWeekend = (p) => p.dow === 0 || p.dow === 6;
   const isHoliday = (p) => holidays(p.y).has(dayKey(p));
@@ -180,12 +181,13 @@
     const trading = isTradingDay(p);
     const closeMin = closeMinuteFor(p);
     const early = trading && closeMin === EARLY_CLOSE;
+    const postClose = closeMin === EARLY_CLOSE ? EARLY_POST_CLOSE : POST_CLOSE;
 
     let phase = 'closed';
     if (trading) {
       if (p.minutes >= REG_OPEN && p.minutes < closeMin) phase = 'open';
       else if (p.minutes >= PRE_OPEN && p.minutes < REG_OPEN) phase = 'pre';
-      else if (p.minutes >= closeMin && p.minutes < POST_CLOSE) phase = 'after';
+      else if (p.minutes >= closeMin && p.minutes < postClose) phase = 'after';
     }
 
     const label = phase === 'open' ? 'Market open'
