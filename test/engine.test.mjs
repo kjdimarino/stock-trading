@@ -60,6 +60,18 @@ describe('order validation', () => {
     throws(() => E.submitOrder(fresh(), { assetId: 'AAPL', side: 'buy', type: 'limit', qty: 1, limitPrice: 'abc' },
       ctx(px({ AAPL: 100 }))), 'valid limit price');
   });
+  it('states money in rejections to the cent, never as float noise', () => {
+    // 3 x 100.1 reserves 300.29999999999995 of a 300.30 balance: ~6e-14 free.
+    const pf = fresh(300.3);
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'limit', qty: 3, limitPrice: 100.1 },
+      ctx(px({ AAPL: 110 })));
+    let msg = '';
+    try {
+      E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 1 },
+        { ...ctx(px({ AAPL: 110 })), shortingEnabled: true });
+    } catch (e) { msg = e.message; }
+    ok(msg.includes('short up to about $0.00 of stock'), msg);
+  });
 });
 
 describe('market orders and cost basis', () => {
@@ -932,6 +944,24 @@ describe('covering shorts and forced buy-ins', () => {
     ok(E.audit(pf).some((p) => p.includes('negative')), 'flagged');
     E.repair(pf);
     near(pf.cash, 20000, 1e-6);
+  });
+
+  it('a debit on a book with trimmed history survives a reload and a forced repair', () => {
+    const st = E.newState(10000);
+    const pf = st.portfolios.user;
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 100 }, sctx(px({ AAPL: 100 })));
+    E.submitOrder(pf, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 100 }, sctx(px({ AAPL: 250 })));
+    near(pf.cash, -5000, 1e-6);
+    pf.fillsTrimmed = true;               // as a quota-exhausted save or a 5000-fill log leaves it
+    eq(E.audit(pf), [], 'an unverifiable debit is not corruption');
+    eq(E.save(st), true);
+    const back = E.load();
+    near(back.portfolios.user.cash, -5000, 1e-6, 'the reload must not wipe what the account owes');
+    ok(!(back.repairs || []).length, 'and reports no repair');
+    const report = E.repair(back.portfolios.user, { force: true });
+    eq(report.method, 'clamped');
+    near(back.portfolios.user.cash, -5000, 1e-6, 'the Settings repair leaves the debit too');
+    E.clear();
   });
 
   it('a buy that covers and then goes long still pays for the long leg', () => {

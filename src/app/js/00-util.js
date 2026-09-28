@@ -94,6 +94,10 @@ window.PT = window.PT || {};
    */
   function fmtQty(v) {
     if (v == null || !isFinite(v)) return '—';
+    // Drop float noise first, so 0.3 - 0.1 = 0.19999999999999998 is cut as
+    // 0.2, not 0.199999. Fifteen significant digits is below any real
+    // quantity's precision, so this never rounds a genuine amount up.
+    v = +v.toPrecision(15);
     const a = Math.abs(v);
     if (a === 0) return '0';
     if (a >= 1000) return fmtNum(v, 0, 2, 'trunc');

@@ -278,9 +278,9 @@ const server = createServer(() => '<html></html>');
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const PORT = server.address().port;
 
-function request(method, path, { headers = {}, body } = {}) {
+function request(method, path, { headers = {}, body, port = PORT } = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port: PORT, method, path, headers }, (res) => {
+    const req = http.request({ host: '127.0.0.1', port, method, path, headers }, (res) => {
       let text = '';
       res.on('data', (c) => { text += c; });
       res.on('end', () => {
@@ -372,6 +372,7 @@ describe('/api/llm only answers the app itself', () => {
     ['a form POST with no Origin', { Host: self, 'Content-Type': 'application/x-www-form-urlencoded' }],
     ['another localhost port', { Host: self, Origin: 'http://localhost:8744', 'Content-Type': 'application/json' }],
     ['a DNS-rebinding page', { Host: `evil.example:${PORT}`, Origin: `http://evil.example:${PORT}`, 'Content-Type': 'application/json' }],
+    ['a machine name nobody listed', { Host: `mybox.local:${PORT}`, Origin: `http://mybox.local:${PORT}`, 'Content-Type': 'application/json' }],
     ['an opaque origin', { Host: self, Origin: 'null', 'Content-Type': 'application/json' }],
   ];
   for (const [label, headers] of cases) {
@@ -400,6 +401,43 @@ describe('/api/llm only answers the app itself', () => {
       eq(anthropic() - before, 1);
     }));
   }
+
+  /*
+   * Bound to 0.0.0.0 and opened by machine name, a reverse proxy or a tunnel,
+   * the app is same-origin under a name HOST cannot hold (HOST is also the
+   * listen address). PT_ALLOWED_HOSTS admits exactly the names listed.
+   */
+  it('serves a machine name listed in PT_ALLOWED_HOSTS, and no other', serial(async () => {
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-TEST';
+    upstream = (call) => (call.host === 'api.anthropic.com' ? { status: 200, body: { content: [] } } : null);
+    // Entries copied from an address bar, with a port or a scheme, count too.
+    process.env.PT_ALLOWED_HOSTS = 'MyBox.local, tunnel.example.com, other.local:7777 , http://proxied.example';
+    let named;
+    try {
+      const S = await import('../src/server.mjs?allowed-hosts'); // reads the list at load
+      named = S.createServer(() => '<html></html>');
+      await new Promise((r) => named.listen(0, '127.0.0.1', r));
+    } finally {
+      delete process.env.PT_ALLOWED_HOSTS;
+    }
+    const port = named.address().port;
+    const as = (name, origin = `http://${name}:${port}`) => request('POST', '/api/llm', {
+      port, body: payload, headers: { Host: `${name}:${port}`, Origin: origin, 'Content-Type': 'application/json' },
+    });
+    try {
+      const before = anthropic();
+      eq((await as('mybox.local')).status, 200, 'listed name, matched without regard to case');
+      eq((await as('tunnel.example.com')).status, 200, 'second listed name');
+      eq((await as('other.local')).status, 200, 'an entry written with a port');
+      eq((await as('proxied.example')).status, 200, 'an entry written with a scheme');
+      eq(anthropic() - before, 4);
+      eq((await as('evil.example')).status, 403, 'an unlisted name is still a rebinding page');
+      eq((await as('mybox.local', 'https://evil.example')).status, 403, 'the Origin must still match');
+      eq(anthropic() - before, 4, 'refusals never reach the key');
+    } finally {
+      named.close();
+    }
+  }));
 });
 
 /* ------------------------------------------ proxy credentials (8) */

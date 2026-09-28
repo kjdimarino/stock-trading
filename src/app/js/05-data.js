@@ -36,6 +36,7 @@
     lastFocusPoll: 0,
     focusPollInFlight: false,
     cryptoPollInFlight: false,
+    cryptoPollQueued: false,      // a call arrived mid-flight; run once more after
     serverUp: true,
     counters: { ticks: 0, polls: 0, wsReconnects: 0 },
     // Rolling per-asset tick history, the source for sub-minute candles.
@@ -415,7 +416,9 @@
     if (!live.length && !delayed.length) return;
     // One at a time, like the stock lanes: a slow server would otherwise
     // collect a request a second and starve every other call to this host.
-    if (state.cryptoPollInFlight) return;
+    // A call that lands mid-flight is owed a follow-up, not dropped: a
+    // delayed coin added now gets no other request while the socket is live.
+    if (state.cryptoPollInFlight) { state.cryptoPollQueued = true; return; }
     state.cryptoPollInFlight = true;
     const params = [];
     if (live.length) params.push(`crypto=${encodeURIComponent(live.join(','))}`);
@@ -439,6 +442,7 @@
       bus.emit('status', snapshotStatus());
     } finally {
       state.cryptoPollInFlight = false;
+      if (state.cryptoPollQueued) { state.cryptoPollQueued = false; pollCrypto(); }
     }
   }
 

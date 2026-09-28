@@ -73,15 +73,36 @@
    * One saved book, possibly several open tabs. Every save writes the whole
    * book, so two tabs saving on their own clocks would each keep putting back
    * the copy they loaded and revert the other's trades. So one tab writes at a
-   * time — whichever was last opened, looked at or used — and the others follow
-   * what it saves until they are used themselves. `rev` numbers the saves, so a
-   * tab can tell a newer book from the one it holds.
+   * time — whichever was last opened in view, looked at or used — and the
+   * others follow what it saves until they are used themselves. `rev` numbers
+   * the saves, so a tab can tell a newer book from the one it holds.
    */
   const TAB_ID = U.uid('tab');
   const WRITER_KEY = E.STORAGE_KEY + '.writer';
   let writer = false;
 
-  const writerKey = () => { try { return localStorage.getItem(WRITER_KEY); } catch { return null; } };
+  /*
+   * The writer key is a lease, `${tabId}:${time}`. A tab can die without a word
+   * — Chrome discards background tabs, renderers crash — and a key naming a
+   * dead tab would leave nobody working orders. So the writer renews it as it
+   * runs and the others take over once it lapses. Chrome runs a hidden tab's
+   * timers as seldom as once a minute, hence the long lease.
+   */
+  const LEASE_MS = 90000;
+  const RENEW_MS = 10000;
+  let renewedAt = 0;
+  let lapsedAt = 0;
+  let bare = null; // a key from an older build: a bare id, timed from first sight
+  function leaseOf(v) {
+    const [id, at] = String(v || '').split(':');
+    return { id: id || null, at: Number(at) || 0 };
+  }
+  const readLease = () => { try { return leaseOf(localStorage.getItem(WRITER_KEY)); } catch { return leaseOf(null); } };
+  function writeLease() {
+    renewedAt = Date.now();
+    lapsedAt = 0;
+    try { localStorage.setItem(WRITER_KEY, `${TAB_ID}:${renewedAt}`); } catch { /* no storage: the only tab */ }
+  }
 
   const persist = U.debounce(() => {
     if (S.resetting || !writer) return;
@@ -108,13 +129,23 @@
    * the change being saved.
    */
   function claimWriter(catchUp) {
-    if (writer || !S.st) return;
+    if (!S.st) return;
+    if (writer) {
+      // Frozen while another tab took over, this one still thinks it writes.
+      // Follow first, so the claim below starts from the newer book. If that
+      // tab has saved since, its book wins: flushing this stale copy over it
+      // would undo whatever it did meanwhile, fills included.
+      if (!catchUp || readLease().id === TAB_ID) return;
+      const stored = E.load();
+      if (stored && (stored.rev || 0) > (S.st.rev || 0)) { writer = false; adoptBook(stored); }
+      else yieldWriter();
+    }
     if (catchUp) {
       const stored = E.load();
       if (stored && (stored.rev || 0) > (S.st.rev || 0)) adoptBook(stored);
     }
     writer = true;
-    try { localStorage.setItem(WRITER_KEY, TAB_ID); } catch { /* no storage: the only tab */ }
+    writeLease();
   }
 
   /** Another tab has taken over: hand it anything unsaved, then follow. */
@@ -128,12 +159,37 @@
   function releaseWriter() {
     if (!writer) return;
     yieldWriter();
-    try { if (writerKey() === TAB_ID) localStorage.removeItem(WRITER_KEY); } catch { /* ignore */ }
+    try { if (readLease().id === TAB_ID) localStorage.removeItem(WRITER_KEY); } catch { /* ignore */ }
   }
 
-  /** Two claims that crossed can leave nobody writing; the named tab resumes. */
+  /**
+   * Every pass of the run loop. The writer renews its lease, or follows if the
+   * key names another tab by now. A follower takes over when nobody holds the
+   * key, when it names this tab (two claims that crossed can leave nobody
+   * writing) or when the lease has lapsed.
+   */
   function checkWriter() {
-    if (!writer && S.st && writerKey() === TAB_ID) claimWriter(true);
+    if (!S.st || S.resetting) return;
+    const lease = readLease();
+    const now = Date.now();
+    // An older build writes a bare id with no time. Counting that as lapsed
+    // would take writing from a live tab, so its lease runs from first sight.
+    if (lease.id && !lease.at) {
+      if (!bare || bare.id !== lease.id) bare = { id: lease.id, since: now };
+      lease.at = bare.since;
+    }
+    if (writer) {
+      if (lease.id && lease.id !== TAB_ID) yieldWriter();
+      else if (!lease.id || now - renewedAt >= RENEW_MS) writeLease();
+    } else if (!lease.id || lease.id === TAB_ID) {
+      claimWriter(true);
+    } else if (now - lease.at < LEASE_MS) {
+      lapsedAt = 0;
+    } else if (!lapsedAt || now - lapsedAt < 1000) {
+      // Waking from sleep, every tab finds the lease old at once. Wait a pass
+      // or two, so a writer that is still there gets to renew it first.
+      lapsedAt = lapsedAt || now;
+    } else claimWriter(true);
   }
 
   /** A `storage` event: another tab saved the book or took over writing it. */
@@ -142,7 +198,7 @@
     if (e.key === WRITER_KEY) {
       // The writing tab closed. Someone has to keep resting orders working.
       if (e.newValue == null) claimWriter(true);
-      else if (e.newValue !== TAB_ID) yieldWriter();
+      else if (leaseOf(e.newValue).id !== TAB_ID) yieldWriter();
       return;
     }
     if (e.key !== null && e.key !== E.STORAGE_KEY) return;
@@ -174,10 +230,11 @@
     for (const id in (S.st.discovered || {})) PT.registerAsset(S.st.discovered[id]);
     if (!R.terminal) return;
     // Every pane that shows the book is rebuilt: they close over its objects.
+    // Not the order ticket: it reads the book when used, renderAll refreshes
+    // its estimate, and a rebuild would empty the amount being typed.
     renderWatchlist();
     V.bindDrawings(S.focus);
     V.buildBlotter();
-    V.buildOrderPane();
     if (S.view === 'accounts') V.renderAccountsView();
     V.renderAll();
   }

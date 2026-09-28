@@ -240,6 +240,196 @@ describe('two open tabs do not revert each other\'s book', () => {
     t2.fire('window', 'pagehide');
     eq(b.store.get(KEY) ?? null, null, 'nothing wrote the old book back');
   });
+
+  it('an AI cycle still loading candles when the user switches tabs does not take writing back', async () => {
+    const b = browser();
+    const t1 = openTab(b);
+    seed(t1);
+    t1.PT.boot.boot();
+    const t2 = openTab(b);
+    t2.PT.boot.boot();
+    b.deliver();
+    t1.fire('window', 'focus');
+    b.deliver();
+    ok(t1.A.isWriter(), 'the tab in use writes');
+    for (const t of [t1, t2]) t.PT.feed.prices.BTC = quote(50000);
+
+    // The AI cycle waits on candles from the network...
+    const pending = [];
+    let ran = 0;
+    t1.PT.feed.candles = () => new Promise((res) => pending.push(res));
+    t1.PT.trader.runTraderCycle = () => { ran++; return { decisions: [] }; };
+    t1.S.st.settings.aiTraderEnabled = true;
+    const cycle = t1.PT.boot.aiCycle();
+    ok(pending.length, 'the cycle is waiting');
+
+    // ...while the user switches to the other tab and trades there.
+    Object.assign(t1.sandbox.document, { hidden: true, visibilityState: 'hidden' });
+    t1.fire('document', 'visibilitychange');
+    t1.fire('window', 'blur');
+    t2.fire('document', 'visibilitychange');
+    t2.fire('window', 'focus');
+    b.deliver();
+    buyBTC(t2, 2000);
+    t2.A.save();
+
+    while (pending.length) { pending.shift()({ bars: [] }); await new Promise((r) => setImmediate(r)); }
+    await cycle;
+    b.deliver();
+    t1.A.save.flush();
+    t2.A.save.flush();
+    b.deliver();
+    ok(t2.A.isWriter() && !t1.A.isWriter(), 'the tab in use still writes');
+    eq(ran, 0, 'the hidden tab left the AI to it');
+    eq(activeFills(t1.stored()), 1, 'the trade is on disk');
+    eq(activeFills(t2.S.st), 1, 'and still on screen');
+  });
+
+  it('a tab opened in the background does not take writing from the tab in use', () => {
+    const b = browser();
+    const t1 = openTab(b);
+    seed(t1);
+    t1.PT.boot.boot();
+    const t2 = openTab(b, { hidden: true });
+    t2.PT.boot.boot();
+    b.deliver();
+    t2.PT.boot.tickLoop();
+    b.deliver();
+    ok(t1.A.isWriter() && !t2.A.isWriter(), 'the tab in view still writes');
+
+    Object.assign(t2.sandbox.document, { hidden: false, visibilityState: 'visible' });
+    t2.fire('document', 'visibilitychange');
+    b.deliver();
+    ok(t2.A.isWriter() && !t1.A.isWriter(), 'once looked at, it takes over');
+  });
+
+  it('following another tab\'s saves leaves the order ticket, and the amount being typed, alone', () => {
+    const b = browser();
+    const t1 = openTab(b);
+    seed(t1);
+    t1.PT.boot.boot();
+    const t2 = openTab(b);
+    t2.PT.boot.boot();
+    b.deliver();
+    t1.views.length = 0;
+    t2.PT.feed.prices.BTC = quote(50000);
+    buyBTC(t2, 2000);
+    t2.A.save();
+    t2.A.save.flush();
+    b.deliver();
+    eq(activeFills(t1.S.st), 1, 'the following tab picked up the trade');
+    ok(!t1.views.includes('buildOrderPane'), `ticket rebuilt: ${t1.views.join(',')}`);
+    ok(t1.views.includes('renderAll'), 'its estimate is redrawn against the new book');
+  });
+
+  it('a writing tab that dies without a word is taken over once its lease lapses', () => {
+    const start = clock.now;
+    const b = browser();
+    const t1 = openTab(b);
+    seed(t1);
+    t1.PT.boot.boot();
+    t1.PT.feed.prices.BTC = quote(50000);
+    t1.E.submitOrder(t1.A.pfUser(), { assetId: 'BTC', side: 'buy', type: 'limit', qty: 0.01, limitPrice: 49000 },
+      t1.A.orderCtx('BTC'));
+    t1.A.save();
+    t1.A.save.flush();
+    const t2 = openTab(b);
+    t2.PT.boot.boot();
+    b.deliver();
+    ok(t2.A.isWriter() && !t1.A.isWriter());
+
+    // A live writer keeps its lease, even run once a minute as a hidden tab is.
+    for (let i = 0; i < 3; i++) {
+      clock.now += 60000;
+      t2.PT.boot.tickLoop();
+      b.deliver();
+      t1.PT.boot.tickLoop();
+      t1.PT.boot.tickLoop();
+    }
+    ok(t2.A.isWriter() && !t1.A.isWriter(), 'no takeover from a live writer');
+
+    // Waking from sleep, the lease is old in every tab; the writer renews it first.
+    clock.now += 3600e3;
+    t1.PT.boot.tickLoop();
+    t2.PT.boot.tickLoop();
+    b.deliver();
+    clock.now += 1500;
+    t1.PT.boot.tickLoop();
+    ok(t2.A.isWriter() && !t1.A.isWriter(), 'no takeover on waking');
+
+    // The writer crashes: no pagehide, and it never runs again.
+    b.tabs.splice(b.tabs.indexOf(t2), 1);
+    t1.PT.feed.prices.BTC = quote(48000);
+    clock.now += 60000;
+    t1.PT.boot.tickLoop();
+    ok(!t1.A.isWriter(), 'the lease is still good');
+    clock.now += 31000;
+    t1.PT.boot.tickLoop();
+    clock.now += 1000;
+    t1.PT.boot.tickLoop();
+    ok(t1.A.isWriter(), 'the remaining tab took over');
+    eq(t1.A.pfUser().fills.length, 1, 'and filled the order the market crossed');
+    clock.now = start;
+  });
+
+  it('a writer frozen while another tab took over follows it on waking, then takes over', () => {
+    const start = clock.now;
+    const b = browser();
+    const t1 = openTab(b);
+    seed(t1);
+    t1.PT.boot.boot();
+    t1.PT.feed.prices.BTC = quote(50000);
+    t1.E.submitOrder(t1.A.pfUser(), { assetId: 'BTC', side: 'buy', type: 'limit', qty: 0.01, limitPrice: 49000 },
+      t1.A.orderCtx('BTC'));
+    t1.A.save();
+    t1.A.save.flush();
+    const t2 = openTab(b);
+    t2.PT.boot.boot();
+    b.deliver();
+    ok(t2.A.isWriter() && !t1.A.isWriter());
+
+    // t2 is frozen: it runs nothing and hears nothing, so t1 takes over and fills.
+    b.tabs.splice(b.tabs.indexOf(t2), 1);
+    t1.PT.feed.prices.BTC = quote(48000);
+    clock.now += 91000;
+    t1.PT.boot.tickLoop();
+    clock.now += 1500;
+    t1.PT.boot.tickLoop();
+    ok(t1.A.isWriter(), 't1 took over');
+    eq(t1.A.pfUser().fills.length, 1);
+    t1.A.save.flush();   // its debounced save lands long before t2 wakes
+
+    // The user switches back to t2, which still thinks it writes.
+    b.tabs.push(t2);
+    t2.PT.feed.prices.BTC = quote(48000);
+    t2.toasts.length = 0;
+    t2.fire('document', 'visibilitychange');
+    t2.fire('window', 'focus');
+    b.deliver();
+    ok(t2.A.isWriter() && !t1.A.isWriter(), 'the tab in use writes again');
+    eq(t2.A.pfUser().fills.length, 1, 'with the fill t1 made, not a second one');
+    ok(!t2.toasts.some((x) => /filled/i.test(x.title)), 'and no fill is announced twice');
+    clock.now = start;
+  });
+
+  it('a key from an older build, a bare id, is not taken as a lapsed lease', () => {
+    const start = clock.now;
+    const b = browser();
+    const t = openTab(b, { hidden: true });
+    seed(t);
+    b.store.set(KEY + '.writer', 'tab_olderbuild');
+    t.PT.boot.boot();
+    t.PT.boot.tickLoop();
+    clock.now += 2000;
+    t.PT.boot.tickLoop();
+    ok(!t.A.isWriter(), 'a live older tab keeps writing');
+    clock.now += 90000;
+    t.PT.boot.tickLoop();
+    clock.now += 1500;
+    t.PT.boot.tickLoop();
+    ok(t.A.isWriter(), 'but a key nobody renews still lapses');
+    clock.now = start;
+  });
 });
 
 /* -------------------------------------------------------------- boot */
@@ -477,6 +667,28 @@ describe('margin is enforced by the run loop', () => {
     ok(!t.A.pfUser().positions.SOL, 'short closed');
     ok(t.toasts.some((x) => /Forced buy-in/.test(x.title)), 'and the user is told');
   });
+  it('only warns while a long is unpriced, though every short is priced', () => {
+    clock.now = Date.UTC(2026, 8, 26, 16, 0);
+    const t = openTab();
+    seed(t, 10000, (st, E) => {
+      st.settings.shortingEnabled = true;
+      const ctx = (prices) => ({ prices, marketOpen: true, shortingEnabled: true, now: clock.now });
+      E.submitOrder(st.portfolios.user, { assetId: 'NVDA', side: 'buy', type: 'market', qty: 50 }, ctx({ NVDA: quote(100) }));
+      E.submitOrder(st.portfolios.user, { assetId: 'SOL', side: 'sell', type: 'market', qty: 95 }, ctx({ SOL: quote(100) }));
+    });
+    t.PT.boot.boot();
+    t.toasts.length = 0;
+    // Priced, NVDA's gain keeps the account healthy; at cost it looks under the floor.
+    eq(t.E.marginStatus(t.A.pfUser(), { NVDA: quote(300), SOL: quote(190) }).level, 'ok');
+    t.PT.feed.prices.SOL = quote(190);
+    eq(t.E.marginStatus(t.A.pfUser(), t.PT.feed.prices).level, 'liquidate');
+    t.PT.boot.tickLoop();
+    eq(t.A.pfUser().positions.SOL?.qty, -95, 'not bought in');
+    // A stock the feed keeps failing must not switch margin off: the call is still raised.
+    eq(t.toasts.length, 1);
+    ok(/Margin call/.test(t.toasts[0].title), t.toasts[0].title);
+    ok(/live price/.test(t.toasts[0].message), t.toasts[0].message);
+  });
   it('does nothing on a short the feed has not priced yet', () => {
     const t = setup(null);
     t.PT.boot.tickLoop();
@@ -500,6 +712,88 @@ describe('margin is enforced by the run loop', () => {
       t.E.submitOrder = real;
       console.warn = warn;
     }
+  });
+});
+
+describe('a forced buy-in of a stock short waits for its session', () => {
+  const et = (d, h, m, s = 0) => Date.UTC(2026, 8, d, h + 4, m, s);   // EDT
+  const setup = () => {
+    clock.now = et(26, 12, 0);   // Saturday
+    const t = openTab();
+    seed(t, 10000, (st, E) => {
+      st.settings.shortingEnabled = true;
+      const ctx = (prices) => ({ prices, marketOpen: true, shortingEnabled: true, now: et(25, 12, 0) });
+      E.submitOrder(st.portfolios.user, { assetId: 'SOL', side: 'buy', type: 'market', qty: 40 }, ctx({ SOL: quote(100) }));
+      E.submitOrder(st.portfolios.user, { assetId: 'AAPL', side: 'sell', type: 'market', qty: 48 }, ctx({ AAPL: quote(250) }));
+    });
+    t.PT.boot.boot();
+    t.toasts.length = 0;
+    // Friday's close for the stock; the coin falls over the weekend.
+    t.PT.feed.prices.AAPL = quote(330, { marketState: 'CLOSED', quoteTime: et(25, 16, 0) });
+    t.PT.feed.prices.SOL = quote(35);
+    eq(t.E.marginStatus(t.A.pfUser(), t.PT.feed.prices).level, 'liquidate');
+    return t;
+  };
+  it('holds it as a margin call while the exchange is shut', () => {
+    const t = setup();
+    t.PT.boot.tickLoop();
+    clock.now += 11000;
+    t.PT.boot.tickLoop();
+    eq(t.A.pfUser().positions.AAPL?.qty, -48, 'not bought back at Friday\'s close');
+    eq(t.A.pfUser().orders.length, 0, 'nor queued, over and over');
+    ok(!t.toasts.some((x) => /Forced buy-in/.test(x.title)));
+    eq(t.toasts.filter((x) => /Margin call/.test(x.title)).length, 1, 'the user is warned once');
+  });
+  it('buys it back on the first quote from the session', () => {
+    const t = setup();
+    t.PT.boot.tickLoop();
+    clock.now = et(28, 9, 30) + 200;
+    t.PT.feed.prices.AAPL = quote(330, { marketState: 'PRE', quoteTime: et(25, 16, 0), t: et(28, 9, 29, 40) });
+    t.PT.boot.tickLoop();
+    eq(t.A.pfUser().positions.AAPL?.qty, -48, 'not at the pre-market poll still on hand at the bell');
+    clock.now = et(28, 9, 31);
+    t.PT.feed.prices.AAPL = quote(332, { marketState: 'REGULAR', quoteTime: et(28, 9, 30, 30) });
+    t.PT.boot.tickLoop();
+    ok(!t.A.pfUser().positions.AAPL, 'short closed');
+    ok(t.A.pfUser().fills.at(-1).price >= 332, 'at a price from the session');
+    ok(t.toasts.some((x) => /Forced buy-in: AAPL/.test(x.title)));
+  });
+});
+
+/* ---------------------------------------------------------- chart fold */
+
+describe('the focused chart takes the official close', () => {
+  const setup = (now) => {
+    clock.now = now;
+    const t = openTab();
+    seed(t);
+    t.PT.boot.boot();
+    const folded = [];
+    t.PT.feed.applyTickToBars = (bars, tf, price, ts) => { folded.push({ price, ts }); return true; };
+    Object.assign(t.S, { focus: 'AAPL', tf: '1D', bars: [{ t: 0, o: 1, h: 1, l: 1, c: 1, v: 0 }], chart: { setData() {} } });
+    const print = (price, quoteTime, at, marketState) => {
+      clock.now = at;
+      t.feedOn.tick({ assetId: 'AAPL', price, changePct: 0, quoteTime, t: at, marketState, source: 'yahoo' });
+    };
+    return { t, folded, print };
+  };
+  it('folds the closing print, stamped at the bell, into the session\'s last candle', () => {
+    const et = (h, m, s = 0) => Date.UTC(2026, 8, 25, h + 4, m, s);   // Fri 25 Sep 2026, EDT
+    const { folded, print } = setup(et(15, 59));
+    print(339.10, et(15, 59, 58), et(15, 59, 59), 'REGULAR');
+    print(340.40, et(16, 0, 0), et(16, 0, 6), 'POST');
+    print(340.40, et(16, 0, 1), et(18, 30), 'POST');
+    eq(folded.map((f) => f.price), [339.10, 340.40, 340.40]);
+    ok(folded.slice(1).every((f) => f.ts < et(16, 0)), 'inside the session, not on a bar of its own');
+    print(341.00, et(18, 30), et(18, 30, 5), 'POST');
+    eq(folded.length, 3, 'an after-hours print is still left out');
+  });
+  it('on a half day, at 13:00', () => {
+    const et = (h, m, s = 0) => Date.UTC(2026, 10, 27, h + 5, m, s);  // Fri 27 Nov 2026, EST
+    const { folded, print } = setup(et(12, 59));
+    print(200, et(13, 0, 0), et(13, 0, 5), 'POST');
+    eq(folded.length, 1);
+    ok(folded[0].ts < et(13, 0));
   });
 });
 

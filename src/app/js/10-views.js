@@ -854,7 +854,8 @@
           const room = q && isFinite(q.price)
             ? E.availableCash(pf, A.prices()) / (E.SHORT_INITIAL_MARGIN - 1) / q.price : 0;
           k.textContent = 'Can sell';
-          v.textContent = `${U.fmtQty(free)} held  ·  up to ${U.fmtQty(free + room)} short`;
+          const most = U.floorQty(free + room, PT.assetKind(assetId));
+          v.textContent = `${U.fmtQty(free)} held  ·  up to ${U.fmtQty(most)} short`;
         } else {
           k.textContent = 'Available to sell';
           v.textContent = `${U.fmtQty(free)} ${assetId}`;

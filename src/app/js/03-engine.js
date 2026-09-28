@@ -16,6 +16,8 @@
 
   const U = PT.util;
   const { round, money, roundQty, floorQty } = U;
+  /** Money amounts in messages, always to the cent: extra digits are for prices. */
+  const fmtMoney = (v) => U.fmtUSD(v, { fixed2: true });
 
   const SCHEMA_VERSION = 1;
   const STORAGE_KEY = 'pt.state.v1';
@@ -302,7 +304,8 @@
   function availableQty(pf, assetId) {
     const pos = pf.positions[assetId];
     if (!pos || pos.qty <= 0) return 0;
-    return Math.max(0, pos.qty - committedQty(pf, assetId));
+    // Rounded so float noise in the difference (0.3 - 0.1) never shows or sells.
+    return Math.max(0, roundQty(pos.qty - committedQty(pf, assetId), kindOf(assetId)));
   }
 
   /**
@@ -408,8 +411,8 @@
       if (openCost > free + CASH_EPS) {
         const reserved = pf.cash - availableCash(pf, ctx.prices);
         throw new OrderError(reserved > CASH_EPS
-          ? `Not enough free cash. Need ${U.fmtUSD(openCost)}, but ${U.fmtUSD(reserved)} is held against open orders and short positions.`
-          : `Not enough cash. Need ${U.fmtUSD(openCost)}, available ${U.fmtUSD(free)}.`);
+          ? `Not enough free cash. Need ${fmtMoney(openCost)}, but ${fmtMoney(reserved)} is held against open orders and short positions.`
+          : `Not enough cash. Need ${fmtMoney(openCost)}, available ${fmtMoney(free)}.`);
       }
     } else {
       const pos = pf.positions[assetId];
@@ -440,8 +443,8 @@
           const maxExposure = availableCash(pf, ctx.prices) / (SHORT_INITIAL_MARGIN - 1);
           throw new OrderError(
             `Not enough margin to short ${U.fmtQty(shortQty)} ${assetId}. `
-            + `That needs ${U.fmtUSD(needed)} of collateral; you can short up to about `
-            + `${U.fmtUSD(maxExposure)} of stock right now.`,
+            + `That needs ${fmtMoney(needed)} of collateral; you can short up to about `
+            + `${fmtMoney(maxExposure)} of stock right now.`,
           );
         }
       }
@@ -1011,8 +1014,9 @@
     const problems = [];
     if (!finite(pf.cash)) problems.push(`cash was ${JSON.stringify(pf.cash)}`);
     // A short bought back past zero equity leaves a genuine debit. Only a
-    // negative balance the full trade history does not explain is damage.
-    else if (pf.cash < -0.005 && (pf.fillsTrimmed || Math.abs(reconstruct(pf).cash - pf.cash) > 0.01)) {
+    // negative balance the full trade history does not explain is damage; a
+    // trimmed book has no full history to check, so its debit is taken as real.
+    else if (pf.cash < -0.005 && !pf.fillsTrimmed && Math.abs(reconstruct(pf).cash - pf.cash) > 0.01) {
       problems.push(`cash was negative (${pf.cash})`);
     }
     if (!finite(pf.startingCash) || pf.startingCash <= 0) problems.push('starting balance was invalid');
@@ -1041,9 +1045,10 @@
       /*
        * History is incomplete, so the log cannot reproduce the book exactly.
        * Do the least-destructive thing: make every field valid and leave the
-       * rest alone.
+       * rest alone. A finite negative balance is a legitimate debit (a cover
+       * can leave one), so zeroing it would hand out free money.
        */
-      if (!finite(pf.cash) || pf.cash < 0) pf.cash = 0;
+      if (!finite(pf.cash)) pf.cash = 0;
       for (const id in pf.positions) {
         const p = pf.positions[id];
         if (!p || !finite(p.qty) || p.qty === 0 || !finite(p.avgCost) || p.avgCost <= 0) delete pf.positions[id];

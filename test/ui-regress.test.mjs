@@ -23,6 +23,12 @@ try {
 const HTML = buildHTML();
 const ORIGIN = 'http://paper-trader.test';
 const EXE = '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+/** What the search API answers, shaped like the real server's rows. */
+const SEARCH = JSON.stringify({ results: [
+  { symbol: 'AAPL', name: 'Apple Inc.', kind: 'stock', exchange: 'US', tradable: true },
+  { symbol: 'APLD', name: 'Applied Digital Corporation', kind: 'stock', exchange: 'US', tradable: true },
+  { symbol: 'APE', name: 'ApeCoin', kind: 'crypto', exchange: 'Coinbase', tradable: true },
+] });
 
 let browser;
 try {
@@ -66,6 +72,7 @@ async function open({ width = 1600, height = 950, session = 'open' } = {}) {
     if (url.pathname === '/') return reply(200, 'text/html; charset=utf-8', HTML);
     if (url.pathname === '/api/quotes') return reply(200, 'application/json', '{"quotes":{}}');
     if (url.pathname === '/api/candles') return reply(200, 'application/json', '{"bars":[],"source":"test"}');
+    if (url.pathname === '/api/search') return reply(200, 'application/json', SEARCH);
     return reply(404, 'text/plain', '');
   });
   await ctx.addInitScript((state) => {
@@ -328,6 +335,81 @@ await scenario('the topbar fits narrow screens', async (open) => {
   });
 });
 
+/* ------------------------------------- search results at narrow widths */
+
+await scenario('search results when the search box shrinks', async (open) => {
+  const { page, errors } = await open({ width: 1280 });
+  await page.locator('.omni__input').fill('apple');
+  await page.waitForSelector('.omni__item');
+  const results = {};
+  for (const width of [1280, 1101, 1024, 768, 601, 390]) {
+    await page.setViewportSize({ width, height: 800 });
+    await page.waitForTimeout(100);
+    results[width] = await page.evaluate(() => {
+      const list = document.querySelector('.omni__results').getBoundingClientRect();
+      const input = document.querySelector('.omni__input').getBoundingClientRect();
+      const rows = [...document.querySelectorAll('.omni__item')];
+      return {
+        shown: rows.length === 3,
+        // Room for a company name, not an ellipsis.
+        names: rows.map((r) => r.querySelector('.omni__name').getBoundingClientRect().width).every((w) => w >= 60),
+        rowsFit: rows.every((r) => r.scrollWidth <= r.clientWidth),
+        onScreen: list.left >= 0 && list.right <= window.innerWidth,
+        underInput: list.left <= input.left + 1 && list.right >= input.right - 1,
+      };
+    });
+  }
+
+  describe('search results when the search box shrinks', () => {
+    const want = { shown: true, names: true, rowsFit: true, onScreen: true, underInput: true };
+    for (const width of Object.keys(results)) {
+      it(`at ${width}px the results keep room for company names`, () => eq(results[width], want, `${width}px`));
+    }
+    it('throws nothing on the page', () => eq(errors, []));
+  });
+});
+
+/* ----------------------------------------------- toasts at phone width */
+
+await scenario('toasts at phone width', async (open) => {
+  // Two accounts, so the account button carries its "▾ 2" count.
+  const { page, errors } = await open({ width: 600, height: 780 });
+  await setPrices(page, { AAPL: 200 });
+  const results = {};
+  for (const [name, width] of [
+    ['Main', 600], ['Main', 390], ['Main', 374], ['Main', 360], ['Main', 340], ['Main', 320],
+    ['Retirement savings', 390], ['Retirement savings', 320], ['Main', 300], ['Main', 280],
+  ]) {
+    await page.setViewportSize({ width, height: 780 });
+    await page.evaluate((name) => { window.PT.app.pfUser().name = name; window.PT.app.renderAccountButton(); }, name);
+    await clearToasts(page);
+    await page.evaluate(() => window.PT.ui.toast({ title: 'Bought 1 AAPL', message: 'Filled at $200.00', kind: 'buy', timeout: 60000 }));
+    await page.waitForTimeout(400);
+    results[`${width}px, account "${name}"`] = await page.evaluate(() => {
+      const box = (sel) => document.querySelector(sel).getBoundingClientRect();
+      const bar = box('.topbar'), toast = box('.toast'), acct = box('.acctbtn'), sw = box('.topbar > .mobile-only');
+      const mid = (r) => (r.top + r.bottom) / 2;
+      const hit = document.elementFromPoint(acct.left + acct.width / 2, acct.bottom - 4);
+      return {
+        clear: toast.top >= bar.bottom,
+        twoRows: Math.abs(mid(sw) - mid(acct)) < 1,
+        labels: [...document.querySelectorAll('.mobile-only .seg__item')].every((b) => b.scrollWidth <= b.clientWidth),
+        account: !!hit && !!hit.closest('.acctbtn') && acct.right <= bar.right,
+        // Which book a trade lands in must stay readable, if only in part.
+        named: box('.acctbtn__name').width >= 20,
+      };
+    });
+  }
+
+  describe('toasts at phone width', () => {
+    const want = { clear: true, twoRows: true, labels: true, account: true, named: true };
+    for (const at of Object.keys(results)) {
+      it(`at ${at} a toast clears the topbar and its account button`, () => eq(results[at], want, at));
+    }
+    it('throws nothing on the page', () => eq(errors, []));
+  });
+});
+
 /* ----------------------------------------- narrow region vs other views */
 
 await scenario('the narrow-layout region switcher and full-width views', async (open) => {
@@ -464,6 +546,74 @@ await scenario('the portfolio view', async (open) => {
     it('the unrealized tile moves too', () => eq(live.unrealized, '-$600.00'));
     it('updates in place, keeping the view and its equity chart', () => ok(live.inPlace));
     it('and rebuilds when a fill changes the holdings', () => eq(live.qtyAfterFill, '39'));
+    it('throws nothing on the page', () => eq(errors, []));
+  });
+});
+
+/* ------------------------------------------ the portfolio between fills */
+
+await scenario('the portfolio view between fills', async (open) => {
+  const { page, errors } = await open({ height: 600 });
+  await setPrices(page, { AAPL: 200.01, TSLA: 250 });
+  await fill(page, 'AAPL', 'buy', 10);
+  await fill(page, 'TSLA', 'buy', 8);
+  await page.evaluate(() => window.PT.app.setView('portfolio'));
+  const scrolled = await page.evaluate(() => {
+    const view = document.querySelector('.pfview');
+    view.scrollTop = view.scrollHeight;
+    window.__pf = { view, chart: window.PT.app.S.equityChart };
+    return view.scrollTop;
+  });
+
+  // TSLA's $2,000.16 now outranks AAPL's $2,000.00: the same holdings, reordered.
+  await setPrices(page, { AAPL: 200, TSLA: 250.02 });
+  const swapped = await page.evaluate(() => {
+    const { app: A, views: V } = window.PT;
+    V.refreshPortfolioValues();
+    const view = document.querySelector('.pfview');
+    return {
+      kept: view === window.__pf.view && A.S.equityChart === window.__pf.chart,
+      scrollTop: view.scrollTop,
+      hero: document.querySelector('.pfhero__value').textContent,
+    };
+  });
+
+  // With prices standing still, a repaint changes nothing — so a figure the
+  // user has selected to copy stays selected.
+  const still = await page.evaluate(() => {
+    const V = window.PT.views;
+    const row = [...document.querySelectorAll('.pfview tbody tr')].find((tr) => /AAPL/.test(tr.textContent));
+    const out = {};
+    for (const [key, node] of [
+      ['hero', document.querySelector('.pfhero__value')],
+      ['holding', row.querySelectorAll('td')[4]],
+      ['tile', document.querySelector('.pfview .stat .stat__value')],
+      ['legend', document.querySelector('.pfview .alloc__key')],
+    ]) {
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      getSelection().removeAllRanges();
+      getSelection().addRange(range);
+      V.refreshPortfolioValues();
+      out[key] = getSelection().toString();
+    }
+    getSelection().removeAllRanges();
+    const watch = new MutationObserver(() => {});
+    watch.observe(document.querySelector('.pfview'), { subtree: true, childList: true, characterData: true, attributes: true });
+    V.refreshPortfolioValues();
+    out.mutations = watch.takeRecords().length;
+    watch.disconnect();
+    return out;
+  });
+
+  describe('the portfolio view between fills', () => {
+    it('keeps the view, its equity chart and its scroll when two holdings swap rank', () => {
+      ok(scrolled > 0, 'the view did not scroll');
+      eq(swapped, { kept: true, scrollTop: scrolled, hero: '$10,000.06' });
+    });
+    it('keeps a selected figure selected across a repaint', () => eq(still, {
+      hero: '$10,000.06', holding: '$2,000.00', tile: '+$0.06', legend: 'Invested $4,000.16 (40.0%)', mutations: 0,
+    }));
     it('throws nothing on the page', () => eq(errors, []));
   });
 });

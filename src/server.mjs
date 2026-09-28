@@ -204,16 +204,32 @@ function llmStatus() {
  * The LLM route spends the user's key, so only the app itself may call it. Any
  * page can send a "simple" cross-origin POST (text/plain needs no preflight),
  * and a DNS-rebinding page reaches us under its own hostname. So the Host must
- * be one no attacker controls (loopback, an IP literal, or the configured
- * HOST), any Origin must be that same host, and the body must be declared
- * JSON — which a cross-origin page cannot send without a preflight this server
- * never grants.
+ * be one no attacker controls (loopback, an IP literal, the configured HOST,
+ * or a name the user lists in PT_ALLOWED_HOSTS), any Origin must be that same
+ * host, and the body must be declared JSON — which a cross-origin page cannot
+ * send without a preflight this server never grants.
+ *
+ * PT_ALLOWED_HOSTS is separate from HOST because HOST is also the address we
+ * listen on: a machine name, a reverse proxy or a tunnel cannot be bound to.
  */
+const ALLOWED_HOSTS = new Set(splitList(process.env.PT_ALLOWED_HOSTS).map(hostnameOf).filter(Boolean));
+
+/**
+ * An entry parsed the way the Host header is, so one copied from the address
+ * bar ('mybox.local:7777', 'http://mybox.local', an IDN) still matches.
+ */
+function hostnameOf(entry) {
+  try {
+    const url = new URL(/^[a-z][\w+.-]*:\/\//i.test(entry) ? entry : `http://${entry}`);
+    return url.hostname.replace(/^\[|\]$/g, '');
+  } catch { return ''; }
+}
+
 function fromTheApp(req) {
   let host;
   try { host = new URL(`http://${req.headers.host}`); } catch { return false; }
   const name = host.hostname.replace(/^\[|\]$/g, '');
-  if (name !== 'localhost' && name !== HOST && !net.isIP(name)) return false;
+  if (name !== 'localhost' && name !== HOST && !net.isIP(name) && !ALLOWED_HOSTS.has(name)) return false;
   if (req.headers.origin !== undefined) {
     try { if (new URL(req.headers.origin).host !== host.host) return false; } catch { return false; }
   }

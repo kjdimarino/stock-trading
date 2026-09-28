@@ -608,6 +608,30 @@ describe('debug-pass regressions', () => {
       eq(hit, null, `"${q}" was answered from the glossary with "${hit && hit.term}"`);
     }
   });
+  it('a chat question naming part of a term still finds it', () => {
+    for (const [q, term] of [['explain bollinger', 'bollinger bands'], ['what is bollinger?', 'bollinger bands'],
+      ['what does unrealized mean', 'unrealized p&l'], ['explain fractional', 'fractional shares'],
+      ['what is a bid', 'bid and ask'], ['what is bid ask', 'bid and ask'], ['what is a limit', 'limit order'],
+      ['explain p/e', 'p/e ratio'], ['explain market capitalisation', 'market cap'],
+      ['what is a moving avg', 'moving average']]) {
+      const hit = C.explainConcept(q);
+      eq(hit && hit.term, term, `"${q}" resolved to ${hit && hit.term}`);
+    }
+  });
+  it('a polite or prefixed question still finds the term', () => {
+    for (const [q, term] of [['please explain bollinger', 'bollinger bands'], ['can you explain fractional', 'fractional shares'],
+      ['so what is a bid', 'bid and ask'], ['could you explain unrealized', 'unrealized p&l']]) {
+      const hit = C.explainConcept(q);
+      eq(hit && hit.term, term, `"${q}" resolved to ${hit && hit.term}`);
+    }
+  });
+  it('a partial name does not claim a market question or a ticker', () => {
+    for (const q of ['what is moving?', 'what is trading higher today', 'what is COST?', 'what is the market doing',
+      'I want to know what is moving']) {
+      const hit = C.explainConcept(q);
+      eq(hit, null, `"${q}" was answered from the glossary with "${hit && hit.term}"`);
+    }
+  });
   it('the app\'s own glossary chips still resolve, plurals included', () => {
     eq(C.explainConcept('Explain limit orders').term, 'limit order');
     eq(C.explainConcept('What is a stop loss?').term, 'stop loss');
@@ -661,6 +685,18 @@ describe('debug-pass regressions', () => {
     near(pa.cashWeight, 0.8, 1e-9);
     near(pa.concentration.hhi, 1, 1e-9);
     near(pa.concentration.topWeight, 0.2, 1e-9);
+  });
+  it('the briefing prints money in cents, not float noise', () => {
+    const p = pf(10000);
+    const prices = { AAPL: { price: 416.22, changePct: 0 } };
+    E.submitOrder(p, { assetId: 'AAPL', side: 'buy', type: 'market', qty: 20 }, ctx({ prices }));
+    const val = E.valuate(p, prices);
+    // A day change of pure float noise, as equity minus its baseline can leave.
+    const day = { change: 3.637978807091713e-12, changePct: 0 };
+    const b = C.briefPortfolio(C.analyzePortfolio(val, day, E.stats(p, val)), val);
+    const text = b.body.join(' ');
+    ok(text.includes('Today you are up $0.00 (0.00%).'), text);
+    ok(!/\$\d[\d,]*\.\d{3}/.test(text + b.headline), text);
   });
 
   /* ------------------------------------------------ annualised volatility */

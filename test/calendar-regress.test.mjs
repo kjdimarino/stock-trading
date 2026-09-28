@@ -103,6 +103,28 @@ describe('fmtQty never shows more than is held', () => {
     eq(U.fmtQty(12.5), '12.5');
     eq(U.fmtQty(0), '0');
   });
+  it('a difference sitting just under its decimal is not cut a unit low', () => {
+    eq(U.fmtQty(0.3 - 0.1), '0.2');
+    eq(U.fmtQty(5.3 - 2.1), '3.2');
+    eq(U.fmtQty(0.03 - 0.01), '0.02');
+    eq(U.fmtQty(-(0.3 - 0.1)), '-0.2');
+    // Past 2^50 scaled units round() leaves a value alone, so the snap must not rely on it.
+    eq(U.fmtQty(14999999.969999999), '14,999,999.97');
+  });
+  it('snapping float noise never rounds a genuine amount up', () => {
+    eq(U.fmtQty(0.0000123456789), '0.00001234');
+    eq(U.fmtQty(5.999999996), '5.9999');
+    eq(U.fmtQty(0.99999999995), '0.999999');
+    eq(U.fmtQty(0.00009999999), '0.00009999');
+  });
+  it('the free quantity reads the same as the Max button fills', () => {
+    const pf = fresh();
+    const c = ctx(px({ BTC: 50000 }));
+    E.submitOrder(pf, { assetId: 'BTC', side: 'buy', type: 'market', qty: 0.3 }, c);
+    E.submitOrder(pf, { assetId: 'BTC', side: 'sell', type: 'limit', qty: 0.1, limitPrice: 60000 }, c);
+    eq(U.fmtQty(E.availableQty(pf, 'BTC')), String(maxQty(pf, 'BTC')));
+    throws(() => E.submitOrder(pf, { assetId: 'BTC', side: 'sell', type: 'market', qty: 0.25 }, c), 'Only 0.2 BTC is free');
+  });
   it('selling the displayed ETH amount neither fails nor opens a short', () => {
     for (const shorting of [false, true]) {
       const pf = fresh();

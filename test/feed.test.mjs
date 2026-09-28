@@ -45,7 +45,7 @@ function rig(startAt = Date.UTC(2026, 8, 29, 14, 0)) {
     requests.push(req);
   });
   return {
-    F: P.feed, clock, sockets, requests, listeners,
+    PT: P, F: P.feed, clock, sockets, requests, listeners,
     get ws() { return sockets[sockets.length - 1]; },
     cryptoPolls: () => requests.filter((r) => r.url.includes('crypto=')),
     /** Advance the clock one second and run the feed's timer. */
@@ -330,6 +330,36 @@ describe('crypto feed lifecycle', () => {
     await r.settle();
     r.second();
     eq(r.cryptoPolls().length, 2, 'the next one goes once it has answered');
+  });
+
+  it('a coin watched while a poll is out is fetched once that poll answers', async () => {
+    // A delayed coin gets nothing from the socket or the timer while the
+    // socket is live, so the watch() that adds it is its only request.
+    const r = rig();
+    r.F.watch(['BTC']);
+    r.F.start();
+    r.cryptoPolls()[0].reply({ quotes: {} });
+    await r.settle();
+    const ws = r.ws;
+    ws.onopen();
+    r.frame(ws, ticker(r, 64000));
+    for (const id of ['SLOWA', 'SLOWB']) {
+      r.PT.registerAsset({ id, name: id, kind: 'crypto', cg: id.toLowerCase(), delayed: true });
+    }
+    r.F.watch(['SLOWA']);
+    const slow = r.cryptoPolls()[1];
+    ok(/gecko=SLOWA:slowa/.test(slow.url), slow.url);
+    r.F.watch(['SLOWB']);                    // lands while SLOWA's request waits on the limiter
+    eq(r.cryptoPolls().length, 2, 'still one request at a time');
+    slow.reply({ quotes: { SLOWA: { price: 2, source: 'coingecko', quality: 'delayed' } } });
+    await r.settle();
+    const next = r.cryptoPolls()[2];
+    ok(next && /SLOWB:slowb/.test(next.url), 'the coin added mid-flight is asked for next');
+    next.reply({ quotes: { SLOWB: { price: 3, source: 'coingecko', quality: 'delayed' } } });
+    await r.settle();
+    eq(r.F.price('SLOWB'), 3);
+    r.second();
+    eq(r.cryptoPolls().length, 3, 'and the follow-up is not repeated');
   });
 
   it('unwatching the focused coin keeps feeding the quote being traded', async () => {

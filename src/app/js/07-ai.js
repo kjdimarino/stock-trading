@@ -62,6 +62,20 @@
   };
   const TERM_RE = Object.fromEntries(TERMS.map((t) => [t, termPattern(t)]));
 
+  // "avg" for "average": same first letter, letters in order.
+  const abbreviates = (w, t) => {
+    let i = 0;
+    for (const ch of t) if (ch === w[i]) i++;
+    return w[0] === t[0] && i === w.length;
+  };
+
+  /** Does a short name ("bollinger", "bid ask", "moving avg") mean this term? */
+  function namesTerm(words, term) {
+    const tw = term.split(' ').filter((t) => t !== 'and');
+    if (words.length === 1) return tw.some((t) => t.startsWith(words[0]));
+    return words.every((w) => tw.some((t) => t.startsWith(w) || w.startsWith(t) || abbreviates(w, t)));
+  }
+
   function explainConcept(query) {
     const q = String(query || '').toLowerCase().trim();
     if (!q) return null;
@@ -74,10 +88,22 @@
     for (const term of TERMS) {
       if (TERM_RE[term].test(q)) return { term, text: CONCEPTS[term] };
     }
-    // A single bare word may name a term by its start: "bollinger".
-    if (/^[a-z0-9&/]{3,}$/.test(q)) {
-      for (const term of TERMS) if (term.startsWith(q)) return { term, text: CONCEPTS[term] };
-    }
+    /*
+     * Failing that, what the question asks about may be a short name for a
+     * term: "explain bollinger", "what is a bid", "what is a moving avg". Only
+     * a phrase of up to three real words qualifies, so "what is my position in
+     * TSLA" stays a portfolio question. "What is moving?" asks what is moving,
+     * and a ticker ("what is COST?") is a question about the asset.
+     */
+    const asked = q.replace(/[?.!\s]+$/, '');
+    // The lead-in can come anywhere: "please explain bollinger", "so what is a bid".
+    const m = asked.match(/(?:^|[^a-z])(what (is|are|does|do)|explain|define|how (does|do))\s+((an?|the)\s+)?(.+)$/);
+    if (m && (m[2] === 'is' || m[2] === 'are') && !m[5] && /^\S+ing$/.test(m[6])) return null;
+    const core = (m ? m[6] : asked).replace(/\s+(mean|means|work|works)$/, '');
+    const words = core.split(/\s+/);
+    if (words.length > 3 || !words.every((w) => /^[a-z0-9&/]{3,}$/.test(w))) return null;
+    if (words.length === 1 && PT.byId && PT.byId[core.toUpperCase()]) return null;
+    for (const term of TERMS) if (namesTerm(words, term)) return { term, text: CONCEPTS[term] };
     return null;
   }
 
@@ -284,17 +310,17 @@
     const eq = val.equity;
 
     if (!pa.positionCount) {
-      body.push(`You are holding ${U.fmtUSD(val.cash)} in cash and no positions. Nothing is at risk, and nothing is working for you either.`);
+      body.push(`You are holding ${U.fmtUSD(val.cash, { fixed2: true })} in cash and no positions. Nothing is at risk, and nothing is working for you either.`);
       body.push('Pick something from the watchlist to see a full breakdown here once you have a position.');
       return { headline: 'Fully in cash', body, computed: true };
     }
 
     const rp = val.totalReturnPct;
-    body.push(`Your book is worth ${U.fmtUSD(eq)} across ${pa.positionCount} position${pa.positionCount === 1 ? '' : 's'}, ${rp >= 0 ? 'up' : 'down'} ${U.fmtPctAbs(rp)} since you started.`);
+    body.push(`Your book is worth ${U.fmtUSD(eq, { fixed2: true })} across ${pa.positionCount} position${pa.positionCount === 1 ? '' : 's'}, ${rp >= 0 ? 'up' : 'down'} ${U.fmtPctAbs(rp)} since you started.`);
     body.push(`Unrealized P&L is ${U.fmtSigned(val.unrealized)} (${U.fmtPct(val.unrealizedPct)}) and you have booked ${U.fmtSigned(val.realized)} in realized gains.`);
 
     if (pa.dayPnl) {
-      body.push(`Today you are ${pa.dayPnl.change >= 0 ? 'up' : 'down'} ${U.fmtUSD(Math.abs(pa.dayPnl.change))} (${U.fmtPctAbs(pa.dayPnl.changePct)}).`);
+      body.push(`Today you are ${pa.dayPnl.change >= 0 ? 'up' : 'down'} ${U.fmtUSD(Math.abs(pa.dayPnl.change), { fixed2: true })} (${U.fmtPctAbs(pa.dayPnl.changePct)}).`);
     }
 
     const c = pa.concentration;
@@ -325,7 +351,7 @@
     }
 
     if (val.shortValue > 0) {
-      body.push(`You are short ${U.fmtUSD(val.shortValue)}, ${eq > 0 ? ((val.shortValue / eq) * 100).toFixed(0) : '—'}% of equity. A short loses as the price rises, and there is no ceiling on how far that can go.`);
+      body.push(`You are short ${U.fmtUSD(val.shortValue, { fixed2: true })}, ${eq > 0 ? ((val.shortValue / eq) * 100).toFixed(0) : '—'}% of equity. A short loses as the price rises, and there is no ceiling on how far that can go.`);
     }
 
     // Closed, not sells: opening a short is a sell, and covering one is a buy.
@@ -334,7 +360,7 @@
     }
 
     return {
-      headline: `${U.fmtUSD(eq)} · ${U.fmtPct(rp)} total return`,
+      headline: `${U.fmtUSD(eq, { fixed2: true })} · ${U.fmtPct(rp)} total return`,
       body, computed: true, risk: pa.risk, diversification: pa.diversification,
     };
   }
@@ -872,7 +898,7 @@
 
       if (notional < RULES.minOrderValue) {
         log('hold', cand.assetId,
-          `${cand.assetId} qualified (${cand.sig.stance}) but the available size of ${U.fmtUSD(notional)} is below the ${U.fmtUSD(RULES.minOrderValue)} minimum.`, []);
+          `${cand.assetId} qualified (${cand.sig.stance}) but the available size of ${U.fmtUSD(notional, { fixed2: true })} is below the ${U.fmtUSD(RULES.minOrderValue, { fixed2: true })} minimum.`, []);
         /*
          * Cash and headroom are shared, so if they are what ran short nothing
          * further down can fit either. The risk size and the group's room are
@@ -890,7 +916,7 @@
       const why = `${cand.assetId} scored ${cand.sig.score.toFixed(2)} (${cand.sig.stance}, ${cand.sig.confidence}% confidence) `
         + `and is trading above its 50-bar trend. Sizing ${weightPct.toFixed(1)}% of equity: `
         + `a ${stopPct.toFixed(1)}% stop on that position risks `
-        + `${U.fmtUSD(notional * stopPct / 100)}, about ${(RULES.riskPerTrade * 100).toFixed(1)}% of the book.`;
+        + `${U.fmtUSD(notional * stopPct / 100, { fixed2: true })}, about ${(RULES.riskPerTrade * 100).toFixed(1)}% of the book.`;
 
       try {
         const r = PT.engine.submitOrder(pf, {

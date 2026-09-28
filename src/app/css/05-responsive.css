@@ -18,8 +18,10 @@
   .terminal {
     grid-template-columns: 56px var(--wl-w, 240px) minmax(360px, 1fr) 280px;
   }
-  /* The search box gives up width before anything is pushed off the bar. */
+  /* The search box gives up width before anything is pushed off the bar... */
   .omni { flex-shrink: 1; min-width: 0; }
+  /* ...but its results keep their own, or company names are squeezed to nothing. */
+  .omni__results { right: auto; min-width: 100%; width: min(300px, calc(100vw - 80px)); }
 }
 
 @media (max-width: 1100px) {
@@ -126,7 +128,33 @@
   .topbar { flex-wrap: wrap; row-gap: var(--sp-2); padding-block: var(--sp-2); }
   .omni { flex-basis: 100%; }
   .topbar__spacer { display: none; }
-  .acct { margin-left: auto; }
   .acctbtn__name { max-width: 88px; }
+  /*
+   * The toasts below are placed for two rows, so the account button gives up
+   * width rather than ever wrapping onto a third: from a zero basis it always
+   * shares the switcher's row, growing back to its natural width where there
+   * is room and truncating its name where there is not.
+   */
+  .acct { margin-left: auto; flex: 1 1 0; min-width: 0; max-width: max-content; }
+  .acctbtn { max-width: 100%; }
+  .acctbtn__caret { flex-shrink: 0; }
+  .topbar > .mobile-only .seg__item { padding-inline: var(--sp-1-5); }
   .toasts { top: calc(96px + var(--sp-2)); }
+}
+
+/* The smallest phones: tighter still, so a short account name is not cut. */
+@media (max-width: 359px) {
+  .topbar { padding-inline: var(--sp-2); }
+  .topbar > .mobile-only .seg__item { padding-inline: var(--sp-1); }
+}
+
+/*
+ * Under 320px (a folded phone's cover screen) the switcher and the button's
+ * own padding leave the account name nothing. Which book a trade lands in has
+ * to stay readable, so everything around the name gives up space first.
+ */
+@media (max-width: 319px) {
+  .topbar { padding-inline: var(--sp-1-5); column-gap: var(--sp-1); }
+  .topbar > .mobile-only .seg__item { padding-inline: var(--sp-0-5); font-size: var(--fs-2xs); }
+  .acctbtn { gap: var(--sp-1); padding-inline: var(--sp-1-5); }
 }

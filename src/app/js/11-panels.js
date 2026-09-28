@@ -110,17 +110,23 @@
     paintPortfolio(live, pf, val);
   }
 
-  /** What the view was drawn for: a different account or set of holdings needs a rebuild. */
-  const portfolioSignature = (pf, val) => pf.id + '/' + val.positions.map((p) => p.assetId + ':' + p.qty).join('|');
+  /**
+   * What the view was drawn for: a different account or set of holdings needs a
+   * rebuild. Sorted, because valuate orders holdings by exposure — two that
+   * swap rank on a tick are still the same holdings, and rows are found by id.
+   */
+  const portfolioSignature = (pf, val) => pf.id + '/' + val.positions.map((p) => p.assetId + ':' + p.qty).sort().join('|');
 
   /** Write every price-dependent figure of the portfolio view. */
   function paintPortfolio(live, pf, val) {
     const day = E.dayPnl(pf, val, PT.calendar.stockStatus().etDate);
     const stats = E.stats(pf, val);
     const pa = C.analyzePortfolio(val, day, stats);
+    // Only what changed is written: replacing a figure's text node drops any
+    // selection in it, and most figures are unchanged on most ticks.
     const set = (node, text, cls) => {
-      node.textContent = text;
-      if (cls != null) node.className = cls;
+      if (node.textContent !== text) node.textContent = text;
+      if (cls != null && node.className !== cls) node.className = cls;
     };
 
     set(live.value, U.fmtUSD(val.equity, { fixed2: true }));
@@ -138,12 +144,12 @@
     const barPct = longSide + cashSide > 0 ? (longSide / (longSide + cashSide)) * 100 : 0;
     live.investedSeg.style.width = barPct.toFixed(3) + '%';
     live.cashSeg.style.width = (100 - barPct).toFixed(3) + '%';
-    live.investedKey.textContent = `Invested ${U.fmtUSD(val.invested, { fixed2: true })} (${val.investedPct.toFixed(1)}%)`;
-    live.cashKey.textContent = `Cash ${U.fmtUSD(val.cash, { fixed2: true })} (${val.cashPct.toFixed(1)}%)`;
+    set(live.investedKey, `Invested ${U.fmtUSD(val.invested, { fixed2: true })} (${val.investedPct.toFixed(1)}%)`);
+    set(live.cashKey, `Cash ${U.fmtUSD(val.cash, { fixed2: true })} (${val.cashPct.toFixed(1)}%)`);
 
     const tile = (key, value, sub, cls) => {
       set(live.tiles[key].value, value, 'stat__value num ' + (cls || ''));
-      live.tiles[key].sub.textContent = sub;
+      set(live.tiles[key].sub, sub);
     };
     tile('unrealized', U.fmtSigned(val.unrealized), U.fmtPct(val.unrealizedPct), U.dirClass(val.unrealized));
     // Closing fills, not sells: buying back a short closes a trade, and a sell
