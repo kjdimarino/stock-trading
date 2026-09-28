@@ -16,8 +16,48 @@
   let lastRender = 0;
   let lastEquitySample = 0;
 
-  function tickLoop() {
-    const now = Date.now();
+  /*
+   * At the bell the newest quote on hand for a stock is still the last
+   * pre-market poll — for Yahoo, the prior close — until the next poll lands.
+   * Releasing a queued order against it would fill at that stale price and
+   * hand out the overnight gap. So while an account has an order waiting on
+   * the open, the stock is left out of the prices its orders see until a quote
+   * printed after today's open arrives.
+   */
+  const OFF_HOURS = new Set(['PRE', 'PREPRE', 'POST', 'POSTPOST', 'CLOSED']);
+  function todaysOpen(now) {
+    const et = PT.calendar.inET(now);
+    return PT.calendar.fromET(et.y, et.m, et.d, 9, 30);
+  }
+  /** Was this stock quote printed in today's session, rather than before the bell? */
+  const printedSinceOpen = (q, openTs) =>
+    !OFF_HOURS.has(q.marketState) && (q.quoteTime || q.fetchedAt || q.t) >= openTs;
+  function orderPrices(pf, px, now) {
+    let out = null, openTs = null;
+    for (const o of pf.orders) {
+      const q = px[o.assetId];
+      if (o.status !== 'queued' || !q || PT.isCrypto(o.assetId)) continue;
+      if (openTs == null) {
+        if (!PT.calendar.stockStatus(now).isOpen) return px;
+        openTs = todaysOpen(now);
+      }
+      if (printedSinceOpen(q, openTs)) continue;
+      if (!out) out = Object.assign(Object.create(null), px);
+      delete out[o.assetId];
+    }
+    return out || px;
+  }
+
+  /** True when any account, or the AI, has a live order on this symbol. */
+  function hasOrderOn(assetId) {
+    for (const id of E.accountIds(S.st).concat('ai')) {
+      const pf = S.st.portfolios[id];
+      if (pf && pf.orders.some((o) => o.assetId === assetId)) return true;
+    }
+    return false;
+  }
+
+  function processOrders(now) {
     const px = A.prices();
 
     /*
@@ -30,9 +70,9 @@
       const pf = S.st.portfolios[id];
       if (!pf || !pf.orders.length) continue;
       const fills = E.processOpenOrders(pf, {
-        prices: px,
+        prices: orderPrices(pf, px, now),
         // Each order's own asset class decides whether it may fill.
-        marketOpen: PT.calendar.stockStatus().isOpen,
+        marketOpen: PT.calendar.stockStatus(now).isOpen,
         slippageEnabled: S.st.settings.slippageEnabled,
         shortingEnabled: S.st.settings.shortingEnabled !== false,
         now,
@@ -44,7 +84,7 @@
           UI.toast({
             kind: f.side,
             title: `${atOpen ? 'Filled at the open' : 'Limit filled'}: ${f.side} ${U.fmtQty(f.qty)} ${f.assetId}${where}`,
-            message: `at ${U.fmtUSD(f.price)}` + (f.side === 'sell' ? ` · realized ${U.fmtSigned(f.realized)}` : ''),
+            message: `at ${U.fmtUSD(f.price)}` + (f.closed ? ` · realized ${U.fmtSigned(f.realized)}` : ''),
           });
         }
       }
@@ -62,7 +102,44 @@
       }
       if (fills.length || (fills.rejected && fills.rejected.length)) A.save();
     }
+  }
 
+  function tickLoop() {
+    const now = Date.now();
+    const px = A.prices();
+
+    // Keep a price on everything an order, a holding or the chart depends on.
+    PT.feed.watch([...A.neededSymbols()]);
+    A.checkWriter();
+
+    // Orders, equity samples and margin are worked by the one tab that saves.
+    // Another tab doing it to its own copy of the book would do it twice.
+    if (A.isWriter()) {
+      processOrders(now);
+      sampleEquity(now, px);
+      checkMargin(now, px);
+    }
+
+    /* Chrome refresh, throttled — price cells update on their own via ticks. */
+    if (!document.hidden && now - lastRender > 250) {
+      lastRender = now;
+      V.renderTopbar();
+      V.renderStatusbar();
+      if (S.view === 'trade') {
+        V.renderSymbolHeader();
+        if (S.blotterTab !== 'history') V.renderBlotter();
+      } else if (S.view === 'portfolio') V.refreshPortfolioValues();
+    }
+
+    /*
+     * A timer, not requestAnimationFrame: animation frames stop outright in a
+     * hidden tab, and resting orders have to keep working while you are
+     * elsewhere. Timers there only slow down.
+     */
+    setTimeout(tickLoop, 100);
+  }
+
+  function sampleEquity(now, px) {
     /*
      * Equity curve sampling for every account and the AI.
      *
@@ -83,19 +160,6 @@
       }
       if (sampled) { lastEquitySample = now; A.save(); }
     }
-
-    /* Chrome refresh, throttled — price cells update on their own via ticks. */
-    if (now - lastRender > 250) {
-      lastRender = now;
-      V.renderTopbar();
-      V.renderStatusbar();
-      if (S.view === 'trade') {
-        V.renderSymbolHeader();
-        if (S.blotterTab !== 'history') V.renderBlotter();
-      }
-    }
-
-    requestAnimationFrame(() => setTimeout(tickLoop, 100));
   }
 
   /**
@@ -109,50 +173,84 @@
    * one account's healthy state suppress another's margin call.
    */
   const lastMarginLevel = Object.create(null);
+  const lastBuyIn = Object.create(null);
   function checkMargin(now, px) {
-    for (const id of E.accountIds(S.st)) checkAccountMargin(S.st.portfolios[id], id, px);
+    for (const id of E.accountIds(S.st)) checkAccountMargin(S.st.portfolios[id], id, px, now);
   }
 
-  function checkAccountMargin(pf, id, px) {
+  function checkAccountMargin(pf, id, px, now) {
     if (!pf) return;
+    /*
+     * Before the feed prices a position it sits at cost. An unpriced short
+     * would look safe, so the book is not judged at all. An unpriced long that
+     * has gained would look flat, so the call is still raised — a stock the
+     * feed keeps failing must not switch margin off — but nothing is bought
+     * back on a value that is made up.
+     */
+    let unpricedLong = false;
+    for (const assetId in pf.positions) {
+      const q = px[assetId];
+      if (q && q.price > 0) continue;
+      if (pf.positions[assetId].qty < 0) return;
+      unpricedLong = true;
+    }
     const active = id === S.st.activeAccount;
     const where = active ? '' : ` · ${pf.name}`;
     const m = E.marginStatus(pf, px);
     if (m.level === 'none') { lastMarginLevel[id] = 'ok'; return; }
 
-    if (m.level === 'liquidate') {
-      const shorts = E.valuate(pf, px).positions.filter((p) => p.isShort);
-      for (const pos of shorts) {
-        try {
-          const r = E.submitOrder(pf, {
-            assetId: pos.assetId, side: 'buy', type: 'market', qty: Math.abs(pos.qty),
-            reason: 'Forced buy-in: margin fell below the maintenance floor',
-          }, { ...A.orderCtx(pos.assetId), marketOpen: true });
-          UI.toast({
-            kind: 'error',
-            title: `Forced buy-in: ${pos.assetId}${where}`,
-            message: `Your short lost more than the account could cover, so it was bought back at `
-              + `${U.fmtUSD(r.fill.price)} (${U.fmtSigned(r.fill.realized)}). This is what a broker would do.`,
-            timeout: 15000,
-          });
-        } catch (e) { console.warn('[margin] could not buy in', pos.assetId, e.message); }
+    let level = m.level;
+    if (level === 'liquidate' && !unpricedLong) {
+      // A buy-in that failed is retried, but not on every 100ms pass.
+      if (now - (lastBuyIn[id] || 0) < 10000) return;
+      /*
+       * Only what can trade now is bought back. A stock waits for its session
+       * and a quote printed in it: before that the price on hand is the last
+       * close, and the user's own cover would be queued for the bell. Until
+       * then it stays a margin call. Crypto trades around the clock.
+       */
+      const open = PT.calendar.stockStatus(now).isOpen;
+      const shorts = E.valuate(pf, px).positions.filter((p) => p.isShort
+        && (PT.isCrypto(p.assetId) || (open && printedSinceOpen(px[p.assetId], todaysOpen(now)))));
+      if (shorts.length) {
+        lastBuyIn[id] = now;
+        for (const pos of shorts) {
+          try {
+            // The session was checked above, so this fills rather than queueing.
+            const r = E.submitOrder(pf, {
+              assetId: pos.assetId, side: 'buy', type: 'market', qty: Math.abs(pos.qty),
+              reason: 'Forced buy-in: margin fell below the maintenance floor',
+            }, { ...A.orderCtx(pos.assetId), marketOpen: true });
+            if (!r.fill) continue;
+            UI.toast({
+              kind: 'error',
+              title: `Forced buy-in: ${pos.assetId}${where}`,
+              message: `Your short lost more than the account could cover, so it was bought back at `
+                + `${U.fmtUSD(r.fill.price)} (${U.fmtSigned(r.fill.realized)}). This is what a broker would do.`,
+              timeout: 15000,
+            });
+          } catch (e) { console.warn('[margin] could not buy in', pos.assetId, e.message); }
+        }
+        A.save();
+        lastMarginLevel[id] = 'liquidate';
+        return;
       }
-      A.save();
-      lastMarginLevel[id] = 'liquidate';
-      return;
     }
+    if (level === 'liquidate') level = 'call';
 
-    if (m.level === 'call' && lastMarginLevel[id] !== 'call') {
+    if (level === 'call' && lastMarginLevel[id] !== 'call') {
       UI.toast({
         kind: 'warn',
         title: `Margin call on your short positions${where}`,
         message: `Equity is ${U.fmtUSD(m.equity)} against ${U.fmtUSD(m.exposure)} of shorts. `
           + `Equity must stay above ${U.fmtUSD(m.maintenance)} (30% of the short). `
-          + `Below ${U.fmtUSD(m.forceLevel)} the positions are bought back automatically.`,
+          + `Below ${U.fmtUSD(m.forceLevel)} the positions are bought back automatically`
+          + (m.level !== 'liquidate' ? '.' : unpricedLong ? ', once every holding has a live price.'
+            : ', stocks once their market opens.'),
         timeout: 15000,
       });
     }
-    lastMarginLevel[id] = m.level;
+    lastMarginLevel[id] = level;
   }
 
   /* ------------------------------------------------------- AI trader loop */
@@ -183,7 +281,8 @@
   }
 
   async function aiCycle() {
-    if (S.aiBusy || !S.st.settings.aiTraderEnabled) return;
+    // One AI per book: a second tab running it would trade the same money twice.
+    if (S.aiBusy || !S.st.settings.aiTraderEnabled || !A.isWriter()) return;
     S.aiBusy = true;
     try {
       const candidates = aiCandidates();
@@ -199,6 +298,9 @@
           S.candleCache[id + ':15m'] = res.bars;
         } catch { /* skip anything we cannot price honestly */ }
       }
+      // Writing may have gone to another tab while the candles loaded; that
+      // tab runs the AI now, and saving here would take writing back.
+      if (!A.isWriter()) return;
 
       const result = PT.trader.runTraderCycle(A.pfAI(), {
         now: Date.now(),
@@ -278,6 +380,12 @@
   function wireFeed() {
     PT.feed.on('tick', (q) => {
       A.paintQuote(q.assetId, q);
+      /*
+       * Resting orders are matched against every print, not just the ones the
+       * run loop samples: its timer crawls in a background tab, and a price can
+       * trade through a limit and back between two passes.
+       */
+      if (A.isWriter() && hasOrderOn(q.assetId)) processOrders(Date.now());
       if (q.assetId !== S.focus || !S.chart) return;
 
       if (PT.feed.SECOND_TFS.has(S.tf)) {
@@ -297,8 +405,28 @@
         return;
       }
 
-      // Fold the live price into the focused chart's newest candle.
-      if (S.bars && PT.feed.applyTickToBars(S.bars, S.tf, q.price, q.t)) {
+      /*
+       * Fold the live price into the focused chart's newest candle. A stock
+       * folds at the exchange's stamp, and only for a print from the regular
+       * session: polls of a shut market would otherwise draw flat bars for
+       * nights and weekends when nothing traded. The official close is stamped
+       * at the bell itself (16:00:00, or later from a post-close poll), so a
+       * print in the minute after it closes the session's last candle. Only
+       * one with an exchange stamp: a stamp-less (Nasdaq) price there may be an
+       * after-hours trade.
+       */
+      const eq = !PT.isCrypto(q.assetId);
+      let ts = eq && q.quoteTime > 0 ? q.quoteTime : q.t;
+      if (eq) {
+        const st = PT.calendar.stockStatus(ts);
+        if (!st.isOpen) {
+          const et = PT.calendar.inET(ts);
+          const bell = PT.calendar.fromET(et.y, et.m, et.d, st.early ? 13 : 16, 0);
+          if (!(q.quoteTime > 0) || st.phase !== 'after' || ts - bell >= 60e3) return;
+          ts = bell - 1;
+        }
+      }
+      if (S.bars && PT.feed.applyTickToBars(S.bars, S.tf, q.price, ts)) {
         S.chart.setData(S.bars, S.tf);
       }
     });
@@ -320,6 +448,26 @@
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'hidden') flush();
     });
+    // Moving to another window may mean moving to another tab of this app.
+    window.addEventListener('blur', flush);
+  }
+
+  /*
+   * Only one tab saves the book (see PT.app.save). The tab being looked at or
+   * used takes that over; the others follow what it saves.
+   */
+  function wireTabs() {
+    window.addEventListener('storage', A.onStorage);
+    window.addEventListener('focus', () => A.claimWriter(true));
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') return;
+      A.claimWriter(true);
+      // Catch up at once on anything that crossed while the tab was hidden.
+      if (A.isWriter()) processOrders(Date.now());
+    });
+    window.addEventListener('pagehide', () => A.releaseWriter());
+    // Back from the back/forward cache, having let go of it on the way out.
+    window.addEventListener('pageshow', (e) => { if (e.persisted) A.claimWriter(true); });
   }
 
   function startApp(state) {
@@ -344,16 +492,18 @@
     PT.app.mountShell();
     V.applyDirectionScheme();
 
-    const toWatch = new Set(S.st.watchlist);
-    for (const id in A.pfUser().positions) toWatch.add(id);
-    for (const id in A.pfAI().positions) toWatch.add(id);
-    PT.feed.watch([...toWatch]);
+    PT.feed.watch([...A.neededSymbols()]);
     PT.feed.setFocus(S.focus);
     PT.feed.start();
 
+    // A newly opened tab is the one in use — unless it opened, or reloaded, in
+    // the background. Then it follows until looked at; the run loop takes over
+    // if nobody writes.
+    if (!document.hidden) A.claimWriter();
     wireFeed();
     wireShortcuts();
     wireDurability();
+    wireTabs();
     V.renderAll();
     tickLoop();
 
@@ -381,7 +531,7 @@
         });
       }
       delete S.st.repairs;
-      A.save();
+      if (A.isWriter()) A.save();
     }
 
     // A one-time, unmissable statement of what this is.
@@ -394,7 +544,8 @@
           timeout: 12000,
         });
         S.st.settings.disclaimerSeen = true;
-        A.save();
+        // Not a reason to take over from a tab the user has since gone back to.
+        if (A.isWriter()) A.save();
       }, 1500);
     }
   }
@@ -402,7 +553,22 @@
   function boot() {
     const existing = E.load();
     if (existing) return startApp(existing);
+
+    // Another tab can finish onboarding while this one waits; use its book.
+    const onStored = (e) => { if (e.key === E.STORAGE_KEY && e.newValue && E.load()) location.reload(); };
+    window.addEventListener('storage', onStored);
     V.showOnboarding((cash) => {
+      window.removeEventListener('storage', onStored);
+      const other = E.load();
+      if (other) return startApp(other);
+      /*
+       * A save this build cannot read — damaged, or written by a newer version —
+       * is set aside rather than overwritten, so it is not destroyed outright.
+       */
+      try {
+        const raw = localStorage.getItem(E.STORAGE_KEY);
+        if (raw) localStorage.setItem(E.STORAGE_KEY + '.unreadable', raw);
+      } catch { /* no room to keep it */ }
       const fresh = E.newState(cash);
       E.save(fresh);
       startApp(fresh);

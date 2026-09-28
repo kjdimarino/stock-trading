@@ -11,6 +11,7 @@
  * localStorage.
  */
 import http from 'node:http';
+import net from 'node:net';
 import { STOCKS, ETFS, CRYPTO, ASSETS, BY_ID } from './universe.mjs';
 import {
   stockQuotes, cryptoQuotes, fetchCandles, searchSymbols, cryptoMarkets, cryptoProducts,
@@ -95,7 +96,7 @@ export function createServer(getHTML) {
         const geckoBySymbol = {};
         const geckoErrors = {};
         for (const [sym, cgId] of geckoPairs) {
-          if (g.quotes[cgId]) geckoBySymbol[sym] = g.quotes[cgId];
+          if ((g.quotes || {})[cgId]) geckoBySymbol[sym] = g.quotes[cgId];
           else geckoErrors[sym] = g.error || 'no CoinGecko price for this coin';
         }
 
@@ -135,7 +136,8 @@ export function createServer(getHTML) {
 
       /* -------------------------------------------------------- markets */
       if (p === '/api/markets') {
-        const ids = splitList(qs.get('ids'));
+        // CoinGecko ids are letters, digits, '-', '_' and '.'; anything else is junk.
+        const ids = splitList(qs.get('ids')).filter((id) => /^[\w.-]+$/.test(id));
         const list = ids.length ? ids : CRYPTO.map((c) => c.cg);
         try {
           return sendJSON(res, 200, await cryptoMarkets(list));
@@ -198,7 +200,47 @@ function llmStatus() {
   return { available: !!key, model: process.env.PT_LLM_MODEL || 'claude-sonnet-4-5-20250929' };
 }
 
+/*
+ * The LLM route spends the user's key, so only the app itself may call it. Any
+ * page can send a "simple" cross-origin POST (text/plain needs no preflight),
+ * and a DNS-rebinding page reaches us under its own hostname. So the Host must
+ * be one no attacker controls (loopback, an IP literal, the configured HOST,
+ * or a name the user lists in PT_ALLOWED_HOSTS), any Origin must be that same
+ * host, and the body must be declared JSON — which a cross-origin page cannot
+ * send without a preflight this server never grants.
+ *
+ * PT_ALLOWED_HOSTS is separate from HOST because HOST is also the address we
+ * listen on: a machine name, a reverse proxy or a tunnel cannot be bound to.
+ */
+const ALLOWED_HOSTS = new Set(splitList(process.env.PT_ALLOWED_HOSTS).map(hostnameOf).filter(Boolean));
+
+/**
+ * An entry parsed the way the Host header is, so one copied from the address
+ * bar ('mybox.local:7777', 'http://mybox.local', an IDN) still matches.
+ */
+function hostnameOf(entry) {
+  try {
+    const url = new URL(/^[a-z][\w+.-]*:\/\//i.test(entry) ? entry : `http://${entry}`);
+    return url.hostname.replace(/^\[|\]$/g, '');
+  } catch { return ''; }
+}
+
+function fromTheApp(req) {
+  let host;
+  try { host = new URL(`http://${req.headers.host}`); } catch { return false; }
+  const name = host.hostname.replace(/^\[|\]$/g, '');
+  if (name !== 'localhost' && name !== HOST && !net.isIP(name) && !ALLOWED_HOSTS.has(name)) return false;
+  if (req.headers.origin !== undefined) {
+    try { if (new URL(req.headers.origin).host !== host.host) return false; } catch { return false; }
+  }
+  return /^application\/json\s*(;|$)/i.test(req.headers['content-type'] || '');
+}
+
 function handleLLM(req, res) {
+  if (!fromTheApp(req)) {
+    req.resume();
+    return sendJSON(res, 403, { error: 'forbidden', message: 'The LLM proxy only answers the app itself.' });
+  }
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) {
     return sendJSON(res, 503, {

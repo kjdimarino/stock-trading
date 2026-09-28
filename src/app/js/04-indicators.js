@@ -143,8 +143,31 @@
     return ((values[values.length - 1] - prev) / prev) * 100;
   }
 
-  /** Latest volume relative to its own average — a crude but useful conviction proxy. */
-  function volumeRatio(bars, period = 20) {
+  /**
+   * Is the newest bar still being built at `now`? Providers return the
+   * in-progress candle, and the live feed appends a v:0 bar at every rollover.
+   * The bar width is the median recent gap, so an overnight or weekend break
+   * before a session's first bar does not stretch it.
+   */
+  function lastBarForming(bars, now) {
+    if (!isFinite(now)) return false;
+    const gaps = [];
+    for (let i = bars.length - 1; i > 0 && gaps.length < 9; i--) {
+      const g = bars[i].t - bars[i - 1].t;
+      if (g > 0) gaps.push(g);
+    }
+    if (!gaps.length) return false;
+    gaps.sort((a, b) => a - b);
+    return now < bars[bars.length - 1].t + gaps[gaps.length >> 1];
+  }
+
+  /**
+   * Latest volume relative to its own average — a crude but useful conviction
+   * proxy. Measured on the newest complete bar: a forming bar holds only part
+   * of its volume and would read as a low-volume bar.
+   */
+  function volumeRatio(bars, period = 20, now = Date.now()) {
+    if (bars && lastBarForming(bars, now)) bars = bars.slice(0, -1);
     if (!bars || bars.length < period + 1) return null;
     const recent = bars.slice(-period - 1, -1);
     const avg = recent.reduce((a, b) => a + (b.v || 0), 0) / recent.length;
@@ -181,8 +204,9 @@
   /**
    * Compute the whole indicator set for a candle series.
    * `periodsPerYear` should reflect the bar interval so volatility is sane.
+   * `now` decides whether the newest bar is still forming (see volumeRatio).
    */
-  function analyze(bars, periodsPerYear = 252) {
+  function analyze(bars, periodsPerYear = 252, now = Date.now()) {
     if (!bars || bars.length < 2) return null;
     const c = closes(bars);
     const last = c[c.length - 1];
@@ -208,7 +232,7 @@
       roc5: roc(c, 5),
       roc10: roc(c, 10),
       roc20: roc(c, 20),
-      volumeRatio: volumeRatio(bars),
+      volumeRatio: volumeRatio(bars, 20, now),
       realizedVol: realizedVol(c, periodsPerYear),
       range,
     };

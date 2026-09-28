@@ -216,6 +216,17 @@ The model is then given the *computed evidence* and told it may not invent a
 number. The key stays on your machine; the browser never sees it. Answers that
 came from the model are labelled as such.
 
+The model route only answers the app itself — opened as `localhost`, by IP
+address, or under the name in `HOST` — so another web page cannot spend your
+key. If you start with `HOST=0.0.0.0` and open the app by machine name, or
+through a tunnel or reverse proxy that passes the original `Host` header on
+(for nginx, `proxy_set_header Host $host`), list those names in
+`PT_ALLOWED_HOSTS`, comma separated:
+
+```bash
+PT_ALLOWED_HOSTS=mybox.local HOST=0.0.0.0 ANTHROPIC_API_KEY=sk-ant-... node paper-trader.mjs
+```
+
 ### Autonomous AI trader
 A second portfolio, same starting cash, traded automatically every five seconds
 by a deterministic multi-factor strategy while you trade yours. It stays
@@ -262,11 +273,11 @@ live app charges. Nothing can see the future.
 
 | | before | after | buy & hold |
 |---|---|---|---|
-| return | +7.6% | **+20.0%** | +1.6% |
-| max drawdown | -9.7% | **-8.3%** | -19.1% |
-| Sharpe | 0.64 | **1.13** | 0.16 |
-| profit factor | 1.19 | **1.85** | — |
-| avg win : avg loss | 2.8 : 1 | **8.4 : 1** | — |
+| return | +7.6% | **+20.4%** | +1.6% |
+| max drawdown | -9.7% | **-8.1%** | -19.1% |
+| Sharpe | 0.64 | **1.14** | 0.16 |
+| profit factor | 1.19 | **1.89** | — |
+| avg win : avg loss | 2.8 : 1 | **8.6 : 1** | — |
 
 The win rate is 18%. That is expected and fine — it is a trend system, and the
 payoff ratio is what pays for it.
@@ -275,7 +286,8 @@ Every setting was chosen on the first half of the history and then checked on
 the second half, which never influenced it. That discipline mattered: a
 parameter sweep found settings that turned the first half from -1.9% to +1.5%
 and made the second half *worse*, so those settings were discarded rather than
-shipped. `tools/ablate.mjs` turns each rule off in turn, and `test/strategy.test.mjs`
+shipped. `tools/ablate.mjs` turns each rule off in turn (and the ones that ship
+switched off, on), and `test/strategy.test.mjs`
 runs the whole backtest as a regression test on every build.
 
 **This is a demonstration of a rules engine, not investment advice, and 306 days
@@ -330,7 +342,7 @@ test/              unit, live-data and browser suites
 
 ### Tests
 
-365 assertions across 10 suites:
+693 assertions across 15 suites:
 
 | Suite | What it covers |
 |---|---|
@@ -340,9 +352,14 @@ test/              unit, live-data and browser suites
 | `chart` | Axis tick generation, decimal precision, sparkline geometry |
 | `feed` | Folding live ticks into session-anchored candles, freshness grading |
 | `ai` | Companion output, trader entries/exits/risk limits, a 400-cycle simulation |
+| `strategy` | The whole backtest as a regression test, on both halves of the history |
+| `calendar-regress` | Rounding and quantity/currency formatting at the extremes, early-close sessions |
+| `server-regress` | Offline proxy checks with scripted upstreams: timestamps, routing, cooldowns, cache keys, the model route's origin rules |
+| `app-regress` | The run loop and boot in simulated tabs: one writer at a time, leases, margin calls and buy-ins, orders at the bell |
 | `live-feed` | Connects to the **real** Coinbase socket and parses genuine live frames |
 | `providers` | Rate-limiter behaviour under concurrency, freshness labelling |
-| `browser` | Full end-to-end in Chromium against live data — 98 checks |
+| `browser` | Full end-to-end in Chromium against live data — 130 checks |
+| `ui-regress` | Hermetic Chromium checks of the order ticket, portfolio view and narrow layouts, with a scripted feed |
 | `market-open` | The equity path with the session clock pinned open |
 
 ```bash

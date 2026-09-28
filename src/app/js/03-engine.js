@@ -16,6 +16,8 @@
 
   const U = PT.util;
   const { round, money, roundQty, floorQty } = U;
+  /** Money amounts in messages, always to the cent: extra digits are for prices. */
+  const fmtMoney = (v) => U.fmtUSD(v, { fixed2: true });
 
   const SCHEMA_VERSION = 1;
   const STORAGE_KEY = 'pt.state.v1';
@@ -76,7 +78,10 @@
   /** Ordered user account ids, always at least one, never including the AI. */
   function accountIds(state) {
     const list = (state.accounts || []).filter((id) => id !== 'ai' && state.portfolios[id]);
-    return list.length ? list : ['user'];
+    if (list.length) return list;
+    // 'Main' can be closed, so fall back to whichever books exist, not to 'user'.
+    const books = Object.keys(state.portfolios || {}).filter((id) => id !== 'ai');
+    return books.length ? books : ['user'];
   }
 
   /** The account the user is currently trading. */
@@ -181,6 +186,14 @@
 
   const kindOf = (assetId) => PT.assetKind(assetId);
 
+  /**
+   * A quote's price if it is one we can trade or value against, else null.
+   * The global isFinite() coerces null to 0 and calls it finite, and upstream
+   * feeds do send `price: null`, so every price check goes through here.
+   */
+  const livePrice = (q) => (q && typeof q.price === 'number' && Number.isFinite(q.price) && q.price > 0
+    ? q.price : null);
+
   /** Price a market order would actually get, after simulated spread. */
   function effectivePrice(assetId, side, price, slippageEnabled) {
     if (!slippageEnabled) return price;
@@ -226,14 +239,41 @@
     return total;
   }
 
+  /**
+   * Margin promised to live sell orders that will open or add to a short.
+   * Each sell delivers whatever long units are still free for it first, oldest
+   * order first; only the remainder is a short. Its own proceeds will cover
+   * 100% of the collateral, so what is held back now is the other 50% — the
+   * same sum buildOrder checks a short against.
+   */
+  function committedShortMargin(pf, exceptId) {
+    const longLeft = {};
+    let total = 0;
+    const sells = pf.orders
+      .filter((o) => LIVE_ORDER.has(o.status) && o.side === 'sell' && o.id !== exceptId)
+      .sort((a, b) => (a.seq || 0) - (b.seq || 0));
+    for (const o of sells) {
+      if (!(o.assetId in longLeft)) {
+        const pos = pf.positions[o.assetId];
+        longLeft[o.assetId] = pos && pos.qty > 0 ? pos.qty : 0;
+      }
+      const fromLong = Math.min(o.qty, longLeft[o.assetId]);
+      longLeft[o.assetId] -= fromLong;
+      const shortPart = o.qty - fromLong;
+      if (shortPart > QTY_EPS) {
+        total += shortPart * (o.limitPrice ?? o.refPrice ?? 0) * (SHORT_INITIAL_MARGIN - 1);
+      }
+    }
+    return total;
+  }
+
   /** Total current market value of every short position. */
   function shortExposure(pf, prices) {
     let total = 0;
     for (const id in pf.positions) {
       const p = pf.positions[id];
       if (p.qty >= 0) continue;
-      const q = prices && prices[id];
-      const price = q && isFinite(q.price) ? q.price : p.avgCost;
+      const price = livePrice(prices && prices[id]) ?? p.avgCost;
       total += Math.abs(p.qty) * price;
     }
     return total;
@@ -243,18 +283,29 @@
   const shortCollateral = (pf, prices) => shortExposure(pf, prices) * SHORT_INITIAL_MARGIN;
 
   /**
+   * Cash left once every promise is kept: resting and queued buys, margin for
+   * pending shorts, and collateral held against open shorts. Negative when the
+   * shorts have moved against the account by more than its spare cash.
+   */
+  function freeCash(pf, prices, exceptId) {
+    return pf.cash - committedCash(pf, exceptId) - committedShortMargin(pf, exceptId)
+      - shortCollateral(pf, prices);
+  }
+
+  /**
    * Cash that is actually spendable: the balance, less money promised to
    * resting buy orders, less collateral held against short positions.
    */
-  function availableCash(pf, prices) {
-    return Math.max(0, pf.cash - committedCash(pf) - shortCollateral(pf, prices));
+  function availableCash(pf, prices, exceptId) {
+    return Math.max(0, freeCash(pf, prices, exceptId));
   }
 
   /** Long units of an asset that can be sold without opening a short. */
   function availableQty(pf, assetId) {
     const pos = pf.positions[assetId];
     if (!pos || pos.qty <= 0) return 0;
-    return Math.max(0, pos.qty - committedQty(pf, assetId));
+    // Rounded so float noise in the difference (0.3 - 0.1) never shows or sells.
+    return Math.max(0, roundQty(pos.qty - committedQty(pf, assetId), kindOf(assetId)));
   }
 
   /**
@@ -268,8 +319,7 @@
     let invested = 0;
     for (const id in pf.positions) {
       const p = pf.positions[id];
-      const q = prices && prices[id];
-      const price = q && isFinite(q.price) ? q.price : p.avgCost;
+      const price = livePrice(prices && prices[id]) ?? p.avgCost;
       invested += p.qty * price;
     }
     const equity = pf.cash + invested;
@@ -296,9 +346,8 @@
     if (type !== 'market' && type !== 'limit') throw new OrderError('Order type must be market or limit.');
 
     const kind = asset.kind;
-    const quote = ctx.prices[assetId];
-    const last = quote && isFinite(quote.price) ? quote.price : null;
-    if (last == null || last <= 0) {
+    const last = livePrice(ctx.prices[assetId]);
+    if (last == null) {
       throw new OrderError(`No live price for ${assetId} yet — wait for the feed to connect.`);
     }
 
@@ -338,20 +387,32 @@
     if (!isFinite(qty) || qty <= 0) throw new OrderError('Enter a quantity greater than zero.');
 
     const estCost = qty * refPrice;
-    if (estCost < MIN_NOTIONAL) {
+    // The minimum stops dust orders. Closing a whole position is exempt, or a
+    // sliver worth under $1 could never be sold or covered.
+    const existing = pf.positions[assetId];
+    const closesAll = existing && (side === 'sell') === (existing.qty > 0)
+      && Math.abs(qty - Math.abs(existing.qty)) <= QTY_EPS;
+    if (estCost < MIN_NOTIONAL && !closesAll) {
       throw new OrderError(`Order value must be at least $${MIN_NOTIONAL}.`);
     }
 
     if (side === 'buy') {
       const pos = pf.positions[assetId];
-      // Buying back a short releases collateral rather than consuming cash.
+      /*
+       * Buying back a short is never refused for want of cash: it settles
+       * shares the account already owes, and releases the 150% collateral held
+       * against them (at the mark). Only the part beyond the short, which opens
+       * a long, has to fit in what is free once the cover has gone through.
+       */
       const covering = pos && pos.qty < 0 ? Math.min(qty, Math.abs(pos.qty)) : 0;
-      const free = availableCash(pf, ctx.prices) + covering * refPrice * (SHORT_INITIAL_MARGIN - 1);
-      if (estCost > free + CASH_EPS) {
+      const openCost = estCost - covering * refPrice;
+      const free = Math.max(0, freeCash(pf, ctx.prices)
+        + covering * last * SHORT_INITIAL_MARGIN - covering * refPrice);
+      if (openCost > free + CASH_EPS) {
         const reserved = pf.cash - availableCash(pf, ctx.prices);
         throw new OrderError(reserved > CASH_EPS
-          ? `Not enough free cash. Need ${U.fmtUSD(estCost)}, but ${U.fmtUSD(reserved)} is held against open orders and short positions.`
-          : `Not enough cash. Need ${U.fmtUSD(estCost)}, available ${U.fmtUSD(free)}.`);
+          ? `Not enough free cash. Need ${fmtMoney(openCost)}, but ${fmtMoney(reserved)} is held against open orders and short positions.`
+          : `Not enough cash. Need ${fmtMoney(openCost)}, available ${fmtMoney(free)}.`);
       }
     } else {
       const pos = pf.positions[assetId];
@@ -382,8 +443,8 @@
           const maxExposure = availableCash(pf, ctx.prices) / (SHORT_INITIAL_MARGIN - 1);
           throw new OrderError(
             `Not enough margin to short ${U.fmtQty(shortQty)} ${assetId}. `
-            + `That needs ${U.fmtUSD(needed)} of collateral; you can short up to about `
-            + `${U.fmtUSD(maxExposure)} of stock right now.`,
+            + `That needs ${fmtMoney(needed)} of collateral; you can short up to about `
+            + `${fmtMoney(maxExposure)} of stock right now.`,
           );
         }
       }
@@ -461,7 +522,10 @@
     // purchase debits — whether it opens, closes or reverses a position.
     if (order.side === 'buy') {
       const cost = money(gross);
-      if (cost > pf.cash + CASH_EPS) throw new OrderError('Insufficient cash at fill time.');
+      // A pure cover always goes through, even into a debit: a short that has
+      // gapped past zero equity must still be bought back, not left to run.
+      const opensLong = oldQty >= 0 || qty > Math.abs(oldQty) + QTY_EPS;
+      if (opensLong && cost > pf.cash + CASH_EPS) throw new OrderError('Insufficient cash at fill time.');
       pf.cash = money(pf.cash - cost);
     } else {
       pf.cash = money(pf.cash + money(gross));
@@ -490,7 +554,8 @@
       closed: closedQty > 0,
       // What this fill did to the book, for an honest history label.
       effect: oldQty === 0 ? (delta > 0 ? 'open long' : 'open short')
-        : closedQty > 0 && Math.abs(newQty) < Math.abs(oldQty) && newQty !== 0 ? (oldQty > 0 ? 'reduce long' : 'reduce short')
+        : closedQty > 0 && Math.abs(newQty) < Math.abs(oldQty) && newQty !== 0
+          && oldQty > 0 === newQty > 0 ? (oldQty > 0 ? 'reduce long' : 'reduce short')
           : newQty === 0 ? (oldQty > 0 ? 'close long' : 'cover short')
             : oldQty > 0 === newQty > 0 ? (newQty > 0 ? 'add long' : 'add short')
               : (newQty > 0 ? 'reverse to long' : 'reverse to short'),
@@ -558,6 +623,27 @@
   }
 
   /**
+   * A resting or queued sell that opens or adds to a short was checked when it
+   * was placed, at a price it may no longer fill at. Check it again against
+   * the fill price and the shorting setting before it goes through.
+   */
+  function checkShortAtFill(pf, order, price, ctx) {
+    if (order.side !== 'sell') return;
+    const pos = pf.positions[order.assetId];
+    const held = pos ? pos.qty : 0;
+    const shortQty = order.qty - Math.max(0, held);
+    if (shortQty <= QTY_EPS) return;
+    if (!ctx.shortingEnabled) {
+      throw new OrderError(`Short selling is off, and you hold only ${U.fmtQty(Math.max(0, held))} ${order.assetId}.`);
+    }
+    const addedExposure = shortQty * price;
+    const needed = addedExposure * SHORT_INITIAL_MARGIN;
+    if (needed > availableCash(pf, ctx.prices, order.id) + addedExposure + CASH_EPS) {
+      throw new OrderError(`Not enough margin to short ${U.fmtQty(shortQty)} ${order.assetId} at ${U.fmtUSD(price)}.`);
+    }
+  }
+
+  /**
    * Walk resting orders against current prices. No partial fills: a paper
    * account cannot honestly model queue position, so an order is all-or-nothing.
    */
@@ -574,8 +660,8 @@
       // Equities only fill during regular hours.
       if (order.kind !== 'crypto' && !ctx.marketOpen) { still.push(order); continue; }
 
-      const q = ctx.prices[order.assetId];
-      if (!q || !isFinite(q.price)) { still.push(order); continue; }
+      const mark = livePrice(ctx.prices[order.assetId]);
+      if (mark == null) { still.push(order); continue; }
 
       /*
        * The bell has rung on an order entered while the market was shut. Market
@@ -589,12 +675,19 @@
 
         if (order.type === 'market') {
           try {
-            // Dollar-sized orders buy their dollars, not yesterday's share count.
+            /*
+             * Dollar-sized orders trade their dollars, not yesterday's share
+             * count, sized (floored) at the price they will actually fill at so
+             * a buy never spends more than it reserved. A sell never grows past
+             * the quantity it was checked and reserved for: a lower open would
+             * otherwise sell shares that are not there.
+             */
+            const price = effectivePrice(order.assetId, order.side, mark, ctx.slippageEnabled);
             if (order.notional != null) {
-              const sized = roundQty(order.notional / q.price, order.kind);
-              if (sized > 0) order.qty = sized;
+              const sized = floorQty(order.notional / price, order.kind);
+              if (sized > 0) order.qty = order.side === 'buy' ? sized : Math.min(sized, order.qty);
             }
-            const price = effectivePrice(order.assetId, order.side, q.price, ctx.slippageEnabled);
+            checkShortAtFill(pf, order, price, ctx);
             fills.push(applyFill(pf, order, price, ts, 'Queued order filled at the open'));
           } catch (e) {
             order.status = 'rejected';
@@ -606,10 +699,12 @@
         }
       }
 
-      if (!crosses(order, q.price)) { still.push(order); continue; }
+      if (!crosses(order, mark)) { still.push(order); continue; }
 
       try {
-        fills.push(applyFill(pf, order, marketableLimitPrice(order, q.price), ts, 'Limit order filled'));
+        const price = marketableLimitPrice(order, mark);
+        checkShortAtFill(pf, order, price, ctx);
+        fills.push(applyFill(pf, order, price, ts, 'Limit order filled'));
       } catch (e) {
         // Conditions changed since the order rested. Keep it — an order that
         // silently disappears is worse than one that explains itself.
@@ -643,14 +738,15 @@
    * flagged via `stale` so the UI can say so rather than silently misreport.
    */
   function valuate(pf, prices) {
-    let longValue = 0, shortValue = 0, unrealized = 0, longCost = 0, stale = 0;
+    let longValue = 0, shortValue = 0, unrealized = 0, longCost = 0, grossCost = 0, stale = 0;
     const rows = [];
 
     for (const assetId in pf.positions) {
       const pos = pf.positions[assetId];
       const q = prices[assetId];
-      const price = q && isFinite(q.price) ? q.price : pos.avgCost;
-      if (!q || !isFinite(q.price)) stale++;
+      const live = livePrice(q);
+      const price = live ?? pos.avgCost;
+      if (live == null) stale++;
 
       const isShort = pos.qty < 0;
       const value = pos.qty * price;              // signed: negative for shorts
@@ -660,6 +756,7 @@
 
       if (isShort) shortValue += Math.abs(value); else { longValue += value; longCost += cost; }
       unrealized += upl;
+      grossCost += basis;
 
       rows.push({
         assetId,
@@ -677,7 +774,7 @@
         realized: pos.realized,
         dayChangePct: q ? q.changePct : null,
         dayChange: q && isFinite(q.changePct) ? value - value / (1 + q.changePct / 100) : null,
-        stale: !q || !isFinite(q.price),
+        stale: live == null,
         openedAt: pos.openedAt,
       });
     }
@@ -694,7 +791,7 @@
     const invested = longValue - shortValue;      // net market exposure
     const equity = pf.cash + invested;
     const collateral = shortValue * SHORT_INITIAL_MARGIN;
-    const free = Math.max(0, pf.cash - committedCash(pf) - collateral);
+    const free = Math.max(0, pf.cash - committedCash(pf) - committedShortMargin(pf) - collateral);
 
     return {
       cash: pf.cash,
@@ -706,7 +803,9 @@
       netExposure: invested,
       costBasis: longCost,
       unrealized,
-      unrealizedPct: Math.abs(longCost) > 0 ? (unrealized / Math.abs(longCost)) * 100 : 0,
+      // Longs and shorts both, over what both cost: the long side alone reads
+      // 0% for a short-only book and wildly inflated for a mixed one.
+      unrealizedPct: grossCost > 0 ? (unrealized / grossCost) * 100 : 0,
       realized: realizedTotal,
       equity,
       // Money the user can actually deploy right now.
@@ -914,7 +1013,12 @@
   function audit(pf) {
     const problems = [];
     if (!finite(pf.cash)) problems.push(`cash was ${JSON.stringify(pf.cash)}`);
-    else if (pf.cash < -0.005) problems.push(`cash was negative (${pf.cash})`);
+    // A short bought back past zero equity leaves a genuine debit. Only a
+    // negative balance the full trade history does not explain is damage; a
+    // trimmed book has no full history to check, so its debit is taken as real.
+    else if (pf.cash < -0.005 && !pf.fillsTrimmed && Math.abs(reconstruct(pf).cash - pf.cash) > 0.01) {
+      problems.push(`cash was negative (${pf.cash})`);
+    }
     if (!finite(pf.startingCash) || pf.startingCash <= 0) problems.push('starting balance was invalid');
     for (const id in pf.positions) {
       const p = pf.positions[id];
@@ -941,9 +1045,10 @@
       /*
        * History is incomplete, so the log cannot reproduce the book exactly.
        * Do the least-destructive thing: make every field valid and leave the
-       * rest alone.
+       * rest alone. A finite negative balance is a legitimate debit (a cover
+       * can leave one), so zeroing it would hand out free money.
        */
-      if (!finite(pf.cash) || pf.cash < 0) pf.cash = 0;
+      if (!finite(pf.cash)) pf.cash = 0;
       for (const id in pf.positions) {
         const p = pf.positions[id];
         if (!p || !finite(p.qty) || p.qty === 0 || !finite(p.avgCost) || p.avgCost <= 0) delete pf.positions[id];
@@ -982,18 +1087,19 @@
     try {
       const parsed = migrate(JSON.parse(raw));
       if (!parsed) return null;
-      if (!parsed.portfolios || !parsed.portfolios.user || !parsed.portfolios.ai) return null;
+      if (!parsed.portfolios || !parsed.portfolios.ai) return null;
 
       /*
        * Saves written before multiple accounts existed have no account list.
        * Their single book keeps its id and simply becomes the first account —
        * nothing is copied, moved or renamed, so no history can be lost here.
+       * The original 'user' book is not required: it can be closed like any
+       * other, and whatever books remain are the accounts.
        */
-      if (!Array.isArray(parsed.accounts) || !parsed.accounts.length) {
-        parsed.accounts = ['user'];
-      }
-      parsed.accounts = parsed.accounts.filter((id) => id !== 'ai' && parsed.portfolios[id]);
-      if (!parsed.accounts.length) parsed.accounts = ['user'];
+      const books = (ids) => ids.filter((id) => id !== 'ai' && parsed.portfolios[id]);
+      parsed.accounts = books(Array.isArray(parsed.accounts) ? parsed.accounts : []);
+      if (!parsed.accounts.length) parsed.accounts = books(Object.keys(parsed.portfolios));
+      if (!parsed.accounts.length) return null;
       if (!parsed.portfolios[parsed.activeAccount] || parsed.activeAccount === 'ai') {
         parsed.activeAccount = parsed.accounts[0];
       }

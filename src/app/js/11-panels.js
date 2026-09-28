@@ -32,47 +32,46 @@
     const host = R.chartpane;
     const pf = A.pfUser();
     const val = E.valuate(pf, A.prices());
-    const day = E.dayPnl(pf, val, PT.calendar.stockStatus().etDate);
-    const stats = E.stats(pf, val);
-    const pa = C.analyzePortfolio(val, day, stats);
 
     host.innerHTML = '';
     const view = el('div', { class: 'pfview' });
+    /*
+     * Every figure here moves with the tape. Each is a node kept in R.pfLive
+     * and written by paintPortfolio: once now, then from the run loop through
+     * refreshPortfolioValues, without rebuilding the view or its equity chart.
+     */
+    const live = R.pfLive = { sig: portfolioSignature(pf, val), tiles: {} };
 
     /* hero */
-    const alloc = el('div', { class: 'allocation' });
-    const investedPct = val.equity > 0 ? (val.invested / val.equity) * 100 : 0;
-    const cashPct = 100 - investedPct;
-    alloc.append(
+    live.investedSeg = el('div', { class: 'alloc__seg', style: 'background:var(--accent)' });
+    live.cashSeg = el('div', { class: 'alloc__seg', style: 'background:var(--surface-4)' });
+    live.investedKey = document.createTextNode('');
+    live.cashKey = document.createTextNode('');
+    const alloc = el('div', { class: 'allocation' }, [
       el('div', { class: 'label', text: 'Cash vs invested' }),
-      el('div', { class: 'alloc__bar' }, [
-        el('div', { class: 'alloc__seg', style: `width:${investedPct}%;background:var(--accent)` }),
-        el('div', { class: 'alloc__seg', style: `width:${cashPct}%;background:var(--surface-4)` }),
-      ]),
+      el('div', { class: 'alloc__bar' }, [live.investedSeg, live.cashSeg]),
       el('div', { class: 'alloc__legend' }, [
         el('span', { class: 'alloc__key' }, [
-          el('span', { class: 'alloc__swatch', style: 'background:var(--accent)' }),
-          `Invested ${U.fmtUSD(val.invested, { fixed2: true })} (${investedPct.toFixed(1)}%)`,
+          el('span', { class: 'alloc__swatch', style: 'background:var(--accent)' }), live.investedKey,
         ]),
         el('span', { class: 'alloc__key' }, [
-          el('span', { class: 'alloc__swatch', style: 'background:var(--surface-4)' }),
-          `Cash ${U.fmtUSD(val.cash, { fixed2: true })} (${cashPct.toFixed(1)}%)`,
+          el('span', { class: 'alloc__swatch', style: 'background:var(--surface-4)' }), live.cashKey,
         ]),
       ]),
-    );
+    ]);
 
+    live.value = el('div', { class: 'pfhero__value num' });
+    live.total = el('span');
+    live.day = el('span');
     view.appendChild(el('div', { class: 'pfhero' }, [
       el('div', { class: 'pfhero__main' }, [
         el('div', { class: 'label', text: 'Total portfolio value' }),
-        el('div', { class: 'pfhero__value num', text: U.fmtUSD(val.equity, { fixed2: true }) }),
+        live.value,
         el('div', { class: 'pfhero__row' }, [
-          el('span', { class: U.dirClass(val.totalReturn), text: `${U.fmtSigned(val.totalReturn)} (${U.fmtPct(val.totalReturnPct)})` }),
+          live.total,
           el('span', { class: 'dimmer', text: 'all time' }),
           el('span', { class: 'dimmer', text: '·' }),
-          el('span', {
-            class: day.pending ? 'dim' : U.dirClass(day.change),
-            text: day.pending ? '—' : `${U.fmtSigned(day.change)} (${U.fmtPct(day.changePct)})`,
-          }),
+          live.day,
           el('span', { class: 'dimmer', text: 'today' }),
         ]),
       ]),
@@ -82,18 +81,13 @@
 
     /* stat strip */
     const stats6 = el('div', { class: 'stats', style: 'grid-template-columns:repeat(auto-fit,minmax(150px,1fr))' });
-    const tile = (label, value, sub, cls) => stats6.appendChild(el('div', { class: 'stat' }, [
-      el('div', { class: 'stat__label', text: label }),
-      el('div', { class: 'stat__value num ' + (cls || ''), text: value }),
-      sub ? el('div', { class: 'stat__sub', text: sub }) : null,
-    ]));
-    tile('Unrealized P&L', U.fmtSigned(val.unrealized), U.fmtPct(val.unrealizedPct), U.dirClass(val.unrealized));
-    tile('Realized P&L', U.fmtSigned(val.realized), `${stats.sells} closed trade${stats.sells === 1 ? '' : 's'}`, U.dirClass(val.realized));
-    tile('Positions', String(val.positions.length), `${stats.openOrders} open order${stats.openOrders === 1 ? '' : 's'}`);
-    tile('Win rate', stats.winRate == null ? '—' : stats.winRate.toFixed(0) + '%',
-      stats.winRate == null ? 'no closed trades yet' : `${stats.wins}W / ${stats.losses}L`);
-    tile('Max drawdown', stats.maxDrawdownPct >= 0.005 ? '-' + stats.maxDrawdownPct.toFixed(2) + '%' : '—', 'from peak equity');
-    tile('Diversification', pa.positionCount ? pa.diversification + '/100' : '—', pa.risk);
+    for (const [key, label] of [
+      ['unrealized', 'Unrealized P&L'], ['realized', 'Realized P&L'], ['positions', 'Positions'],
+      ['winRate', 'Win rate'], ['drawdown', 'Max drawdown'], ['diversification', 'Diversification'],
+    ]) {
+      const t = live.tiles[key] = { value: el('div'), sub: el('div', { class: 'stat__sub' }) };
+      stats6.appendChild(el('div', { class: 'stat' }, [el('div', { class: 'stat__label', text: label }), t.value, t.sub]));
+    }
     view.appendChild(stats6);
 
     /* equity curve */
@@ -112,7 +106,83 @@
     S.equityChart = new PT.chart.EquityChart(curveWrap);
     S.equityChart.setSeries([{ name: pf.name, color: SERIES_COLORS.user, points: pf.equity }]);
 
-    PT.views.renderPositionsInto(posHost, val);
+    live.rows = PT.views.renderPositionsInto(posHost, val);
+    paintPortfolio(live, pf, val);
+  }
+
+  /**
+   * What the view was drawn for: a different account or set of holdings needs a
+   * rebuild. Sorted, because valuate orders holdings by exposure — two that
+   * swap rank on a tick are still the same holdings, and rows are found by id.
+   */
+  const portfolioSignature = (pf, val) => pf.id + '/' + val.positions.map((p) => p.assetId + ':' + p.qty).sort().join('|');
+
+  /** Write every price-dependent figure of the portfolio view. */
+  function paintPortfolio(live, pf, val) {
+    const day = E.dayPnl(pf, val, PT.calendar.stockStatus().etDate);
+    const stats = E.stats(pf, val);
+    const pa = C.analyzePortfolio(val, day, stats);
+    // Only what changed is written: replacing a figure's text node drops any
+    // selection in it, and most figures are unchanged on most ticks.
+    const set = (node, text, cls) => {
+      if (node.textContent !== text) node.textContent = text;
+      if (cls != null && node.className !== cls) node.className = cls;
+    };
+
+    set(live.value, U.fmtUSD(val.equity, { fixed2: true }));
+    set(live.total, `${U.fmtSigned(val.totalReturn)} (${U.fmtPct(val.totalReturnPct)})`, U.dirClass(val.totalReturn));
+    set(live.day, day.pending ? '—' : `${U.fmtSigned(day.change)} (${U.fmtPct(day.changePct)})`,
+      day.pending ? 'dim' : U.dirClass(day.change));
+
+    /*
+     * The legend gives each side as the engine's share of equity. With a short
+     * open those sum past 100% — its proceeds sit in cash — so the bar instead
+     * splits long holdings against cash, which always fills it exactly.
+     */
+    const longSide = Math.max(0, val.invested);
+    const cashSide = Math.max(0, val.cash);
+    const barPct = longSide + cashSide > 0 ? (longSide / (longSide + cashSide)) * 100 : 0;
+    live.investedSeg.style.width = barPct.toFixed(3) + '%';
+    live.cashSeg.style.width = (100 - barPct).toFixed(3) + '%';
+    set(live.investedKey, `Invested ${U.fmtUSD(val.invested, { fixed2: true })} (${val.investedPct.toFixed(1)}%)`);
+    set(live.cashKey, `Cash ${U.fmtUSD(val.cash, { fixed2: true })} (${val.cashPct.toFixed(1)}%)`);
+
+    const tile = (key, value, sub, cls) => {
+      set(live.tiles[key].value, value, 'stat__value num ' + (cls || ''));
+      set(live.tiles[key].sub, sub);
+    };
+    tile('unrealized', U.fmtSigned(val.unrealized), U.fmtPct(val.unrealizedPct), U.dirClass(val.unrealized));
+    // Closing fills, not sells: buying back a short closes a trade, and a sell
+    // that opens one does not.
+    tile('realized', U.fmtSigned(val.realized), `${stats.closed} closed trade${stats.closed === 1 ? '' : 's'}`, U.dirClass(val.realized));
+    tile('positions', String(val.positions.length), `${stats.openOrders} open order${stats.openOrders === 1 ? '' : 's'}`);
+    tile('winRate', stats.winRate == null ? '—' : stats.winRate.toFixed(0) + '%',
+      stats.winRate == null ? 'no closed trades yet' : `${stats.wins}W / ${stats.losses}L`);
+    tile('drawdown', stats.maxDrawdownPct >= 0.005 ? '-' + stats.maxDrawdownPct.toFixed(2) + '%' : '—', 'from peak equity');
+    tile('diversification', pa.positionCount ? pa.diversification + '/100' : '—', pa.risk);
+
+    for (const p of val.positions) {
+      const row = live.rows && live.rows.get(p.assetId);
+      if (!row) continue;
+      set(row.value, U.fmtUSD(p.value, { fixed2: true }));
+      set(row.upl, U.fmtSigned(p.unrealized), 'num ' + U.dirClass(p.unrealized));
+      set(row.pct, U.fmtPct(p.unrealizedPct), 'num ' + U.dirClass(p.unrealized));
+      set(row.weight, p.weightPct.toFixed(1) + '%');
+    }
+  }
+
+  /**
+   * The run loop's refresh for the portfolio view. Numbers are rewritten in
+   * place; the view is rebuilt only when the account or its holdings changed,
+   * so the equity chart and any text selection survive the tape.
+   */
+  function refreshPortfolioValues() {
+    const live = R.pfLive;
+    if (S.view !== 'portfolio' || !live || !live.value.isConnected) return;
+    const pf = A.pfUser();
+    const val = E.valuate(pf, A.prices());
+    if (portfolioSignature(pf, val) !== live.sig) renderPortfolioView();
+    else paintPortfolio(live, pf, val);
   }
 
   /* ============================== scoreboard ============================= */
@@ -307,11 +377,12 @@
 
     R.aiInput = el('input', {
       class: 'input', type: 'text', placeholder: 'Ask about your positions, a symbol, or a concept…',
+      'aria-label': 'Ask the AI companion',
     });
     R.aiInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && R.aiInput.value.trim()) ask(R.aiInput.value.trim());
     });
-    const send = el('button', { class: 'btn btn--primary btn--icon' }, icon('send', 15));
+    const send = el('button', { class: 'btn btn--primary btn--icon', title: 'Send', 'aria-label': 'Send' }, icon('send', 15));
     send.addEventListener('click', () => { if (R.aiInput.value.trim()) ask(R.aiInput.value.trim()); });
     view.appendChild(el('div', { class: 'ai__composer' }, [R.aiInput, send]));
 
@@ -627,7 +698,7 @@
     aiOn.checked = !!S.st.settings.aiTraderEnabled;
     aiOn.addEventListener('change', () => { S.st.settings.aiTraderEnabled = aiOn.checked; A.save(); });
 
-    const scheme = el('select', { class: 'input' });
+    const scheme = el('select', { class: 'input', 'aria-label': 'Direction colours' });
     for (const [v, label] of [['standard', 'Green up / red down'], ['inverted', 'Red up / green down'], ['cvd', 'Blue up / amber down (colour-blind safe)']]) {
       scheme.appendChild(el('option', { value: v, text: label, selected: (S.st.settings.directionScheme || 'standard') === v }));
     }
@@ -928,7 +999,7 @@
   }
 
   function promptRename(pf) {
-    const name = el('input', { class: 'input', type: 'text', value: pf.name, maxlength: '40' });
+    const name = el('input', { class: 'input', type: 'text', value: pf.name, maxlength: '40', 'aria-label': 'Account name' });
     UI.modal({
       title: 'Rename account',
       body: el('div', { class: 'field' }, [el('div', { class: 'field__label' }, 'Name'), name]),
@@ -1082,19 +1153,29 @@
 
   /* --------------------------------------------------- shared sub-render */
 
+  /** The holdings table. Returns its moving cells by asset, for in-place updates. */
   function renderPositionsInto(host, val) {
     host.innerHTML = '';
+    const rows = new Map();
     if (!val.positions.length) {
       host.appendChild(UI.emptyState('wallet', 'No holdings yet',
         'Your positions and their live P&L will appear here once you buy something.'));
-      return;
+      return rows;
     }
     const { t, tbody } = PT.views.table(['Symbol', 'Qty', 'Avg cost', 'Last', 'Market value', 'Unrealized', '%', 'Weight']);
     for (const p of val.positions) {
-      const weight = val.equity > 0 ? (p.value / val.equity) * 100 : 0;
       const priceCell = UI.makePriceCell('');
       A.registerCell(p.assetId, { price: priceCell });
       UI.setPrice(priceCell, p.price);
+      const cells = {
+        value: el('td', { class: 'num', text: U.fmtUSD(p.value, { fixed2: true }) }),
+        upl: el('td', { class: 'num ' + U.dirClass(p.unrealized), text: U.fmtSigned(p.unrealized) }),
+        pct: el('td', { class: 'num ' + U.dirClass(p.unrealized), text: U.fmtPct(p.unrealizedPct) }),
+        // The engine's weight — exposure over equity — so a short reads as the
+        // same share of the book here as in the blotter's "% of book".
+        weight: el('td', { class: 'num dim', text: p.weightPct.toFixed(1) + '%' }),
+      };
+      rows.set(p.assetId, cells);
       const tr = el('tr', { class: 'is-clickable' }, [
         el('td', {}, [
           el('div', { class: 'table__sym', text: p.assetId }),
@@ -1103,21 +1184,19 @@
         el('td', { class: 'num', text: U.fmtQty(p.qty) }),
         el('td', { class: 'num', text: U.fmtUSD(p.avgCost) }),
         el('td', {}, priceCell),
-        el('td', { class: 'num', text: U.fmtUSD(p.value, { fixed2: true }) }),
-        el('td', { class: 'num ' + U.dirClass(p.unrealized), text: U.fmtSigned(p.unrealized) }),
-        el('td', { class: 'num ' + U.dirClass(p.unrealized), text: U.fmtPct(p.unrealizedPct) }),
-        el('td', { class: 'num dim', text: weight.toFixed(1) + '%' }),
+        cells.value, cells.upl, cells.pct, cells.weight,
       ]);
       tr.addEventListener('click', () => A.setFocus(p.assetId));
       tbody.appendChild(tr);
     }
     host.appendChild(t);
+    return rows;
   }
 
   PT.views = Object.assign(PT.views || {}, {
     renderPortfolioView, renderCompareView, renderAIView, renderTradeLog, renderIdeasView,
     renderAccountsView,
-    openSettings, showOnboarding, applyDirectionScheme, renderPositionsInto,
+    openSettings, showOnboarding, applyDirectionScheme, renderPositionsInto, refreshPortfolioValues,
     askCompanion: ask,
   });
 })(window.PT);

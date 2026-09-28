@@ -50,6 +50,181 @@ describe('axis decimals', () => {
   });
 });
 
+/* ------------------------------------------------------ rendered charts -- */
+
+// Just enough DOM for the real PriceChart/EquityChart to paint. Each 2D
+// context records its fillText calls, so a test can read what was drawn.
+const recordingCtx = () => new Proxy({ texts: [] }, {
+  get(t, k) {
+    if (k === 'fillText') return (s) => t.texts.push(String(s));
+    if (k === 'measureText') return (s) => ({ width: String(s).length * 6 });
+    if (k in t) return t[k];
+    return () => ({ addColorStop() {} });
+  },
+  set(t, k, v) { t[k] = v; return true; },
+});
+let rafSeq = 0;
+const rafQueue = new Map();
+Object.assign(sandbox, {
+  document: {
+    documentElement: {},
+    createElement: () => {
+      const ctx = recordingCtx();
+      return { getContext: () => ctx, remove() {}, style: {} };
+    },
+  },
+  getComputedStyle: () => ({ getPropertyValue: () => '' }),
+  ResizeObserver: class { observe() {} disconnect() {} },
+  requestAnimationFrame: (f) => { rafQueue.set(++rafSeq, f); return rafSeq; },
+  cancelAnimationFrame: (id) => rafQueue.delete(id),
+  devicePixelRatio: 1,
+});
+const flush = () => { const q = [...rafQueue.values()]; rafQueue.clear(); q.forEach((f) => f()); };
+const box = (width, height) => ({
+  appendChild() {}, addEventListener() {}, removeEventListener() {},
+  style: {}, classList: { toggle() {} },
+  getBoundingClientRect: () => ({ width, height, left: 0, top: 0 }),
+});
+
+/*
+ * Pin the "browser" time zone, whatever zone the suite runs in. Dates are the
+ * interesting case west of UTC, where a bar stamped 00:00 UTC is still the
+ * previous evening locally.
+ */
+let localZone = 'America/New_York';
+const RealIntl = Intl;
+sandbox.Intl = Object.create(RealIntl, {
+  DateTimeFormat: {
+    value: function (loc, opts) { return new RealIntl.DateTimeFormat(loc, { timeZone: localZone, ...opts }); },
+  },
+});
+
+function priceChart(bars, tf, w = 800, h = 400) {
+  const chart = new C.PriceChart(box(w, h));
+  chart.setData(bars, tf);
+  flush();
+  return chart;
+}
+/** Crosshair pill texts, [price, time], with bar `i` hovered. */
+function pills(chart, i) {
+  chart.hover = i;
+  chart.octx.texts.length = 0;
+  chart._drawOverlay();
+  return chart.octx.texts.slice();
+}
+const NUMERIC = /^\$?[\d,]+(\.\d+)?$/;
+const parseLabel = (s) => Number(s.replace(/[$,]/g, ''));
+/** Price-axis labels: the run of numbers painted before the time axis. */
+function priceAxis(chart) {
+  const out = [];
+  for (const s of chart.bctx.texts) { if (!NUMERIC.test(s)) break; out.push(parseLabel(s)); }
+  return out;
+}
+const fmtAxis = (v, dp) => v.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+const DAY = 86400e3;
+
+describe('axis labels sit on their gridlines', () => {
+  const uniform = (labels, what) => {
+    ok(labels.length >= 3, `${what}: ${labels.length} labels`);
+    for (let i = 2; i < labels.length; i++) {
+      near(labels[i] - labels[i - 1], labels[1] - labels[0], 1e-9, `${what}: labels ${labels.join(' | ')}`);
+    }
+  };
+  it('every tick reads back as its own value', () => {
+    // Ranges whose first nice step leaves too few gridlines, so ticks() densifies.
+    for (const [lo, hi, n] of [[101, 113, 3], [0.1003, 0.1133, 3], [0.3, 1.4, 6], [179.2888, 189.6012, 6], [99999.1, 100009.9, 5]]) {
+      const t = C.ticks(lo, hi, n);
+      const dp = C.axisDecimals(t[1] - t[0]);
+      for (const v of t) near(parseLabel(fmtAxis(v, dp)), v, (t[1] - t[0]) * 1e-6, `ticks(${lo}, ${hi}, ${n}) at ${v} reads ${fmtAxis(v, dp)}`);
+    }
+  });
+  it('steps stay in the 1-2-5 family, whatever the range', () => {
+    let seed = 11;
+    const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+    for (let k = 0; k < 2000; k++) {
+      const lo = Math.pow(10, rnd() * 12 - 7);
+      const hi = lo * (1 + rnd() * 0.5);
+      const t = C.ticks(lo, hi, 3 + Math.floor(rnd() * 6));
+      const step = t[1] - t[0];
+      const m = step / Math.pow(10, Math.floor(Math.log10(step)));
+      ok([1, 2, 5, 10].some((f) => Math.abs(m - f) < 1e-6), `step ${step} for ${lo}..${hi}`);
+    }
+  });
+  it('the price axis on a ~$180 chart is evenly labelled', () => {
+    // Bars spanning 180.00-188.89 give six gridlines at this size.
+    const t0 = Date.UTC(2026, 7, 10);
+    const bars = [180, 182.4, 184.1, 185.6, 186.9, 188.2].map((c, i) => ({ t: t0 + i * DAY, o: c, h: c + 0.4, l: c - 0.4, c, v: 1000 }));
+    bars[0].l = 180; bars[5].h = 188.89;
+    uniform(priceAxis(priceChart(bars, '1D')), 'price axis');
+  });
+  it('the equity axis of a barely-moved account is evenly labelled', () => {
+    const chart = new C.EquityChart(box(600, 260));
+    chart.ctx.texts.length = 0;
+    chart.setSeries([{ name: 'You', color: '#fff', points: [{ t: 0, e: 100000 }, { t: 1, e: 100004 }, { t: 2, e: 100009 }] }]);
+    uniform(chart.ctx.texts.filter((s) => NUMERIC.test(s)).map(parseLabel), 'equity axis');
+  });
+});
+
+describe('sub-penny price pills', () => {
+  const t0 = Date.UTC(2026, 8, 28, 12);
+  const closes = [0.00000253, 0.00000258, 0.00000262, 0.00000255, 0.00000249, 0.00000254];
+  const bars = closes.map((c, i) => ({ t: t0 + i * 300e3, o: c, h: c * 1.002, l: c * 0.998, c, v: 1e9 }));
+  it('the last-price pill keeps every significant digit', () => {
+    eq(priceChart(bars, '5m').bctx.texts.at(-1), '0.00000254');
+  });
+  it('the crosshair pill tells neighbouring candles apart', () => {
+    const chart = priceChart(bars, '5m');
+    eq(pills(chart, 4)[0], '0.00000249');
+    eq(pills(chart, 1)[0], '0.00000258');
+  });
+  it('a drawn level is labelled with its real price', () => {
+    const chart = priceChart(bars, '5m');
+    chart.setDrawings([{ kind: 'level', pts: [{ t: bars[2].t, price: 0.0000026 }] }]);
+    ok(chart.octx.texts.includes('0.00000260'), chart.octx.texts.join(' | '));
+  });
+  it('ordinary prices keep their usual precision', () => {
+    const plain = bars.map((b, i) => ({ ...b, o: 184 + i, h: 185 + i, l: 183 + i, c: 184.25 + i }));
+    eq(priceChart(plain, '5m').bctx.texts.at(-1), '189.25');
+  });
+});
+
+describe('time labels', () => {
+  // Nasdaq-fallback and Coinbase daily bars are stamped 00:00 UTC.
+  const days = [13, 14, 17, 18, 19].map((d) => Date.UTC(2026, 7, d));
+  const daily = (stamps) => stamps.map((t, i) => ({ t, o: 100 + i, h: 101 + i, l: 99 + i, c: 100.5 + i, v: 1000 }));
+  const timeAxis = (chart) => chart.bctx.texts.filter((s) => /^[A-Z][a-z]{2} \d/.test(s));
+  it('daily bars are labelled with their session date west of UTC', () => {
+    localZone = 'America/New_York';
+    const chart = priceChart(daily(days), '1D');
+    eq(timeAxis(chart).slice().reverse(), ['Aug 13', 'Aug 14', 'Aug 17', 'Aug 18', 'Aug 19']);
+    eq(pills(chart, 4)[1], 'Aug 19');
+  });
+  it('US-session daily stamps keep their date far east of UTC', () => {
+    // Yahoo stamps a US daily bar at the 13:30 UTC open — already tomorrow in Auckland.
+    localZone = 'Pacific/Auckland';
+    try {
+      const chart = priceChart(daily(days.map((t) => t + 13.5 * 3600e3)), '1D');
+      eq(pills(chart, 1)[1], 'Aug 14');
+    } finally { localZone = 'America/New_York'; }
+  });
+  it('5m pills tell the same time on different days apart', () => {
+    // Mon and Tue 2026-09-21/22 at 10:35 New York time.
+    const mon = Date.UTC(2026, 8, 21, 14, 35), tue = Date.UTC(2026, 8, 22, 14, 35);
+    const chart = priceChart(daily([mon, mon + 300e3, tue, tue + 300e3]), '5m');
+    const a = pills(chart, 0)[1], b = pills(chart, 2)[1];
+    ok(a !== b, `both read "${a}"`);
+    ok(a.startsWith('Sep 21') && b.startsWith('Sep 22'), `${a} / ${b}`);
+  });
+  it('weekly bars name their week, not a day of the month', () => {
+    // toWeekly buckets are Mondays at 00:00 UTC.
+    const weeks = [Date.UTC(2025, 8, 1), Date.UTC(2026, 7, 3), Date.UTC(2026, 7, 10)];
+    const chart = priceChart(daily(weeks), '1W');
+    eq(pills(chart, 0)[1], 'Sep 1, 2025');
+    eq(pills(chart, 1)[1], 'Aug 3, 2026');
+    eq(pills(chart, 2)[1], 'Aug 10, 2026');
+  });
+});
+
 describe('sparkline path', () => {
   it('emits a path across the full width', () => {
     const d = C.sparklinePath([1, 2, 3, 4], 52, 22);

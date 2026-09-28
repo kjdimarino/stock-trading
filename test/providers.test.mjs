@@ -76,6 +76,25 @@ describe('rate limiter under concurrency', () => {
     ok(lim.state.strikes === 0, 'a success clears the strike count');
   });
 
+  it('counts one strike per throttled burst, not one per refused request', async () => {
+    const lim = createLimiter({ capacity: 5, refillMs: 10 });
+    const sentAt = Date.now();
+    // Five requests from one burst all come back 429 — the first in the same
+    // millisecond it was sent, which must not make the rest look newer.
+    const backoffs = Array.from({ length: 5 }, () => lim.penalise(sentAt));
+    ok(backoffs.every((ms) => ms <= 20000), `backoffs ${backoffs.join(',')} — one burst went past the first step`);
+    eq(lim.state.strikes, 1, 'strikes after one burst');
+    // A late success from the same burst must not wipe the strike it earned.
+    lim.reward(sentAt);
+    eq(lim.state.strikes, 1, 'a success sent before the ban leaves the strike');
+    // A request sent after the ban is a new episode: it escalates, or clears.
+    await sleep(5);
+    ok(lim.penalise(Date.now()) > 20000, 'a second episode escalates');
+    await sleep(5);
+    lim.reward(Date.now());
+    eq(lim.state.strikes, 0, 'a success sent after the ban clears it');
+  });
+
   it('sheds load rather than queueing without bound', async () => {
     const lim = createLimiter({ capacity: 1, refillMs: 1000, maxWaitMs: 1500 });
     const results = await Promise.all(Array.from({ length: 8 }, () =>

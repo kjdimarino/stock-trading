@@ -30,16 +30,17 @@ function cacheSet(key, value, ttl) {
  */
 async function through(key, ttl, fetcher) {
   const hit = cacheGet(key);
-  if (hit && Date.now() - hit.at < ttl) return { ...hit.value, quality: hit.value.quality || 'live', ageMs: Date.now() - hit.at };
+  // fetchedAt lets the client order two quotes that carry no exchange stamp.
+  if (hit && Date.now() - hit.at < ttl) return { ...hit.value, quality: hit.value.quality || 'live', ageMs: Date.now() - hit.at, fetchedAt: hit.at };
   if (inflight.has(key)) return inflight.get(key);
 
   const p = (async () => {
     try {
       const fresh = await fetcher();
       cacheSet(key, fresh, ttl);
-      return { ...fresh, ageMs: 0 };
+      return { ...fresh, ageMs: 0, fetchedAt: cache.get(key).at };
     } catch (err) {
-      if (hit) return { ...hit.value, quality: 'cached', ageMs: Date.now() - hit.at, error: err.message };
+      if (hit) return { ...hit.value, quality: 'cached', ageMs: Date.now() - hit.at, fetchedAt: hit.at, error: err.message };
       throw err;
     } finally {
       inflight.delete(key);
@@ -85,6 +86,7 @@ function createLimiter({ capacity, refillMs, maxWaitMs = 4000 }) {
   let tat = 0;                                          // next theoretical arrival
   let cooldownUntil = 0;
   let strikes = 0;
+  let penalisedAt = -Infinity;                          // when the last strike landed
 
   return {
     get state() {
@@ -132,14 +134,25 @@ function createLimiter({ capacity, refillMs, maxWaitMs = 4000 }) {
       }
     },
 
-    penalise() {
+    /*
+     * `sentAt` is when the refused request went out. Everything already in
+     * flight when the first 429 lands was sent into the same ban and answers
+     * 429 too; counting each of those as a strike would take one burst
+     * straight to the five-minute maximum. Likewise a late success from before
+     * the ban does not clear it. (Nothing is sent after a penalty until the
+     * cooldown ends, so a request stamped the same millisecond went before
+     * it.) Called without it, every call counts.
+     */
+    penalise(sentAt = Infinity) {
+      if (sentAt <= penalisedAt) return Math.max(0, cooldownUntil - Date.now());
       strikes = Math.min(strikes + 1, 5);
+      penalisedAt = Date.now();
       const backoff = Math.min(300000, 20000 * 2 ** (strikes - 1)); // 20s → 5min
       cooldownUntil = Date.now() + backoff;
       tat = cooldownUntil;
       return backoff;
     },
-    reward() { strikes = 0; },
+    reward(sentAt = Infinity) { if (sentAt > penalisedAt) strikes = 0; },
   };
 }
 
@@ -174,13 +187,14 @@ async function yahooGet(pathAndQuery) {
   }
   const limiter = yahooLimiters[host];
   await limiter.take();
+  const sentAt = Date.now();
   try {
     const json = await getJSON(`https://${host}${pathAndQuery}`, { timeout: 9000 });
-    limiter.reward();
+    limiter.reward(sentAt);
     return json;
   } catch (e) {
     if (e.status === 429 || e.status === 999) {
-      const ms = limiter.penalise();
+      const ms = limiter.penalise(sentAt);
       e.message = `Yahoo ${host.slice(0, 6)} rate limited (backing off ${Math.round(ms / 1000)}s)`;
     }
     throw e;
@@ -195,7 +209,8 @@ function quoteFromYahooChart(json, symbol) {
   if (!r || !r.meta) throw new Error(`no chart data for ${symbol}`);
   const m = r.meta;
   const price = m.regularMarketPrice;
-  if (!isFinite(price)) throw new Error(`no price for ${symbol}`);
+  // isFinite(null) is true, so a null or zero price has to be ruled out by hand.
+  if (!(Number.isFinite(price) && price > 0)) throw new Error(`no price for ${symbol}`);
   const prev = isFinite(m.chartPreviousClose) ? m.chartPreviousClose
     : isFinite(m.previousClose) ? m.previousClose : null;
   const change = prev != null ? price - prev : null;
@@ -229,6 +244,15 @@ function quoteFromYahooChart(json, symbol) {
   };
 }
 
+/*
+ * Class shares have three spellings: the Nasdaq screener writes BRK/B, Yahoo
+ * (and the curated list) BRK-B, and Nasdaq's quote API BRK.B. Each upstream
+ * 404s the others. Ids are kept in the Yahoo form and translated on the way
+ * out; the slash form is still accepted, since ids already saved may use it.
+ */
+const yahooSymbol = (s) => String(s).replace(/^([A-Z]+)\/([A-Z])$/, '$1-$2');
+const nasdaqSymbol = (s) => String(s).replace(/^([A-Z]+)[-/]([A-Z])$/, '$1.$2');
+
 /**
  * Nasdaq needs an `assetclass`, and guessing wrong costs a full round trip
  * (~3s). Our own universe already knows, so order the attempts accordingly.
@@ -250,14 +274,14 @@ async function nasdaqQuote(symbol) {
       // A token per request: this loop can fire twice if the first class misses.
       await nasdaqLimiter.take();
       const j = await getJSON(
-        `https://api.nasdaq.com/api/quote/${encodeURIComponent(symbol)}/info?assetclass=${cls}`,
+        `https://api.nasdaq.com/api/quote/${encodeURIComponent(nasdaqSymbol(symbol))}/info?assetclass=${cls}`,
         { timeout: 8000 },
       );
       const d = j?.data;
       const pd = d?.primaryData;
       if (!d || !pd) continue;
       const price = num(pd.lastSalePrice);
-      if (price == null) continue;
+      if (!(price > 0)) continue;
       const changePct = num(pd.percentageChange);
       const change = num(pd.netChange);
       return {
@@ -285,7 +309,7 @@ async function nasdaqQuote(symbol) {
 export function stockQuote(symbol, ttl = 5000) {
   return through(`q:${symbol}`, ttl, async () => {
     try {
-      const path = `/v8/finance/chart/${encodeURIComponent(symbol)}?range=1d&interval=1m&includePrePost=false`;
+      const path = `/v8/finance/chart/${encodeURIComponent(yahooSymbol(symbol))}?range=1d&interval=1m&includePrePost=false`;
       return quoteFromYahooChart(await yahooGet(path), symbol);
     } catch (yErr) {
       try {
@@ -330,7 +354,9 @@ function resolveAsset(assetId, hint = {}) {
     kind,
     // Yahoo quotes crypto as "SOL-USD"; equities use the bare ticker.
     yh: hint.yh || (kind === 'crypto' ? `${id}-USD` : id),
-    cb: hint.cb || (kind === 'crypto' ? `${id}-USD` : null),
+    // A coin sent with only a CoinGecko id has no Coinbase product; inventing
+    // one would chart whatever Coinbase or Yahoo lists under that ticker.
+    cb: hint.cb || (kind === 'crypto' && !hint.cg ? `${id}-USD` : null),
     discovered: true,
   };
 }
@@ -441,7 +467,9 @@ export async function cryptoQuotes(symbols, ttl) {
 
 /** CoinGecko market snapshot — market cap and rank, refreshed slowly. */
 export function cryptoMarkets(ids) {
-  const key = `cg:${ids.slice().sort().join(',')}`;
+  // Its own prefix: the ids come from the query string, and a bare `cg:` key
+  // let `ids=dir` or `ids=q:<coin>` overwrite the directory or a quote entry.
+  const key = `cg:mkt:${ids.slice().sort().join(',')}`;
   return through(key, 120000, async () => {
     await geckoLimiter.take();
     const url = 'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids='
@@ -518,6 +546,30 @@ const NUM = (v) => {
 /** Bucket width in ms per timeframe, for aggregating intraday samples. */
 const TF_MS = { '1m': 60e3, '5m': 300e3, '15m': 900e3, '1h': 3600e3 };
 
+/*
+ * Nasdaq stamps its chart points with New York wall-clock time written as if
+ * it were UTC: "1:02 PM ET" arrives as 13:02Z. Read raw, every bar lands four
+ * or five hours early and the next live tick opens a hole that size.
+ */
+const NY_CLOCK = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York', hourCycle: 'h23',
+  year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric',
+});
+
+/** New York's offset from UTC at an instant, in ms (-4h in summer, -5h in winter). */
+function nyOffset(ms) {
+  const p = {};
+  for (const { type, value } of NY_CLOCK.formatToParts(new Date(ms))) p[type] = Number(value);
+  return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - (ms - (ms % 1000));
+}
+
+/** The real instant of a New York wall-clock time encoded as UTC. */
+function etWallToEpoch(wallMs) {
+  // The offset at the wall time itself is a guess; the one at the guessed
+  // instant is right on both sides of a daylight-saving change.
+  return wallMs - nyOffset(wallMs - nyOffset(wallMs));
+}
+
 /**
  * Nasdaq's intraday endpoint returns one price sample per minute rather than
  * OHLC bars, so we aggregate samples into buckets. The open/high/low/close of
@@ -542,7 +594,7 @@ async function nasdaqIntradayCandles(symbol, tf) {
     try {
       await nasdaqLimiter.take();
       const j = await getJSON(
-        `https://api.nasdaq.com/api/quote/${encodeURIComponent(symbol)}/chart?assetclass=${cls}`,
+        `https://api.nasdaq.com/api/quote/${encodeURIComponent(nasdaqSymbol(symbol))}/chart?assetclass=${cls}`,
         { timeout: 12000 },
       );
       if (j?.data?.chart?.length) { json = j; break; }
@@ -552,9 +604,11 @@ async function nasdaqIntradayCandles(symbol, tf) {
 
   const buckets = new Map();
   for (const point of json.data.chart) {
-    const t = Number(point.x);
+    const x = Number(point.x);
     const price = Number(point.y);
-    if (!isFinite(t) || !isFinite(price)) continue;
+    if (!isFinite(x) || !isFinite(price)) continue;
+    // Whole-hour shift, so bucket alignment is unchanged.
+    const t = etWallToEpoch(x);
     const key = Math.floor(t / width) * width;
     const b = buckets.get(key);
     if (!b) buckets.set(key, { t: key, o: price, h: price, l: price, c: price, v: 0, n: 1 });
@@ -597,7 +651,7 @@ async function nasdaqDailyCandles(symbol, days = 400) {
     try {
       await nasdaqLimiter.take();
       const j = await getJSON(
-        `https://api.nasdaq.com/api/quote/${encodeURIComponent(symbol)}/historical`
+        `https://api.nasdaq.com/api/quote/${encodeURIComponent(nasdaqSymbol(symbol))}/historical`
         + `?assetclass=${cls}&fromdate=${iso(from)}&todate=${iso(to)}&limit=${days}`,
         { timeout: 12000 },
       );
@@ -612,7 +666,8 @@ async function nasdaqDailyCandles(symbol, days = 400) {
     const [m, d, y] = String(r.date).split('/').map(Number);
     const o = NUM(r.open), h = NUM(r.high), l = NUM(r.low), c = NUM(r.close);
     if (!isFinite(y) || o == null || h == null || l == null || c == null) continue;
-    bars.push({ t: Date.UTC(y, m - 1, d), o, h, l, c, v: NUM(r.volume) || 0 });
+    // Stamped at the 09:30 ET open, as Yahoo stamps its daily bars.
+    bars.push({ t: etWallToEpoch(Date.UTC(y, m - 1, d, 9, 30)), o, h, l, c, v: NUM(r.volume) || 0 });
   }
   if (!bars.length) throw new Error(`nasdaq history unparseable for ${symbol}`);
   return bars.sort((a, b) => a.t - b.t);
@@ -703,9 +758,9 @@ export function fetchCandles(assetId, tf, hint) {
    * BTC would quietly drop from real Coinbase OHLCV to a close-only snapshot.
    * The gecko path is for coins with no Coinbase product at all.
    */
-  const cgId = asset.cb ? null : (hint && hint.cg);
+  const cgId = asset.cb ? null : (hint && hint.cg) || null;
 
-  return through(`k:${asset.id}:${tf}`, CANDLE_TTL[tf] ?? 60000, async () => {
+  return through(`k:${asset.id}:${tf}:${cgId || ''}`, CANDLE_TTL[tf] ?? 60000, async () => {
     if (cgId) {
       return {
         bars: await geckoCandles(cgId, tf),
@@ -736,7 +791,7 @@ export function fetchCandles(assetId, tf, hint) {
     }
 
     try {
-      const path = `/v8/finance/chart/${encodeURIComponent(asset.yh)}?range=${spec.range}&interval=${spec.interval}`;
+      const path = `/v8/finance/chart/${encodeURIComponent(yahooSymbol(asset.yh))}?range=${spec.range}&interval=${spec.interval}`;
       return { bars: candlesFromYahoo(await yahooGet(path)), source: 'yahoo', quality: 'live', tf, assetId };
     } catch (yErr) {
       const bars = await nasdaqCandles(asset.symbol, tf);
@@ -825,7 +880,7 @@ export function geckoQuotes(ids) {
     const quotes = {};
     for (const id of list) {
       const r = j[id];
-      if (!r || !isFinite(r.usd)) continue;
+      if (!r || !(Number.isFinite(r.usd) && r.usd > 0)) continue;
       quotes[id] = {
         price: r.usd,
         changePct: isFinite(r.usd_24h_change) ? r.usd_24h_change : null,
@@ -836,6 +891,16 @@ export function geckoQuotes(ids) {
       };
     }
     return { quotes, source: 'coingecko', quality: 'delayed' };
+  }).then((g) => {
+    /*
+     * Same reasoning as quoteFromCoinbaseStats: when CoinGecko refuses the
+     * refresh, `through()` marks the old envelope cached, but the quotes inside
+     * it would still say 'delayed' — indefinitely, since nothing evicts them.
+     */
+    if (g.quality !== 'cached') return g;
+    const quotes = {};
+    for (const id in g.quotes) quotes[id] = { ...g.quotes[id], quality: 'cached', ageMs: g.ageMs, staleError: g.error };
+    return { ...g, quotes };
   });
 }
 
@@ -878,7 +943,7 @@ export function stockDirectory() {
     const raw = (j && j.data && j.data.rows) || [];
     const rows = [];
     for (const r of raw) {
-      const symbol = String(r.symbol || '').trim().toUpperCase();
+      const symbol = yahooSymbol(String(r.symbol || '').trim().toUpperCase());
       const price = parseMoney(r.lastsale);
       if (!symbol || price == null || price <= 0) continue;
       rows.push({

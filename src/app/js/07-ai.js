@@ -50,21 +50,60 @@
     'position sizing': 'Position sizing decides how much to put into a trade. It matters more than entry timing — sizing controls how much a single wrong call can cost you.',
     'market hours': 'US stock exchanges trade 9:30am–4:00pm Eastern on weekdays, minus holidays. Crypto never closes, which is why it keeps moving while stocks are shut.',
     'paper trading': 'Paper trading practises with simulated money against real prices. The mechanics and the math are real; the pressure of risking your own money is not, which is the one thing it cannot teach.',
-    'short selling': 'Short selling bets on a price falling by selling borrowed shares first. Losses are theoretically unlimited because a price can keep rising — this app is deliberately long-only.',
+    'short selling': 'Short selling bets on a price falling by selling borrowed shares first. Losses are theoretically unlimited because a price can keep rising. Your account can short, against margin collateral and with a forced buy-in if the position runs too far, and it can be switched off in Settings; the autonomous AI trader stays long-only.',
   };
+
+  // Longest first, so "unrealized p&l" wins over "realized p&l".
+  const TERMS = Object.keys(CONCEPTS).sort((a, b) => b.length - a.length);
+  // A whole term, optionally plural ("limit orders"), never part of a word.
+  const termPattern = (term) => {
+    const escaped = term.replace(/[.*+?^$(){}|[\]\\/]/g, '\\$&');
+    return new RegExp(`(^|[^a-z0-9])${escaped}(s|es)?([^a-z0-9]|$)`);
+  };
+  const TERM_RE = Object.fromEntries(TERMS.map((t) => [t, termPattern(t)]));
+
+  // "avg" for "average": same first letter, letters in order.
+  const abbreviates = (w, t) => {
+    let i = 0;
+    for (const ch of t) if (ch === w[i]) i++;
+    return w[0] === t[0] && i === w.length;
+  };
+
+  /** Does a short name ("bollinger", "bid ask", "moving avg") mean this term? */
+  function namesTerm(words, term) {
+    const tw = term.split(' ').filter((t) => t !== 'and');
+    if (words.length === 1) return tw.some((t) => t.startsWith(words[0]));
+    return words.every((w) => tw.some((t) => t.startsWith(w) || w.startsWith(t) || abbreviates(w, t)));
+  }
 
   function explainConcept(query) {
     const q = String(query || '').toLowerCase().trim();
     if (!q) return null;
     if (CONCEPTS[q]) return { term: q, text: CONCEPTS[q] };
-    // Loose match so "what is rsi?" finds "rsi".
-    for (const term in CONCEPTS) {
-      if (q.includes(term) || term.includes(q)) return { term, text: CONCEPTS[term] };
+    /*
+     * Whole terms only, so "what is rsi?" finds "rsi" but "diversification"
+     * does not, and "moving", "and" or "position" inside an ordinary question
+     * cannot hand it to the glossary instead of the portfolio or the scan.
+     */
+    for (const term of TERMS) {
+      if (TERM_RE[term].test(q)) return { term, text: CONCEPTS[term] };
     }
-    const words = q.split(/\s+/).filter((w) => w.length > 2);
-    for (const term in CONCEPTS) {
-      if (words.some((w) => term.includes(w))) return { term, text: CONCEPTS[term] };
-    }
+    /*
+     * Failing that, what the question asks about may be a short name for a
+     * term: "explain bollinger", "what is a bid", "what is a moving avg". Only
+     * a phrase of up to three real words qualifies, so "what is my position in
+     * TSLA" stays a portfolio question. "What is moving?" asks what is moving,
+     * and a ticker ("what is COST?") is a question about the asset.
+     */
+    const asked = q.replace(/[?.!\s]+$/, '');
+    // The lead-in can come anywhere: "please explain bollinger", "so what is a bid".
+    const m = asked.match(/(?:^|[^a-z])(what (is|are|does|do)|explain|define|how (does|do))\s+((an?|the)\s+)?(.+)$/);
+    if (m && (m[2] === 'is' || m[2] === 'are') && !m[5] && /^\S+ing$/.test(m[6])) return null;
+    const core = (m ? m[6] : asked).replace(/\s+(mean|means|work|works)$/, '');
+    const words = core.split(/\s+/);
+    if (words.length > 3 || !words.every((w) => /^[a-z0-9&/]{3,}$/.test(w))) return null;
+    if (words.length === 1 && PT.byId && PT.byId[core.toUpperCase()]) return null;
+    for (const term of TERMS) if (namesTerm(words, term)) return { term, text: CONCEPTS[term] };
     return null;
   }
 
@@ -76,20 +115,22 @@
    * Concentration via the Herfindahl-Hirschman Index over position weights.
    * 1.0 means everything sits in a single position.
    */
-  function concentration(positions, equity, invested) {
+  function concentration(positions, equity, gross) {
     if (!positions.length || equity <= 0) return { hhi: 0, top: null, topWeight: 0, effectiveN: 0 };
     /*
-     * HHI is measured against invested capital: including cash makes a
+     * HHI is measured against gross exposure: including cash makes a
      * one-stock book look perfectly diversified simply because it is mostly
      * uninvested. `topWeight` stays equity-relative, because there cash
-     * genuinely does dilute single-name risk.
+     * genuinely does dilute single-name risk. Both use each position's size
+     * regardless of side: a short is as much a bet as a long of the same size.
      */
-    const base = invested > 0 ? invested : equity;
+    const base = gross > 0 ? gross : equity;
     let hhi = 0, topWeight = 0, top = null;
     for (const p of positions) {
-      const w = p.value / base;
+      const size = Math.abs(p.value);
+      const w = size / base;
       hhi += w * w;
-      const eqWeight = p.value / equity;
+      const eqWeight = size / equity;
       if (eqWeight > topWeight) { topWeight = eqWeight; top = p.assetId; }
     }
     return { hhi, top, topWeight, effectiveN: hhi > 0 ? 1 / hhi : 0 };
@@ -98,16 +139,23 @@
   function analyzePortfolio(val, dayPnl, stats) {
     const positions = val.positions;
     const equity = val.equity;
-    const conc = concentration(positions, equity, val.invested);
-    const cashWeight = equity > 0 ? val.cash / equity : 1;
+    const gross = (val.longValue ?? val.invested ?? 0) + (val.shortValue || 0);
+    const conc = concentration(positions, equity, gross);
+    /*
+     * The share of equity with no market exposure. Raw cash will not do: short
+     * proceeds are credited to it, so a big short would read as a book that is
+     * more than all cash. For a long-only book this is exactly cash / equity.
+     */
+    const cashWeight = equity > 0 ? U.clamp(1 - gross / equity, 0, 1) : 1;
 
     const bySector = {};
     const byKind = { stock: 0, etf: 0, crypto: 0 };
     for (const p of positions) {
       const a = PT.byId[p.assetId];
       const sector = a ? a.sector : 'Unknown';
-      bySector[sector] = (bySector[sector] || 0) + p.value;
-      byKind[p.kind] = (byKind[p.kind] || 0) + p.value;
+      const size = Math.abs(p.value);
+      bySector[sector] = (bySector[sector] || 0) + size;
+      byKind[p.kind] = (byKind[p.kind] || 0) + size;
     }
 
     const sorted = positions.slice().sort((a, b) => b.unrealizedPct - a.unrealizedPct);
@@ -164,20 +212,27 @@
 
   /**
    * Bars per year for each timeframe, so annualised volatility means something.
-   * US equities trade ~252 days a year, 6.5h a day.
+   * US equities trade ~252 days a year, 6.5h (23,400s) a day. Crypto never
+   * closes, so its bars-per-year is the full calendar at every timeframe.
    */
   const BARS_PER_YEAR = {
-    '1m': 252 * 390, '5m': 252 * 78, '15m': 252 * 26,
-    '1h': 252 * 7, '1D': 252, '1W': 52,
+    equity: {
+      '1s': 252 * 23400, '5s': 252 * 4680, '15s': 252 * 1560,
+      '1m': 252 * 390, '5m': 252 * 78, '15m': 252 * 26,
+      '1h': 252 * 7, '1D': 252, '1W': 52,
+    },
+    crypto: {
+      '1s': 365 * 86400, '5s': 365 * 17280, '15s': 365 * 5760,
+      '1m': 365 * 1440, '5m': 365 * 288, '15m': 365 * 96,
+      '1h': 365 * 24, '1D': 365, '1W': 52,
+    },
   };
 
   /** Build a companion briefing for one asset entirely from computed values. */
   function briefAsset(assetId, bars, quote, tf) {
     const asset = PT.byId[assetId];
     if (!asset) return null;
-    // Crypto never closes, so its bars-per-year is the full calendar.
-    const cryptoFactor = asset.kind === 'crypto' ? (365 * 24) / (252 * 6.5) : 1;
-    const perYear = Math.round((BARS_PER_YEAR[tf] || 252) * cryptoFactor);
+    const perYear = BARS_PER_YEAR[asset.kind === 'crypto' ? 'crypto' : 'equity'][tf] || 252;
     const ind = bars && bars.length >= MIN_BRIEF_BARS ? TA.analyze(bars, perYear) : null;
     const sig = ind ? TA.score(ind) : null;
     if (!ind || !sig) {
@@ -255,22 +310,24 @@
     const eq = val.equity;
 
     if (!pa.positionCount) {
-      body.push(`You are holding ${U.fmtUSD(val.cash)} in cash and no positions. Nothing is at risk, and nothing is working for you either.`);
+      body.push(`You are holding ${U.fmtUSD(val.cash, { fixed2: true })} in cash and no positions. Nothing is at risk, and nothing is working for you either.`);
       body.push('Pick something from the watchlist to see a full breakdown here once you have a position.');
       return { headline: 'Fully in cash', body, computed: true };
     }
 
     const rp = val.totalReturnPct;
-    body.push(`Your book is worth ${U.fmtUSD(eq)} across ${pa.positionCount} position${pa.positionCount === 1 ? '' : 's'}, ${rp >= 0 ? 'up' : 'down'} ${U.fmtPctAbs(rp)} since you started.`);
+    body.push(`Your book is worth ${U.fmtUSD(eq, { fixed2: true })} across ${pa.positionCount} position${pa.positionCount === 1 ? '' : 's'}, ${rp >= 0 ? 'up' : 'down'} ${U.fmtPctAbs(rp)} since you started.`);
     body.push(`Unrealized P&L is ${U.fmtSigned(val.unrealized)} (${U.fmtPct(val.unrealizedPct)}) and you have booked ${U.fmtSigned(val.realized)} in realized gains.`);
 
     if (pa.dayPnl) {
-      body.push(`Today you are ${pa.dayPnl.change >= 0 ? 'up' : 'down'} ${U.fmtUSD(Math.abs(pa.dayPnl.change))} (${U.fmtPctAbs(pa.dayPnl.changePct)}).`);
+      body.push(`Today you are ${pa.dayPnl.change >= 0 ? 'up' : 'down'} ${U.fmtUSD(Math.abs(pa.dayPnl.change), { fixed2: true })} (${U.fmtPctAbs(pa.dayPnl.changePct)}).`);
     }
 
     const c = pa.concentration;
     if (c.topWeight > 0.4) {
-      body.push(`Heads up on concentration: ${c.top} alone is ${(c.topWeight * 100).toFixed(0)}% of your equity. A bad day in one name would move your whole book.`);
+      const topRow = val.positions.find((p) => p.assetId === c.top);
+      const name = topRow && topRow.value < 0 ? `your ${c.top} short` : c.top;
+      body.push(`Heads up on concentration: ${name} alone is ${(c.topWeight * 100).toFixed(0)}% of your equity. A bad day in one name would move your whole book.`);
     } else if (pa.positionCount >= 4 && c.topWeight < 0.3) {
       body.push(`Position sizing looks reasonable — your largest holding, ${c.top}, is ${(c.topWeight * 100).toFixed(0)}% of equity.`);
     }
@@ -293,12 +350,17 @@
       body.push(`Crypto is ${(cryptoW * 100).toFixed(0)}% of your book. It trades around the clock, so this account keeps moving after the stock market closes.`);
     }
 
+    if (val.shortValue > 0) {
+      body.push(`You are short ${U.fmtUSD(val.shortValue, { fixed2: true })}, ${eq > 0 ? ((val.shortValue / eq) * 100).toFixed(0) : '—'}% of equity. A short loses as the price rises, and there is no ceiling on how far that can go.`);
+    }
+
+    // Closed, not sells: opening a short is a sell, and covering one is a buy.
     if (pa.stats && pa.stats.winRate != null) {
-      body.push(`Across ${pa.stats.sells} closed trade${pa.stats.sells === 1 ? '' : 's'} your win rate is ${pa.stats.winRate.toFixed(0)}%${pa.stats.profitFactor && isFinite(pa.stats.profitFactor) ? `, with a profit factor of ${pa.stats.profitFactor.toFixed(2)}` : ''}.`);
+      body.push(`Across ${pa.stats.closed} closed trade${pa.stats.closed === 1 ? '' : 's'} your win rate is ${pa.stats.winRate.toFixed(0)}%${pa.stats.profitFactor && isFinite(pa.stats.profitFactor) ? `, with a profit factor of ${pa.stats.profitFactor.toFixed(2)}` : ''}.`);
     }
 
     return {
-      headline: `${U.fmtUSD(eq)} · ${U.fmtPct(rp)} total return`,
+      headline: `${U.fmtUSD(eq, { fixed2: true })} · ${U.fmtPct(rp)} total return`,
       body, computed: true, risk: pa.risk, diversification: pa.diversification,
     };
   }
@@ -374,6 +436,9 @@
     addScore: 0.34,           // conviction needed to add to a winner
     exitScore: -0.12,         // conviction at which to close
     stopAtrMult: 2.5,
+    // A fixed-percentage stop in place of the ATR one, when set. Off: it exists
+    // so tools/ablate.mjs can measure what sizing stops by ATR is worth.
+    flatStopPct: null,
     hardStopPct: -10,
     cooldownMs: 10 * 60000,   // per-symbol pause after any trade
     maxTradesPerDay: 25,
@@ -387,19 +452,21 @@
      */
     /*
      * Off by default, and that is a measured choice rather than an oversight.
-     * Backtested over 33 names and 306 days it either never fired (at 5 ATR and
-     * wider the base stop was always higher) or fired early and cost about 1.2
-     * points of return — this system's winners are few and large, and a trail
-     * clips exactly those. The rule is kept, and correct, for anyone who would
-     * rather cap giveback than maximise return. See tools/ablate.mjs.
+     * Backtested over 33 names and 306 days, these settings took the return
+     * from about 20% to about 9% and deepened the drawdown. Most of that is
+     * the breakeven floor: this system's winners are few and large, and many
+     * dip back to entry on the way. The trail alone never fired at 5 ATR or
+     * wider and cost about 4 points at 3. The rule is kept, and correct, for
+     * anyone who would rather cap giveback than maximise return. See
+     * tools/ablate.mjs.
      */
     useTrailingStop: false,
     trailAtrMult: 3.0,
-    // The trail arms only once the trade is this far ahead. Below it the base
-    // stop rules, so a normal pullback on the way up is not cut short.
+    // The trail arms only once the trade has been this far ahead. Below it the
+    // base stop rules, so a normal pullback on the way up is not cut short.
     trailActivateAtr: 1.0,
-    // Once a trade is this far ahead in ATR terms, the stop moves to entry: a
-    // winner is not allowed to become a loser.
+    // Once a trade has been this far ahead in ATR terms, the stop moves to
+    // entry: a winner is not allowed to become a loser.
     breakevenAfterAtr: 1.5,
 
     // Exit when the entry condition fails, not only when a stop is hit.
@@ -539,13 +606,16 @@
       const price = quote.price;
       const atr = ind && isFinite(ind.atr14) ? ind.atr14 : null;
       const peak = Math.max(st.peaks[assetId] || price, price);
-      const heldMs = now - (st.openedAt[assetId] ?? now);
-      // Bar spacing from the series itself, so the hold gate scales with the
-      // timeframe the trader happens to be reading.
-      const barMs = series && series.length > 1
-        ? Math.max(1, series[series.length - 1].t - series[series.length - 2].t)
-        : 60e3;
-      const seasoned = heldMs >= RULES.minHoldBars * barMs;
+      /*
+       * Bars opened since the entry, counted off the series itself, so the
+       * hold gate scales with the timeframe the trader happens to be reading.
+       * Measuring time against the last gap instead would take an overnight or
+       * weekend gap for the bar width on the first bar of every session.
+       */
+      const openedAt = st.openedAt[assetId] ?? now;
+      let barsHeld = 0;
+      if (series) for (const b of series) if (b.t > openedAt) barsHeld++;
+      const seasoned = barsHeld >= RULES.minHoldBars;
 
       if (atr != null && pos.avgCost > 0) {
         /*
@@ -556,14 +626,22 @@
          * early is how a system stops out of the drawdowns that precede its
          * winners. It arms only once the trade is genuinely ahead.
          */
-        let stopPrice = pos.avgCost - RULES.stopAtrMult * atr;
-        const aheadAtr = atr > 0 ? (price - pos.avgCost) / atr : 0;
+        const baseStop = RULES.flatStopPct > 0
+          ? pos.avgCost * (1 - RULES.flatStopPct)
+          : pos.avgCost - RULES.stopAtrMult * atr;
+        let stopPrice = baseStop;
+        /*
+         * Armed by how far ahead the trade has *been*, not where it is now:
+         * gated on the current price, the breakeven floor could only ever sit
+         * below the market, and a gap under the arming level disarmed the trail.
+         */
+        const peakAheadAtr = atr > 0 ? (peak - pos.avgCost) / atr : 0;
         let trailing = false;
 
-        if (RULES.useTrailingStop && aheadAtr >= RULES.trailActivateAtr) {
+        if (RULES.useTrailingStop && peakAheadAtr >= RULES.trailActivateAtr) {
           const trail = peak - RULES.trailAtrMult * atr;
           if (trail > stopPrice) { stopPrice = trail; trailing = true; }
-          if (aheadAtr >= RULES.breakevenAfterAtr && pos.avgCost > stopPrice) {
+          if (peakAheadAtr >= RULES.breakevenAfterAtr && pos.avgCost > stopPrice) {
             stopPrice = pos.avgCost;      // a winner may not round-trip into a loss
             trailing = true;
           }
@@ -576,6 +654,10 @@
             const giveBack = peak > 0 ? ((peak - price) / peak) * 100 : 0;
             reason = `Trailing stop: locked in ${U.fmtPct(pnlPct)} after giving back ${giveBack.toFixed(1)}% from the high.`;
             factors.push({ k: 'peak', v: U.fmtUSD(peak) });
+          } else if (RULES.flatStopPct > 0) {
+            const stopPct = RULES.flatStopPct * 100;
+            reason = `Stop hit: down ${U.fmtPct(pnlPct)}, beyond the flat ${stopPct.toFixed(1)}% stop.`;
+            factors.push({ k: 'flat stop', v: `${stopPct.toFixed(1)}%` });
           } else {
             const stopPct = (RULES.stopAtrMult * atr / pos.avgCost) * 100;
             reason = `Stop hit: down ${U.fmtPct(pnlPct)}, beyond ${RULES.stopAtrMult}× ATR (${stopPct.toFixed(1)}%).`;
@@ -792,7 +874,8 @@
 
       const price = cand.quote.price;
       const atr = isFinite(cand.ind.atr14) ? cand.ind.atr14 : null;
-      const stopDistance = atr != null ? RULES.stopAtrMult * atr : price * 0.08;
+      const stopDistance = RULES.flatStopPct > 0 ? price * RULES.flatStopPct
+        : atr != null ? RULES.stopAtrMult * atr : price * 0.08;
       if (!(stopDistance > 0)) continue;
 
       const riskDollars = workingVal.equity * RULES.riskPerTrade;
@@ -815,8 +898,14 @@
 
       if (notional < RULES.minOrderValue) {
         log('hold', cand.assetId,
-          `${cand.assetId} qualified (${cand.sig.stance}) but the available size of ${U.fmtUSD(notional)} is below the ${U.fmtUSD(RULES.minOrderValue)} minimum.`, []);
-        break;
+          `${cand.assetId} qualified (${cand.sig.stance}) but the available size of ${U.fmtUSD(notional, { fixed2: true })} is below the ${U.fmtUSD(RULES.minOrderValue, { fixed2: true })} minimum.`, []);
+        /*
+         * Cash and headroom are shared, so if they are what ran short nothing
+         * further down can fit either. The risk size and the group's room are
+         * this name's own: a calmer name, or one from another group, may fit.
+         */
+        if (Math.floor(Math.min(headroom, pf.cash * 0.95) * 100) / 100 < RULES.minOrderValue) break;
+        continue;
       }
 
       const factors = cand.sig.factors.slice(0, 4).map((f) => ({
@@ -827,7 +916,7 @@
       const why = `${cand.assetId} scored ${cand.sig.score.toFixed(2)} (${cand.sig.stance}, ${cand.sig.confidence}% confidence) `
         + `and is trading above its 50-bar trend. Sizing ${weightPct.toFixed(1)}% of equity: `
         + `a ${stopPct.toFixed(1)}% stop on that position risks `
-        + `${U.fmtUSD(notional * stopPct / 100)}, about ${(RULES.riskPerTrade * 100).toFixed(1)}% of the book.`;
+        + `${U.fmtUSD(notional * stopPct / 100, { fixed2: true })}, about ${(RULES.riskPerTrade * 100).toFixed(1)}% of the book.`;
 
       try {
         const r = PT.engine.submitOrder(pf, {

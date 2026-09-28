@@ -40,11 +40,14 @@
     let out = build(step);
     /*
      * Rounding to a "nice" step can overshoot a narrow range badly enough to
-     * leave one gridline or none — visible on sub-penny assets. Halve until the
-     * axis is legible again.
+     * leave one gridline or none — visible on sub-penny assets. Step down the
+     * 1-2-5 ladder until the axis is legible again. Halving would give 2.5 or
+     * 0.25 steps, whose ticks need a decimal more than axisDecimals shows.
      */
     for (let guard = 0; out.length < 3 && guard < 5; guard++) {
-      step /= 2;
+      const exp = Math.floor(Math.log10(step));
+      const m = Math.round(step / Math.pow(10, exp));
+      step = m >= 5 ? 2 * Math.pow(10, exp) : m >= 2 ? Math.pow(10, exp) : 5 * Math.pow(10, exp - 1);
       out = build(step);
     }
     return out.length ? out : [lo, hi];
@@ -62,16 +65,29 @@
 
   const fmtAxis = (v, dp) => v.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
 
+  /** Decimals for a single price label — sub-penny tiers match U.fmtUSD. */
+  function priceDecimals(v) {
+    const a = Math.abs(v);
+    return a > 0 && a < 0.0001 ? 8 : a < 1 ? 6 : a < 100 ? 3 : 2;
+  }
+
+  /*
+   * A 5m series spans several sessions, so its labels carry the date. Daily
+   * and weekly bars stand for a calendar date and are stamped in UTC (00:00
+   * for Coinbase and weekly buckets; the US open for Yahoo and the Nasdaq
+   * fallback), so they are formatted in UTC — local time would move them a day
+   * either side of it. A weekly bar is named by the Monday it starts on.
+   */
   const TIME_FMT = {
     '1s': { minute: '2-digit', second: '2-digit' },
     '5s': { minute: '2-digit', second: '2-digit' },
     '15s': { hour: 'numeric', minute: '2-digit', second: '2-digit' },
     '1m': { hour: 'numeric', minute: '2-digit' },
-    '5m': { hour: 'numeric', minute: '2-digit' },
+    '5m': { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' },
     '15m': { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' },
     '1h': { month: 'short', day: 'numeric', hour: 'numeric' },
-    '1D': { month: 'short', day: 'numeric' },
-    '1W': { month: 'short', year: '2-digit' },
+    '1D': { month: 'short', day: 'numeric', timeZone: 'UTC' },
+    '1W': { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' },
   };
   const fmtTimeFor = (tf, ms) => new Intl.DateTimeFormat('en-US', TIME_FMT[tf] || TIME_FMT['1D']).format(new Date(ms));
 
@@ -486,7 +502,7 @@
 
         // The level is only useful if you can read the price off it.
         const v = d.pts[0].price;
-        const txt = fmtAxis(v, v < 1 ? 6 : v < 100 ? 3 : 2);
+        const txt = fmtAxis(v, priceDecimals(v));
         ctx.font = `600 10px ${cssVar('--font-sans', 'system-ui')}`;
         const w = Math.min(ctx.measureText(txt).width + 12, this.pad.r - 5);
         const ly = U.clamp(y - 8, p.y0, p.y1 - 16);
@@ -699,8 +715,7 @@
       ctx.restore();
 
       // Price pill on the axis.
-      const dp = last.c < 1 ? 6 : last.c < 100 ? 3 : 2;
-      const text = fmtAxis(last.c, dp);
+      const text = fmtAxis(last.c, priceDecimals(last.c));
       ctx.font = `600 10px ${cssVar('--font-sans', 'system-ui')}`;
       const w = ctx.measureText(text).width + 12;
       ctx.fillStyle = color;
@@ -753,8 +768,7 @@
       ctx.textBaseline = 'middle';
 
       /* price pill */
-      const dp = b.c < 1 ? 6 : b.c < 100 ? 3 : 2;
-      const priceTxt = fmtAxis(b.c, dp);
+      const priceTxt = fmtAxis(b.c, priceDecimals(b.c));
       const pw = Math.min(ctx.measureText(priceTxt).width + 12, this.pad.r - 5);
       const py = U.clamp(y - 8, p.y0, p.y1 - 16);
       ctx.fillStyle = cssVar('--surface-4', '#262c38');
